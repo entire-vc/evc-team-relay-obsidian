@@ -1,0 +1,78 @@
+import { afterEach, describe, expect, test } from "@jest/globals";
+import { Account } from "../src/Account";
+import type { AuthSession } from "../src/AuthSession";
+import { ProviderBacked } from "../src/ProviderBacked";
+import type { RelayCredentialCache } from "../src/RelayCredentialCache";
+import { RemoteDocumentAddress } from "../src/ResourceAddress";
+import { createPermanentUserData } from "../src/permanentUserData";
+
+const SERVER_ID = "self-host";
+const SHARE_ID = "00000000-0000-4000-8000-000000000001";
+const DOCUMENT_ID = "00000000-0000-4000-8000-000000000002";
+const providers: ProviderBacked[] = [];
+
+afterEach(() => {
+	for (const provider of providers.splice(0)) {
+		provider.dismantle();
+		provider.crdtDoc.destroy();
+	}
+});
+
+function makeClient() {
+	let user: Account | undefined;
+	const listeners = new Set<() => void>();
+	const auth = {
+		getCurrentUserForServer: (serverId?: string) =>
+			serverId === SERVER_ID ? user : undefined,
+		on: (listener: () => void) => {
+			listeners.add(listener);
+			return () => { listeners.delete(listener); };
+		},
+	} as unknown as AuthSession;
+	const credentials = { peekToken: () => undefined } as unknown as RelayCredentialCache;
+	// Keep the real provider disconnected: this test exercises real awareness
+	// and Yjs identity state without depending on a network connection.
+	const provider = new ProviderBacked(
+		DOCUMENT_ID,
+		new RemoteDocumentAddress("relay-onprem", SHARE_ID, DOCUMENT_ID),
+		credentials,
+		auth,
+		SERVER_ID,
+	);
+	providers.push(provider);
+	return {
+		provider,
+		listeners,
+		restoreIdentity(account: Account) {
+			user = account;
+			for (const listener of listeners) listener();
+		},
+	};
+}
+
+describe("ProviderBacked identity restoration", () => {
+	test("a later server login seeds both presence and the document user mapping", () => {
+		const { provider, restoreIdentity } = makeClient();
+		const permanentUsers = createPermanentUserData(provider.crdtDoc);
+		expect(provider._liveProvider.awareness.getLocalState()?.user).toBeUndefined();
+		expect(permanentUsers.getUserByClientId(provider.crdtDoc.clientID)).toBeNull();
+
+		const account = new Account("local-user", "Local User", "user@example.com", "", "");
+		restoreIdentity(account);
+
+		expect(provider._liveProvider.awareness.getLocalState()?.user).toEqual({
+			id: account.accountId,
+			name: account.fullName,
+			color: account.presenceColor.color,
+			colorLight: account.presenceColor.light,
+		});
+		expect(permanentUsers.getUserByClientId(provider.crdtDoc.clientID)).toBe(account.accountId);
+	});
+
+	test("disposing a provider removes its authentication listener", () => {
+		const { provider, listeners } = makeClient();
+		expect(listeners.size).toBe(1);
+		provider.dismantle();
+		expect(listeners.size).toBe(0);
+	});
+});

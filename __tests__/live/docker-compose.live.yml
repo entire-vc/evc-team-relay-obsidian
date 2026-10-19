@@ -1,0 +1,107 @@
+# Compose override for the LIVE relay harness (see README.md in this directory).
+#
+# It is layered on top of the Team Relay stack's own infra/docker-compose.yml,
+# which lives in the evc-team-relay repository, not here:
+#
+#   docker compose -p trlive \
+#     -f <evc-team-relay>/infra/docker-compose.yml \
+#     -f __tests__/live/docker-compose.live.yml \
+#     up -d --build
+#
+# The base file is the production-shaped one: relay-server only `expose`s its
+# ports inside the compose network and nothing is published to the host. That is
+# what a real install wants and what a test client on the host cannot use, so
+# this override adds exactly the things the harness needs:
+#
+#   1. host ports the harness defaults point at (58080 / 58081 / 59000 / 55432);
+#   2. RELAY_PUBLIC_URL / RELAY_AUDIENCE that match the local stack;
+#   3. the four services the harness talks to, and nothing else;
+#   4. throwaway named volumes instead of ./data bind mounts.
+#
+# If a container is ever recreated without this file, the port mappings vanish
+# silently and `localhost:58081/ready` refuses connections while
+# `docker compose ps` still shows the stack healthy. Reuse the exact `-f` set
+# the project was created with (`docker compose ls -a` lists it).
+
+services:
+  # --- 1. host ports -------------------------------------------------------
+  # Bound to 127.0.0.1 on purpose: the stack ships a default admin password
+  # (see README.md) and has no business listening on a LAN interface.
+  postgres:
+    ports:
+      - "127.0.0.1:55432:5432"
+
+  minio:
+    ports:
+      - "127.0.0.1:59000:9000"
+    volumes:
+      # Same target path as the base file's ./data/minio bind mount, so this
+      # entry replaces it (compose merges volumes by target).
+      - minio-data:/data
+
+  control-plane:
+    ports:
+      - "127.0.0.1:58080:8000"
+    environment:
+      # 2. The relay-server validates the `aud` claim of every token against its
+      # own relay.toml [server].url, byte for byte. The control-plane derives that
+      # claim from RELAY_PUBLIC_URL's host and port, forced to https://, unless
+      # RELAY_AUDIENCE is set. Left to derive, it signs
+      # `aud=https://localhost:58081`, which cannot match a plain-http local
+      # relay, and every websocket is refused with no symptom other than a socket
+      # that never opens.
+      #
+      #   RELAY_PUBLIC_URL  what clients are told to dial (the relay-server)
+      #   RELAY_AUDIENCE    must equal relay.toml [server].url exactly
+      RELAY_PUBLIC_URL: "ws://localhost:58081"
+      RELAY_AUDIENCE: "http://localhost:58080"
+      # Base URL the control-plane hands out for file uploads and downloads. The
+      # shipped .env points it at a placeholder domain, which would silently break
+      # attachments as soon as a live test uses them.
+      CONTROL_PLANE_PUBLIC_URL: "http://localhost:58080"
+    volumes:
+      - uploads-data:/app/app/static/uploads
+
+  relay-server:
+    ports:
+      - "127.0.0.1:58081:8080"
+    volumes:
+      - relay-data:/app/data
+
+  # --- 3. services the harness does not use -------------------------------
+  # A service carrying a profile is skipped unless that profile is requested, so
+  # a bare `up -d --build` starts only postgres, minio, minio-init,
+  # control-plane-migrate, control-plane and relay-server. This matters for two
+  # reasons: caddy would publish 80/443, and web-publish cannot be built from
+  # source without a token for private @entire-vc packages, which would fail the
+  # whole `--build`.
+  postgres-backup:
+    profiles: ["not-in-live-stack"]
+  control-plane-migrate-dry-run:
+    profiles: ["not-in-live-stack"]
+  webhook-worker:
+    profiles: ["not-in-live-stack"]
+  email-worker:
+    profiles: ["not-in-live-stack"]
+  listmonk-sync-worker:
+    profiles: ["not-in-live-stack"]
+  lifecycle-worker:
+    profiles: ["not-in-live-stack"]
+  prometheus:
+    profiles: ["not-in-live-stack"]
+  grafana:
+    profiles: ["not-in-live-stack"]
+  web-publish:
+    profiles: ["not-in-live-stack"]
+  caddy:
+    profiles: ["not-in-live-stack"]
+
+# --- 4. state ---------------------------------------------------------------
+# Named volumes are prefixed with the project name, so `-p trlive` and
+# `-p trlive-check` never share MinIO data, and `down -v` removes all of it.
+# Image tags are not: the base file pins `infra-control-plane:latest` and
+# `infra-relay-server:latest`, so do not run this on a host with a real install.
+volumes:
+  minio-data:
+  relay-data:
+  uploads-data:

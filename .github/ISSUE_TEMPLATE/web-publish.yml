@@ -1,0 +1,47 @@
+name: Web Publish Issue
+description: Report a rendering or access issue with web publish
+title: "[Web Publish]: "
+labels: ["web-publish"]
+body:
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Publish mode
+      options:
+        - Public
+        - Protected (link + token)
+        - Private (authenticated)
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Self-hosted
+        - Hosted (entire.vc)
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the rendering or access issue
+    validations:
+      required: true
+  - type: textarea
+    id: content
+    attributes:
+      label: Content that fails to render
+      description: Paste the markdown that doesn't render correctly
+      render: markdown
+  - type: input
+    id: url
+    attributes:
+      label: Published page URL (if public)
+      placeholder: "https://..."
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot
+      description: Drag & drop or paste a screenshot

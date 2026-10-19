@@ -1,0 +1,373 @@
+/**
+ * Relay On-Premise Token Provider
+ *
+ * This provider fetches relay access tokens from the relay-onprem control plane.
+ * It replaces the cloud-backend /token endpoint with relay-onprem /tokens/relay endpoint.
+ */
+
+import { platformFetch } from "../platformFetch";
+import { namedLogger } from "../logging";
+import type { DocumentGrant, FileGrant } from "../relay/TokenShapes";
+import type { IAuthProvider } from "./IAuthProvider";
+
+export interface RelayTokenRequest {
+	share_id: string;
+	doc_id: string;
+	mode: "read" | "write";
+	password?: string;
+	file_path?: string; // For folder shares: path of file within folder
+	client_version?: string; // Plugin manifest version — see RelayOnPremTokenConfig.clientVersion
+}
+
+export interface RelayTokenResponse {
+	relay_url: string;
+	token: string;
+	expires_at: string;
+}
+
+export interface FileTokenRequest {
+	path: string;
+	sha256: string;
+	content_type: string;
+	content_length: number;
+}
+
+export interface FileTokenApiResponse {
+	token: string;
+	base_url: string;
+	expires_at: string;
+}
+
+export interface RelayOnPremTokenConfig {
+	controlPlaneUrl: string;
+	authProvider: IAuthProvider;
+	/**
+	 * Plugin manifest version (this.manifest.version), sent to the control-plane
+	 * with every token request so it can attribute a given auth outcome to a
+	 * specific release. User-Agent alone can't do this — it carries the
+	 * Obsidian/Electron app version, not the plugin's ( recurrence
+	 * diagnosis, 2026-09-17). Optional so callers that don't have a manifest
+	 * handy (e.g. tests) still compile.
+	 */
+	clientVersion?: string;
+}
+
+/**
+ * Error thrown when the server returns HTTP 429 Too Many Requests.
+ * Carries the recommended retry-after delay in milliseconds.
+ */
+export class RateLimitError extends Error {
+	constructor(
+		public readonly retryAfterMs: number,
+		message?: string,
+	) {
+		super(message ?? `Rate limited — retry after ${retryAfterMs}ms`);
+		this.name = "RateLimitError";
+	}
+}
+
+/**
+ * Throttle queue: ensures at most `maxPerMinute` requests are dispatched
+ * per 60-second window by spacing them out.
+ *
+ * With the control-plane limit of 30 req/min we use 25 slots/min (2 400 ms
+ * minimum spacing) to stay safely below the ceiling.
+ */
+class TokenRequestThrottle {
+	/** Minimum delay between consecutive dispatched requests (ms) */
+	private readonly minIntervalMs: number;
+	/** Timestamp when the last request was dispatched */
+	private lastDispatchAt = 0;
+	/** Queue of pending resolvers waiting for their turn */
+	private queue: Array<() => void> = [];
+	private timer: number | null = null;
+	private log = namedLogger("[TokenRequestThrottle]", "debug");
+
+	constructor(maxPerMinute = 25) {
+		this.minIntervalMs = Math.ceil(60_000 / maxPerMinute);
+	}
+
+	/**
+	 * Returns a promise that resolves when it is this caller's turn to make
+	 * a network request.  Callers are served in FIFO order with at least
+	 * `minIntervalMs` between each dispatch.
+	 */
+	acquire(): Promise<void> {
+		return new Promise((resolve) => {
+			this.queue.push(resolve);
+			if (this.queue.length === 1) {
+				this._scheduleNext();
+			}
+		});
+	}
+
+	private _scheduleNext() {
+		if (this.queue.length === 0) return;
+
+		const now = Date.now();
+		const elapsed = now - this.lastDispatchAt;
+		const delay = Math.max(0, this.minIntervalMs - elapsed);
+
+		this.timer = window.setTimeout(() => {
+			this.timer = null;
+			const next = this.queue.shift();
+			if (next) {
+				this.lastDispatchAt = Date.now();
+				this.log(`dispatching queued request (queue remaining: ${this.queue.length})`);
+				next();
+				this._scheduleNext();
+			}
+		}, delay);
+	}
+
+	destroy() {
+		if (this.timer !== null) {
+			window.clearTimeout(this.timer);
+			this.timer = null;
+		}
+		// Drain any waiters so they are not leaked
+		for (const resolve of this.queue) {
+			resolve();
+		}
+		this.queue = [];
+	}
+}
+
+export class RelayOnPremTokenProvider {
+	private log = namedLogger("[RelayOnPremTokenProvider]");
+	private normalizedUrl: string;
+	/** Shared throttle — all token requests for this provider share one queue */
+	private throttle: TokenRequestThrottle;
+
+	constructor(private config: RelayOnPremTokenConfig) {
+		// Normalize URL - remove trailing slashes to prevent double-slash issues
+		this.normalizedUrl = config.controlPlaneUrl.replace(/\/+$/, "");
+		// 25 req/min leaves a 5-req safety margin below the server's 30 req/min limit
+		this.throttle = new TokenRequestThrottle(25);
+	}
+
+	/**
+	 * Repoint this provider at a new control-plane URL — e.g. when the
+	 * user edits the default server's URL in settings. The provider is
+	 * otherwise long-lived (held by RelayCredentialCache for the plugin's lifetime),
+	 * so without this the old URL stays baked into `normalizedUrl` until reload.
+	 */
+	updateControlPlaneUrl(controlPlaneUrl: string): void {
+		this.config.controlPlaneUrl = controlPlaneUrl;
+		this.normalizedUrl = controlPlaneUrl.replace(/\/+$/, "");
+	}
+
+	/**
+	 * Request a relay token for document access.
+	 * Requests are throttled to ≤25/min and throw RateLimitError on HTTP 429.
+	 */
+	async requestToken(
+		relayId: string,
+		folderId: string,
+		docId: string,
+		mode: "read" | "write" = "read",
+		filePath?: string
+	): Promise<DocumentGrant> {
+		const token = await this.config.authProvider.getValidToken();
+
+		if (!token) {
+			throw new Error("Not authenticated");
+		}
+
+		this.log(`Requesting relay token for doc ${docId} in folder ${folderId}${filePath ? ` (file: ${filePath})` : ""}`);
+
+		const request: RelayTokenRequest = {
+			share_id: folderId, // In relay-onprem, folder maps to share
+			doc_id: docId,
+			mode,
+		};
+
+		// Include file_path for folder shares if provided
+		if (filePath) {
+			request.file_path = filePath;
+		}
+
+		if (this.config.clientVersion) {
+			request.client_version = this.config.clientVersion;
+		}
+
+		// Wait for our slot in the throttle queue before hitting the network
+		await this.throttle.acquire();
+
+		try {
+			const response = await platformFetch(
+				`${this.normalizedUrl}/v1/tokens/relay`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${token}`,
+					},
+					body: JSON.stringify(request),
+				}
+			);
+
+			if (response.status === 429) {
+				// Parse Retry-After header (seconds) if present, default 60 s
+				const retryAfterSec = parseInt(response.headers.get("Retry-After") ?? "60", 10);
+				const retryAfterMs = (isNaN(retryAfterSec) ? 60 : retryAfterSec) * 1000;
+				const errorText = await response.text().catch(() => "");
+				console.warn(
+					`[DIAG][RelayOnPremTokenProvider] 429 rate limited for doc ${docId}. retryAfter=${retryAfterMs}ms body=${errorText}`
+				);
+				throw new RateLimitError(retryAfterMs, `Token request rate limited for doc ${docId}`);
+			}
+
+			if (response.status === 403 && mode === "write") {
+				// The caller always requests "write" regardless of the member's actual
+				// share role (see RelayCredentialRefresh.ts) — the control-plane correctly
+				// 403s a viewer's write request (ensure_write_access), but without this
+				// fallback that 403 propagated as a hard connection failure, leaving
+				// viewer-role members unable to open onprem relay shares at all (U3).
+				this.log(
+					`Write access denied for doc ${docId} — retrying as read-only (viewer role)`
+				);
+				return this.requestToken(relayId, folderId, docId, "read", filePath);
+			}
+
+			if (!response.ok) {
+				const errorText = await response.text();
+				throw new Error(`Token request failed: ${response.status} - ${errorText}`);
+			}
+
+			const data = await response.json() as RelayTokenResponse;
+
+			// Convert to DocumentGrant format expected by the plugin
+			const expiresAt = new Date(data.expires_at);
+			const clientToken: DocumentGrant = {
+				token: data.token,
+				url: data.relay_url,
+				docId: docId,
+				folder: folderId,
+				expiryTime: expiresAt.getTime(),
+				authorization: mode === "write" ? "full" : "read-only",
+			};
+
+			this.log(`Successfully obtained relay token, expires at ${data.expires_at}`);
+
+			return clientToken;
+		} catch (error: unknown) {
+			this.log("Token request error:", error);
+			throw error;
+		}
+	}
+
+	/**
+	 * Request a file token for attachment (BlobClient) access — HEAD/download-url/
+	 * upload-url on POST /shares/{id}/file-token's response. Unlike
+	 * requestToken (relay-token for the WebSocket doc connection), this
+	 * mints a presigned-URL-flavored token: BlobClient.ts reads only `baseUrl` and
+	 * `token` off the result and does HEAD/GET/POST against
+	 * `baseUrl` (+ "/download-url" | "/upload-url"). See BlobClient.ts for the
+	 * exact three-call contract this token is consumed by.
+	 *
+	 * Requests one token per operation without stating read/write intent
+	 * (same call shape for verify/readFile/writeFile) — the backend
+	 * independently re-checks read vs write access at each of the three
+	 * consuming routes, so this mint only needs read access to succeed.
+	 *
+	 * Storage key is `fileId` (the RemoteFileAddress UUID), not the vault path:
+	 * BlobClient.ts's call chain (AttachmentFile -> resolveFileToken(documentId, ...)) never
+	 * threads the vault-relative path down to this layer, and re-deriving it
+	 * would mean changing BlobClient.ts's own call signature. fileId is already
+	 * available (decoded from documentId one layer up in fetchFileTokenFromApi),
+	 * stable across renames, and unique per attachment within a share — a
+	 * better storage key than a path would be anyway.
+	 */
+	async requestFileToken(
+		relayId: string,
+		folderId: string,
+		fileId: string,
+		fileHash: string,
+		contentType: string,
+		contentLength: number,
+	): Promise<FileGrant> {
+		const token = await this.config.authProvider.getValidToken();
+
+		if (!token) {
+			throw new Error("Not authenticated");
+		}
+
+		this.log(`Requesting file token for ${fileId} in folder ${folderId}`);
+
+		const request: FileTokenRequest = {
+			path: fileId,
+			sha256: fileHash,
+			content_type: contentType,
+			content_length: contentLength,
+		};
+
+		// Deliberately NOT routed through this.throttle: POST /file-token has no
+		// control-plane rate limit (the 30/min ceiling applies to doc tokens), and
+		// sharing the 25/min queue made attachment tokens the bulk of initial-sync
+		// lane time. A 429 still surfaces as RateLimitError and is retried by the caller.
+		try {
+			const response = await platformFetch(
+				`${this.normalizedUrl}/v1/shares/${folderId}/file-token`,
+				{
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Authorization: `Bearer ${token}`,
+					},
+					body: JSON.stringify(request),
+				}
+			);
+
+			if (response.status === 429) {
+				const retryAfterSec = parseInt(response.headers.get("Retry-After") ?? "60", 10);
+				const retryAfterMs = (isNaN(retryAfterSec) ? 60 : retryAfterSec) * 1000;
+				const errorText = await response.text().catch(() => "");
+				console.warn(
+					`[DIAG][RelayOnPremTokenProvider] 429 rate limited for file-token ${fileId}. retryAfter=${retryAfterMs}ms body=${errorText}`
+				);
+				throw new RateLimitError(
+					retryAfterMs,
+					`File token request rate limited for ${fileId}`
+				);
+			}
+
+			if (!response.ok) {
+				const errorText = await response.text();
+				throw new Error(`File token request failed: ${response.status} - ${errorText}`);
+			}
+
+			const data = (await response.json()) as FileTokenApiResponse;
+			const expiresAt = new Date(data.expires_at);
+
+			const fileToken: FileGrant = {
+				token: data.token,
+				// BlobClient.ts does `token.baseUrl!` then platformFetch(baseUrl, ...) —
+				// must be populated, `url` is unused by BlobClient.ts but required by
+				// the DocumentGrant shape, reuse the same value rather than "".
+				baseUrl: data.base_url,
+				url: data.base_url,
+				docId: fileId,
+				folder: folderId,
+				expiryTime: expiresAt.getTime(),
+				// Not read by BlobClient.ts (verified) — real read/write enforcement
+				// happens server-side per-route, not via this cached label.
+				authorization: "full",
+				contentType,
+				contentLength,
+				fileHash,
+			};
+
+			this.log(`Successfully obtained file token for ${fileId}, expires at ${data.expires_at}`);
+
+			return fileToken;
+		} catch (error: unknown) {
+			this.log("File token request error:", error);
+			throw error;
+		}
+	}
+
+	destroy() {
+		this.throttle.destroy();
+	}
+}

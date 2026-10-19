@@ -1,0 +1,19 @@
+Team Relay
+Copyright (c) 2024-2026 Entire VC
+
+This product bundles third-party software, listed below. Each component keeps
+its own licence, reproduced in full in the accompanying LICENSE file inside the
+corresponding directory.
+
+  src/y-codemirror.next/   Copyright (c) 2024 Kevin Jahns
+                           See src/y-codemirror.next/LICENSE
+
+
+The licence files in those directories are reproduced as received and are not
+to be edited: removing a copyright notice from code that is still present is a
+legal act, not housekeeping.
+
+The WebSocket provider (src/client/provider.ts) was written for Team Relay and
+speaks the standard y-protocols framing; its class name (YSweetProvider) reflects
+wire compatibility with the y-sweet relay server (jamsocket/y-sweet, MIT). No
+y-sweet source is bundled.

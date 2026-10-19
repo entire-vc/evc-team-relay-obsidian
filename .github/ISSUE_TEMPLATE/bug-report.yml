@@ -1,0 +1,75 @@
+name: Bug Report
+description: Report a bug in Team Relay plugin or relay server
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where does the issue occur?
+      options:
+        - Obsidian Plugin (sync/collaboration)
+        - Relay Server (self-hosted)
+        - Web Publish
+        - Control Plane / Admin UI
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Plugin / Relay Version
+      placeholder: "e.g. plugin 2.1.0 / relay 1.5.0"
+    validations:
+      required: true
+  - type: input
+    id: obsidian-version
+    attributes:
+      label: Obsidian Version
+      placeholder: "e.g. 1.7.4"
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Self-hosted (docker compose)
+        - Hosted (entire.vc)
+        - Local development
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - iOS
+        - Android
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you expect vs what actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      value: |
+        1. 
+        2. 
+        3. 
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Plugin: Developer Tools → Console. Relay: docker logs or journal output."
+      render: text

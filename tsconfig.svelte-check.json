@@ -1,0 +1,18 @@
+{
+	// Dedicated tsconfig for `svelte-check` only (package.json script
+	// `typecheck:svelte`, CI job `svelte-check`). Extends the real
+	// project config rather than duplicating its compilerOptions, so the
+	// two configs cannot silently diverge on target/lib/strictness -- the
+	// only thing this file adds is "noEmit", which the plain `tsc` gate
+	// gets for free from its own `-noEmit` CLI flag instead.
+	//
+	// Why this exists instead of just adding "noEmit" to tsconfig.json
+	// directly: tsconfig.json is also read by ts-jest (jest.config.js) and
+	// by editors; changing its emit behavior for every consumer to fix a
+	// warning specific to svelte-check's internal program construction is
+	// a wider blast radius than the fix needs.
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": true
+	}
+}

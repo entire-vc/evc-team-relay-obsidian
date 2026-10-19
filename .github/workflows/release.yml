@@ -1,0 +1,120 @@
+name: Release
+# Build, attest provenance and publish a release tagged EXACTLY = manifest.version
+# (bare semver, no 'v'), with main.js, manifest.json and styles.css as assets.
+# A workflow_dispatch naming a version whose tag does not exist yet creates and
+# pushes the tag itself, then continues into the same build/attest/release steps.
+on:
+  push:
+    tags: ['[0-9]*.[0-9]*.[0-9]*']        # bare semver only — a 'v'-prefixed tag won't trigger
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version to create+release (new tag) or (re)build/attest/release (existing tag) — bare semver, e.g. 1.2.5'
+        required: true
+      allow_overwrite:
+        description: 'republish over an EXISTING release of this version (say why in the run notes)'
+        type: boolean
+        default: false
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine dispatch ref (does this version's tag exist yet?)
+        # Only meaningful for workflow_dispatch. A tag-push run always builds the pushed tag,
+        # so this step is skipped and the checkout below falls back to github.ref unchanged.
+        id: dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -eu
+          if git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && steps.dispatch.outputs.ref || github.ref }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Create + push release tag as CI identity (workflow_dispatch, new tag only)
+        # Runs on the dispatching branch, BEFORE the build — a build's manifest.json can get
+        # stamped with a debug/dev version (see the restore step below); the version that
+        # decides whether we're allowed to cut this tag must be the committed one.
+        if: github.event_name == 'workflow_dispatch' && steps.dispatch.outputs.exists != 'true'
+        run: |
+          set -eu
+          TAG="${{ inputs.version }}"
+          case "$TAG" in v*) echo "::error::'$TAG' has a 'v' prefix — Obsidian needs bare semver"; exit 1;; esac
+          VER=$(node -p "require('./manifest.json').version")
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::requested tag '$TAG' != manifest.version '$VER' on ${{ github.ref }}."
+            echo "::error::Bump manifest.json to $TAG on this branch (normal PR/merge) first, then dispatch again."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+      - run: npm ci || npm install
+      - run: npm run build
+      - name: Restore committed manifest.json (a dev/debug build must NEVER change the published version)
+        # A debug build may stamp manifest.json (esbuild
+        # debug overwrite, version=beta). The published version MUST be the tag's committed manifest.
+        run: git checkout HEAD -- manifest.json
+      - name: Resolve + verify version (bare, tag == manifest)
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.version }}"; else TAG="${GITHUB_REF_NAME}"; fi
+          VER=$(node -p "require('./manifest.json').version")
+          case "$TAG" in v*) echo "::error::tag '$TAG' has a 'v' prefix — Obsidian needs bare semver"; exit 1;; esac
+          if [ "$TAG" != "$VER" ]; then echo "::error::tag '$TAG' != manifest.version '$VER'"; exit 1; fi
+          [ -f main.js ] || { echo "::error::main.js not built"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance (main.js, styles.css)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            main.js
+            styles.css
+      - name: Create release with assets (refuses to overwrite an existing one)
+        # A published release is the artifact users install. Silently replacing its
+        # assets makes "version X" mean two different builds, and nothing downstream
+        # can tell which one it got -- the attestation above is per-run, so the old
+        # one keeps attesting bytes that are gone. So: publishing is create-only.
+        #
+        # Re-running a failed release is still possible and is meant to be visible:
+        # dispatch with allow_overwrite=true and say why. The override exists, and
+        # it is loud.
+        #
+        # Scope: this closes the workflow's own re-publish path. It does NOT stop
+        # someone with `contents: write` from running `gh release create` by hand.
+        # Closing that needs tag protection, or write removed for everyone except
+        # the release job -- a repository-admin change, not a workflow change.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ALLOW_OVERWRITE: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_overwrite || 'false' }}
+        run: |
+          set -eu
+          TAG="${{ steps.v.outputs.tag }}"
+          ASSETS="main.js manifest.json"
+          [ -f styles.css ] && ASSETS="$ASSETS styles.css"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$ALLOW_OVERWRITE" != "true" ]; then
+              echo "::error::release $TAG already exists. Publishing is create-only:"
+              echo "::error::a released version must not silently change bytes."
+              echo "::error::To ship a fix, tag a NEW version. To deliberately republish"
+              echo "::error::this one, dispatch this workflow with allow_overwrite=true."
+              exit 1
+            fi
+            echo "::warning::overwriting assets of existing release $TAG (allow_overwrite=true)"
+            gh release upload "$TAG" $ASSETS --clobber
+          else
+            gh release create "$TAG" $ASSETS --title "$TAG" --notes "Release $TAG"
+          fi

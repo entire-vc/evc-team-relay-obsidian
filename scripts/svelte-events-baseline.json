@@ -1,0 +1,5 @@
+{
+	"_comment": "Frozen baseline of pre-existing unreachable Svelte listener bindings found by check-svelte-events.py --update-baseline. Do NOT hand-edit to silence a new one -- fix it (rename to match a real dispatch, or delete the dead listener with a static proof, per #8c9a4223), or if it is genuinely deliberate, say why in the commit and update via --update-baseline.",
+	"generated_note": "#8c9a4223: the two unreachable listeners (on:close, on:manageRemoteFolder on SettingsPanel.svelte's svelte:component) fixed by deletion, proven dead via this same graph. Baseline is genuinely empty now, not suppressed.",
+	"violations": []
+}

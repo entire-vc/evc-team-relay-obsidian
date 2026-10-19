@@ -1,0 +1,56 @@
+{
+	// Dedicated tsconfig for the `tests-typecheck` CI job (package.json script
+	// `typecheck:tests`, ratcheted via scripts/check-tests-types.py). Extends
+	// the real project config rather than duplicating its compilerOptions, so
+	// the two configs cannot silently diverge on target/lib/strictness --
+	// the only thing this file changes is `include`/`exclude` (widened to
+	// reach __tests__) and `noEmit` (this config is never built from, same
+	// reasoning as tsconfig.svelte-check.json).
+	//
+	// Why this exists instead of just widening tsconfig.json's own `include`:
+	// tsconfig.json is also read by ts-jest (jest.config.js) and by editors;
+	// this gate is ratcheted against a frozen baseline of 209 pre-existing
+	// errors (scripts/tests-typecheck-baseline.json) rather than gated on
+	// zero -- widening the shared config for every consumer to carry that
+	// baseline concept is a wider blast radius than the fix needs. Mirrors
+	// tsconfig.svelte-check.json's own rationale exactly.
+	//
+	// Background: (follow-up to's.svelte gate).
+	// __tests__ was excluded from tsc's `include` entirely, so a hand-rolled
+	// mock declaring its OWN shape instead of referencing the real production
+	// type went stale after a rename with zero compile error -- caught twice
+	// in one evening only because the affected test happened to assert on the
+	// now-`undefined` field (FakeFolder.connected -> isOnline, MR !228;
+	// FakeFile.guid -> entityGuid, MR !235). A mock whose stale field isn't
+	// read by any assertion would have stayed green and silent.
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"noEmit": true,
+		// tsconfig.json's own `types` is `["svelte", "node"]` -- no ambient
+		// Jest globals. Most __tests__ files import describe/it/expect/jest
+		// explicitly from "@jest/globals", but several rely on Jest's
+		// runtime-injected globals with no import at all (jest always
+		// provides them regardless of what TS believes is ambient). Without
+		// "jest" here, tsc reports ~180 pure false positives ("Cannot find
+		// name 'describe'") in exactly those files -- confirmed by diffing
+		// this config against one that included "jest" from the start: same
+		// file set, same line numbers, error disappears. Baseline noise of
+		// that shape would bury genuine new errors on every PR.
+		"types": ["jest", "node"]
+	},
+	"include": [
+		"**/*.ts",
+		"__tests__/**/*.ts"
+	],
+	"exclude": [
+		"node_modules",
+		"vaults",
+		// The live relay harness talks to a real control-plane + relay-server
+		// over real sockets (LIVE_RELAY=1 npx jest --config jest.live.config.js)
+		// and is excluded from the ordinary `test` job for the same reason
+		// (jest.config.js's own testPathIgnorePatterns) -- it is never run in
+		// CI, so type-checking it here would grow the frozen baseline with
+		// errors nothing else ever exercises.
+		"__tests__/live"
+	]
+}

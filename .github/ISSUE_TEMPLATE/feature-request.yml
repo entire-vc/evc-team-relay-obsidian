@@ -1,0 +1,41 @@
+name: Feature Request
+description: Suggest a feature for Team Relay plugin or relay server
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Obsidian Plugin
+        - Relay Server
+        - Web Publish
+        - Control Plane / Admin UI
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: priority
+    attributes:
+      label: How important is this?
+      options:
+        - Nice to have
+        - Important for my workflow
+        - Blocking adoption
