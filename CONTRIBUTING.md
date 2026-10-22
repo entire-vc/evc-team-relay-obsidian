@@ -1,4 +1,4 @@
-# Contributing to EVC Team Relay Obsidian Plugin
+# Contributing to the Team Relay Sync Obsidian Plugin
 
 Thanks for your interest in contributing! This plugin enables live team editing and sync in Obsidian via EVC Team Relay.
 
@@ -25,7 +25,7 @@ npm run lint
 ### Testing in Obsidian
 
 1. Build the plugin: `npm run build`
-2. Copy `main.js` and `manifest.json` to your vault's `.obsidian/plugins/evc-team-relay/`
+2. Copy `main.js` and `manifest.json` to your vault's `.obsidian/plugins/team-relay-sync/`
 3. Enable the plugin in Obsidian Settings > Community Plugins
 4. Point it at your local Team Relay instance
 
