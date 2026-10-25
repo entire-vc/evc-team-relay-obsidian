@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { createEventDispatcher, onMount } from "svelte";
+	import { onMount } from "svelte";
 	import type TeamRelayPlugin from "../main";
 	import AddTenantForm from "./AddTenantForm.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
@@ -7,8 +7,8 @@
 	import { validateEndpointUrl, describeCaughtError } from "./endpointUrlValidation";
 
 	export let live: TeamRelayPlugin;
-
-	const dispatch = createEventDispatcher();
+	export let onClose: () => void;
+	export let onApply: () => void;
 
 	let newTenantUrl = "";
 	let isValidating = false;
@@ -150,7 +150,8 @@
 	}
 
 	function handleApplyOrClose() {
-		dispatch(hasChanges ? "apply" : "close");
+		if (hasChanges) onApply();
+		else onClose();
 	}
 
 	// Kick off the default-tenant info fetch on mount

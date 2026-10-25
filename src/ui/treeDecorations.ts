@@ -12,6 +12,7 @@ import { Document } from "src/Document";
 import SyncStatusBadge from "src/components/SyncStatusBadge.svelte";
 import TextBadge from "src/components/TextBadge.svelte";
 import UploadBadge from "src/components/UploadBadge.svelte";
+import { mountComponent, type MountedComponent } from "src/svelteMount";
 import type { TransferTask } from "src/TransferQueue";
 import type { Unsubscriber } from "src/notifiers/Notifier";
 import type { NotifierSet } from "src/notifiers/NotifierSet";
@@ -80,7 +81,7 @@ export class FolderLiveIndicatorVisitor extends NoopVisitor<FolderLiveIndicator>
 // Renders the connection-status pill on a shared folder's own row.
 class FolderStatusPill implements Disposable {
 	private readonly el: HTMLElement;
-	private readonly pill: SyncStatusBadge;
+	private readonly pill: MountedComponent<Record<string, unknown>>;
 	private readonly unsubscribe: TeardownFn;
 
 	constructor(
@@ -96,7 +97,7 @@ class FolderStatusPill implements Disposable {
 		this.el = el;
 		this.el.addClass("evc-relay-pill");
 
-		this.pill = new SyncStatusBadge({
+		this.pill = mountComponent(SyncStatusBadge, {
 			target: this.el,
 			props: {
 				connectionStatus: this.vaultShare.connectionState.status,
@@ -109,7 +110,7 @@ class FolderStatusPill implements Disposable {
 
 		const unsubs: TeardownFn[] = [
 			this.vaultShare.subscribe(this.el, (state: ConnectionState) => {
-				this.pill.$set({
+				this.pill.update({
 					connectionStatus: state.status,
 					hubId: this.vaultShare.workspaceId,
 					linked: this.vaultShare.linked,
@@ -119,7 +120,7 @@ class FolderStatusPill implements Disposable {
 				this.vaultShare,
 				(progress) => {
 					if (progress) {
-						this.pill.$set({
+						this.pill.update({
 							progressPercent: progress.percent,
 							transferPhase: progress.phase,
 						});
@@ -131,7 +132,7 @@ class FolderStatusPill implements Disposable {
 	}
 
 	destroy() {
-		this.pill.$destroy();
+		this.pill.destroy();
 		this.unsubscribe();
 		this.el.removeClass("evc-relay-pill");
 	}
@@ -224,7 +225,7 @@ export class SyncQueueIndicatorVisitor extends NoopVisitor<SyncQueueIndicator> {
 // syncable non-document file (an attachment tracked by AttachmentFile rather than
 // by the Yjs-backed Document flow).
 class FileUploadPill implements Disposable {
-	private badge?: UploadBadge;
+	private badge?: MountedComponent<Record<string, unknown>>;
 	private readonly unsubscribes: Unsubscriber[];
 
 	constructor(
@@ -240,7 +241,8 @@ class FileUploadPill implements Disposable {
 	private refreshBadge() {
 		if (!this.attachment) return;
 		if (this.attachment.hasRemoteMeta) {
-			this.badge?.$destroy();
+			this.badge?.destroy();
+			this.badge = undefined;
 			return;
 		}
 		const pillText = this.attachment.statusTag;
@@ -248,12 +250,12 @@ class FileUploadPill implements Disposable {
 			? "var(--text-error)"
 			: undefined;
 		if (!this.badge) {
-			this.badge = new UploadBadge({
+			this.badge = mountComponent(UploadBadge, {
 				target: this.rowEl,
 				props: { pillText, ariaLabel: pillText, tintColor },
 			});
 		} else {
-			this.badge.$set({ pillText, ariaLabel: pillText, tintColor });
+			this.badge.update({ pillText, ariaLabel: pillText, tintColor });
 		}
 	}
 
@@ -262,7 +264,8 @@ class FileUploadPill implements Disposable {
 		this.rowEl.querySelectorAll(".evc-relay-uploadpill").forEach((el) => {
 			el.remove();
 		});
-		this.badge?.$destroy();
+		this.badge?.destroy();
+		this.badge = undefined;
 	}
 }
 
@@ -302,14 +305,14 @@ export class FileUploadPillVisitor extends NoopVisitor<FileUploadPill> {
 // type) with a "NOT SYNCED" pill. `text`/`label` are copy read by the user
 // and must stay byte-for-byte stable — do not reword casually.
 class UnsyncedFilePill implements Disposable {
-	private readonly pill: TextBadge;
+	private readonly pill: MountedComponent<Record<string, unknown>>;
 
 	constructor(private readonly el: HTMLElement) {
 		this.el.querySelectorAll(".evc-relay-filepill").forEach((el) => {
 			el.remove();
 		});
 		// TODO: Ensure the not-synced pill comes last
-		this.pill = new TextBadge({
+		this.pill = mountComponent(TextBadge, {
 			target: this.el,
 			props: {
 				pillText: "NOT SYNCED",
@@ -319,7 +322,7 @@ class UnsyncedFilePill implements Disposable {
 	}
 
 	destroy() {
-		this.pill.$destroy();
+		this.pill.destroy();
 		this.el.querySelectorAll(".evc-relay-filepill").forEach((el) => {
 			el.remove();
 		});

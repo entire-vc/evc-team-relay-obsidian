@@ -1,35 +1,46 @@
 const path = require("node:path");
 const { loadSvelteComponent } = require("../scripts/test/svelteDOM.cjs");
-const loadBadge = (compatible) => loadSvelteComponent(path.resolve(__dirname, "../src/components/TextBadge.svelte"), {}, compatible);
+const loadBadge = () => loadSvelteComponent(path.resolve(__dirname, "../src/components/TextBadge.svelte"));
 
-test("the default Svelte 5 API rejects an existing class constructor (negative control)", async () => {
-	const { dom, default: Component } = await loadBadge(false);
+test("production options no longer accept the Svelte 4 class constructor", async () => {
+	const { dom, default: Component } = await loadBadge();
 	try {
 		expect(() => new Component({ target: dom.window.document.body, props: { pillText: "before", ariaLabel: "initial" } }))
 			.toThrow(/component_api_invalid_new/);
 	} finally { dom.window.close(); }
 });
 
-test("production options support new Component, $set, $on and $destroy in a real DOM", async () => {
-	const { dom, default: Component, flushSync } = await loadBadge(true);
+test("props passed to a bare mount() are read once (negative control for update)", async () => {
+	const { dom, default: Component, mount, flushSync } = await loadBadge();
+	const target = dom.window.document.body;
+	try {
+		const props = { pillText: "before", ariaLabel: "initial" };
+		mount(Component, { target, props });
+		flushSync();
+		props.pillText = "after";
+		flushSync();
+		expect(target.textContent).toBe("before");
+	} finally { dom.window.close(); }
+});
+
+test("mountComponent mounts, updates (including keys absent at mount) and destroys in a real DOM", async () => {
+	const { dom, default: Component, mountComponent, flushSync } = await loadBadge();
 	const target = dom.window.document.body;
 	let component;
 	try {
-		component = new Component({ target, props: { pillText: "before", ariaLabel: "initial" } });
+		component = mountComponent(Component, { target, props: { pillText: "before" } });
 		expect(target.textContent).toBe("before");
-		const unsubscribe = component.$on("unused", () => {});
-		expect(typeof unsubscribe).toBe("function");
-		unsubscribe();
-		component.$set({ pillText: "after", ariaLabel: "updated" });
+		expect(target.firstElementChild.hasAttribute("aria-label")).toBe(false);
+		component.update({ pillText: "after", ariaLabel: "updated" });
 		flushSync();
 		expect(target.textContent).toBe("after");
 		expect(target.firstElementChild.getAttribute("aria-label")).toBe("updated");
-		component.$destroy();
+		component.destroy();
 		component = undefined;
 		expect(target.textContent).toBe("");
 		expect(target.children).toHaveLength(0);
 	} finally {
-		component?.$destroy();
+		component?.destroy();
 		dom.window.close();
 	}
 });

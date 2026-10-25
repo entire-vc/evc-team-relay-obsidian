@@ -4,6 +4,7 @@ import { App, PluginSettingTab } from "obsidian";
 import type { SettingDefinitionItem } from "obsidian";
 import TeamRelayPlugin from "src/main";
 import SettingsPanel from "src/components/SettingsPanel.svelte";
+import { mountComponent, type MountedComponent } from "src/svelteMount";
 
 type CloseableSetting = { setting: { close: () => void } };
 
@@ -22,7 +23,7 @@ export class RelaySettingsPage extends PluginSettingTab {
 	// `this.plugin` internally, with zero compile error to catch it.
 	plugin: TeamRelayPlugin;
 	mountEl!: HTMLElement;
-	private panel?: SettingsPanel;
+	private panel?: MountedComponent<Record<string, unknown>>;
 
 	constructor(app: App, plugin: TeamRelayPlugin) {
 		super(app, plugin);
@@ -69,7 +70,7 @@ export class RelaySettingsPage extends PluginSettingTab {
 					// runs through hide() below; this cleanup covers the row
 					// itself being torn down independently of the tab (e.g. a
 					// future getSettingDefinitions() reconciliation). hide()
-					// is idempotent (try/catch around $destroy()).
+					// is idempotent (try/catch around destroy()).
 					return () => this.hide();
 				},
 			},
@@ -86,7 +87,7 @@ export class RelaySettingsPage extends PluginSettingTab {
 		this.mountEl.empty();
 		void this.plugin.relayRegistry.refresh();
 
-		this.panel = new SettingsPanel({
+		this.panel = mountComponent(SettingsPanel, {
 			target: this.mountEl,
 			props: {
 				live: this.plugin,
@@ -96,12 +97,12 @@ export class RelaySettingsPage extends PluginSettingTab {
 	}
 
 	showPath(path: string): void {
-		this.panel?.$set({ initialPath: path });
+		this.panel?.update({ initialPath: path });
 	}
 
 	hide(): void {
 		try {
-			this.panel?.$destroy();
+			this.panel?.destroy();
 		} catch (e: unknown) {
 			console.warn(e);
 		}
