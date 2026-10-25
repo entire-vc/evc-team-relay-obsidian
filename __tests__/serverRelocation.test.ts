@@ -276,13 +276,13 @@ function noMemoryFixture(disk: Record<string, string>) {
 				exists: async (p: string) => files.has(p),
 				readBinary: async (p: string) => new TextEncoder().encode(files.get(p) ?? "").buffer,
 			},
-			trash: async (node: { path: string }) => {
+		},
+		fileOps: {
+			trashFile: async (node: { path: string }) => {
 				trashed.push(node.path);
 				files.delete(node.path);
 				folders.delete(node.path);
 			},
-		},
-		fileOps: {
 			renameFile: async (file: { path: string }, to: string) => {
 				renames.push([file.path, to]);
 				for (const [p, text] of [...files]) {

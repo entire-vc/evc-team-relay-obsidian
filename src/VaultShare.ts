@@ -574,7 +574,7 @@ export class VaultShare extends ProviderBacked {
 				const x = new Uint8Array(a);
 				const y = new Uint8Array(b);
 				if (x.some((byte, i) => byte !== y[i])) continue;
-				await this.vaultApi.trash(file, false);
+				await this.fileOps.trashFile(file);
 			}
 			const folders = inside
 				.filter((file): file is TFolder => file instanceof TFolder)
@@ -584,7 +584,7 @@ export class VaultShare extends ProviderBacked {
 			for (const folder of folders) {
 				const live = this.vaultApi.getAbstractFileByPath(folder.path);
 				if (live instanceof TFolder && live.children.length === 0) {
-					await this.vaultApi.trash(live, false);
+					await this.fileOps.trashFile(live);
 				}
 			}
 		} catch (e: unknown) {
@@ -2637,7 +2637,7 @@ export class VaultShare extends ProviderBacked {
 					if (candidate.children.length !== 0) continue;
 					discarded.add(candidate);
 					try {
-						await this.vaultApi.trash(candidate, false);
+						await this.fileOps.trashFile(candidate);
 					} catch (error: unknown) {
 						this.warn("could not remove discarded folder creation", candidate.path, error);
 					}

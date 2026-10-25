@@ -24,7 +24,7 @@
 
 	function deleteLocalCopy(): void {
 		const folder = syncedFolder && live.pluginVault.getFolderByPath(syncedFolder.path);
-		if (folder) live.app.vault.trash(folder, false);
+		if (folder) void live.app.fileManager.trashFile(folder);
 		dispatch("goBack", {});
 	}
 
