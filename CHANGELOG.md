@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.3
+- Svelte components are now mounted with the Svelte 5 `mount`/`unmount` API instead of the legacy component API; the legacy compatibility mode is turned off. No functional changes.
+
 ## 0.1.2
 - Removing files and folders (stale copies after a move, discarded folder creations, "Delete local copy") now goes through Obsidian's file manager, so it follows your "Deleted files" setting instead of always using the vault `.trash` folder.
 - Internal type cleanups in the local document store. No other functional changes.
