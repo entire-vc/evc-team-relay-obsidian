@@ -54,7 +54,7 @@ describe("cached folder startup", () => {
 		const writer = new LocalDocumentStore(database, seed.cache);
 		await writer.whenSynced;
 		await collapseStoredHistory(writer);
-		await writer.destroy();
+		await writer.close();
 		const replayed = new Y.Doc();
 		const reader = new LocalDocumentStore(database, replayed);
 		await reader.whenSynced;
@@ -100,7 +100,7 @@ describe("cached folder startup", () => {
 		} finally {
 			if (contains) Object.defineProperty(Array.prototype, "contains", contains);
 			else Reflect.deleteProperty(Array.prototype, "contains");
-			await reader.destroy();
+			await reader.close();
 			await dropStoredDocument(database);
 		}
 	});
