@@ -61,10 +61,6 @@ or open `obsidian://show-plugin?id=team-relay-sync`, or search for "Team Relay S
 
 As a fallback, [BRAT](https://github.com/TfTHacker/obsidian42-brat) can install it from `entire-vc/evc-team-relay-obsidian`.
 
-### Coming from the earlier `team-relay` plugin
-
-This plugin has a new id (`team-relay-sync`), so Obsidian keeps its settings in a separate folder and does not carry them over automatically. Disable the old `team-relay` plugin first (the two should not run side by side), then either add your server again in the new plugin's settings, or close Obsidian and copy `data.json` from `.obsidian/plugins/team-relay/` into `.obsidian/plugins/team-relay-sync/`.
-
 ---
 
 ## Quickstart
