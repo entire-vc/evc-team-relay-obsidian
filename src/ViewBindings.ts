@@ -214,7 +214,7 @@ class ViewActionsMount {
 			this.unsubscribe?.();
 			this.component = mountComponent(EditorStatusActions, {
 				target: actionsEl,
-				anchor: actionsEl.firstChild as Element,
+				anchor: actionsEl.firstChild,
 				props,
 			});
 			this.unsubscribe = doc.subscribe(actionsEl, (state: ConnectionState) => {
