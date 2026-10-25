@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.4
+- Removed a type assertion in the editor status bindings that became redundant with the Svelte 5 mount helper. No functional changes.
+
 ## 0.1.3
 - Svelte components are now mounted with the Svelte 5 `mount`/`unmount` API instead of the legacy component API; the legacy compatibility mode is turned off. No functional changes.
 
