@@ -1,5 +1,6 @@
 # Team Relay Sync
 
+[**Install from Obsidian community plugins →**](https://community.obsidian.md/plugins/team-relay-sync)
 
 **Real-time collaboration and web publishing for Obsidian.**
 
@@ -43,6 +44,12 @@ You love Obsidian, but your team needs more:
 
 ## Install
 
+### From Obsidian community plugins (recommended)
+
+Open [**Team Relay Sync** in the community plugin directory](https://community.obsidian.md/plugins/team-relay-sync) and click **Add to Obsidian**,
+or open `obsidian://show-plugin?id=team-relay-sync`, or search for "Team Relay Sync" in
+*Settings → Community plugins → Browse*. Then enable **Team Relay Sync**.
+
 ### Manual install
 
 1. Download `main.js`, `manifest.json` and `styles.css` from the
@@ -52,13 +59,7 @@ You love Obsidian, but your team needs more:
 3. Restart Obsidian, then enable **Team Relay Sync** in
    *Settings → Community plugins*
 
-### Coming from the earlier `team-relay` plugin
-
-This plugin has a new id (`team-relay-sync`), so Obsidian keeps its settings in a separate folder and does not carry them over automatically. Disable the old `team-relay` plugin first (the two should not run side by side), then either add your server again in the new plugin's settings, or close Obsidian and copy `data.json` from `.obsidian/plugins/team-relay/` into `.obsidian/plugins/team-relay-sync/`.
-
-### From the community catalogue
-
-Once the listing is live: Settings → Community plugins → Browse → search "Team Relay".
+As a fallback, [BRAT](https://github.com/TfTHacker/obsidian42-brat) can install it from `entire-vc/evc-team-relay-obsidian`.
 
 ---
 
