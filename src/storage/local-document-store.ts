@@ -177,7 +177,7 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 	private readonly _storeDebounceMs = 1000;
 	private readonly _updateHandler: (update: Uint8Array, origin: unknown) => void;
 	private readonly _destroyHandler = (): void => {
-		void this.destroy();
+		this.destroy();
 	};
 
 	constructor(name: string, doc: Y.Doc) {
@@ -238,7 +238,7 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 			});
 		};
 		doc.on("update", this._updateHandler);
-		this.destroy = this.destroy.bind(this);
+		this.close = this.close.bind(this);
 		doc.on("destroy", this._destroyHandler);
 	}
 
@@ -256,18 +256,27 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 	 * `whenSynced` and callers that attach late both depend on this: without
 	 * it, subscribing after the load finished waits forever.
 	 */
-	once<NAME extends keyof LocalDocumentStoreEvents & string>(
+	once<NAME extends keyof LocalDocumentStoreEvents>(
 		name: NAME,
 		f: LocalDocumentStoreEvents[NAME],
 	): void {
 		if (name === "synced" && this.synced) {
-			(f as LocalDocumentStoreEvents["synced"])(this);
+			f(this);
 			return;
 		}
 		super.once(name, f);
 	}
 
-	destroy(): Promise<void> {
+	/**
+	 * Fire-and-forget teardown, matching the void `destroy()` of the
+	 * observable base class. Use `close()` to wait for the database to close.
+	 */
+	destroy(): void {
+		void this.close();
+	}
+
+	/** Stop persisting, drop all listeners and close the database. */
+	close(): Promise<void> {
 		if (this._storeTimeoutId !== null) {
 			window.clearTimeout(this._storeTimeoutId);
 			this._storeTimeoutId = null;
@@ -283,7 +292,7 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 
 	/** Destroy this instance and delete everything it stored. */
 	async dropAll(): Promise<void> {
-		await this.destroy();
+		await this.close();
 		await dropStoredDocument(this.name);
 	}
 

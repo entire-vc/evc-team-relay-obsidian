@@ -62,25 +62,25 @@ describe("LocalDocumentStore", () => {
 		expect(await store.get("k")).toBe("v");
 	});
 
-	test("detached destroy remains awaitable and closes the database after clearing listeners", async () => {
+	test("detached close remains awaitable and closes the database after clearing listeners", async () => {
 		const doc = new Y.Doc();
 		const store = new LocalDocumentStore(`destroy-${Math.random()}`, doc);
 		await store.whenSynced;
 		const db = await store._dbref;
-		const close = jest.spyOn(db, "close");
+		const dbClose = jest.spyOn(db, "close");
 		const listener = jest.fn();
 		store.on("synced", listener);
 
-		const destroy = store.destroy;
-		await destroy();
+		const detachedClose = store.close;
+		await detachedClose();
 
-		expect(close).toHaveBeenCalledTimes(1);
+		expect(dbClose).toHaveBeenCalledTimes(1);
 		expect(store._destroyed).toBe(true);
 		store.emit("synced", [store]);
 		expect(listener).not.toHaveBeenCalled();
 		doc.destroy();
 		await Promise.resolve();
-		expect(close).toHaveBeenCalledTimes(1);
+		expect(dbClose).toHaveBeenCalledTimes(1);
 	});
 
 	test("destroying the document also closes its persistence database", async () => {

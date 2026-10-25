@@ -104,7 +104,7 @@ describe("LocalDocumentStore replay with identity seeded first", () => {
 		Y.applyUpdate(first, tombstonedUsersUpdate("acct-gone"));
 		// The doc's own "update" handler persists to IDB asynchronously.
 		await new Promise((r) => window.setTimeout(r, 50));
-		await store.destroy();
+		await store.close();
 	}
 
 	test("reopen reaches synced when the stored history holds a tombstoned users entry", async () => {
