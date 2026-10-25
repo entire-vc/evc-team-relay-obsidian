@@ -25,8 +25,7 @@ function fixture(entryPath = "late", missingParent = false) {
 	const createEvents: Promise<void>[] = [];
 	let resume!: (node: TFolder) => void;
 	const creation = new Promise<TFolder>((resolve) => { resume = resolve; });
-	const trashFolder = jest.fn(async (node: TAbstractFile, systemTrash?: boolean) => {
-		expect(systemTrash).toBe(false);
+	const trashFolder = jest.fn(async (node: TAbstractFile) => {
 		expect(node).toBeInstanceOf(TFolder);
 		if (!(node instanceof TFolder)) throw new Error("expected a folder");
 		expect(node.children).toHaveLength(0);
@@ -47,11 +46,11 @@ function fixture(entryPath = "late", missingParent = false) {
 		vaultApi: {
 			getAbstractFileByPath: (path: string) => nodes.get(path) ?? null,
 			createFolder: jest.fn(() => creation),
-			trash: trashFolder,
 			// Desktop Vault.delete(folder, false) cannot remove even an empty
 			// folder: Node rm without recursion returns EISDIR.
 			delete: jest.fn(async () => { throw new Error("EISDIR"); }),
 		},
+		fileOps: { trashFile: trashFolder },
 	});
 	folderIndex.put("late", makeFolderRecord("parent"));
 	folderIndex.put(entryPath, makeFolderRecord("old-folder"));
@@ -107,7 +106,7 @@ describe("folder creation racing the normal vault create handler", () => {
 		await f.finish(stale);
 		expect(f.folderIndex.tracks("late")).toBe(false);
 		expect(f.nodes.has(stale.path)).toBe(false);
-		expect(f.trashFolder).toHaveBeenCalledWith(stale, false);
+		expect(f.trashFolder).toHaveBeenCalledWith(stale);
 		expect(f.share.vaultApi.delete).not.toHaveBeenCalled();
 		// A deliberate creation after the old operation settles remains uploadable.
 		const replacement = folderNode(stale.path);
@@ -173,7 +172,7 @@ describe("folder creation racing the normal vault create handler", () => {
 		expect(f.nodes.get(replacement.path)).toBe(replacement);
 		expect(f.folderIndex.recordFor("late")?.type).toBe("folder");
 		expect(f.trashFolder).toHaveBeenCalledTimes(1);
-		expect(f.trashFolder).toHaveBeenCalledWith(child, false);
+		expect(f.trashFolder).toHaveBeenCalledWith(child);
 	});
 
 	test("cleanup preserves new content inside a returned ancestor", async () => {

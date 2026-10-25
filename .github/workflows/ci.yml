@@ -32,6 +32,12 @@ jobs:
         run: npx tsc --noEmit --skipLibCheck
       - name: Lint
         run: npm run lint
+      - name: No Vault.trash (use FileManager.trashFile, it respects the user's deletion setting)
+        run: |
+          if grep -rnE '\.trash\(' src/; then
+            echo "::error::use app.fileManager.trashFile() instead of Vault.trash()"
+            exit 1
+          fi
       - name: Test
         run: npm test
       - name: Build
