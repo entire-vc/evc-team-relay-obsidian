@@ -9,7 +9,7 @@ import sveltePreprocess from "svelte-preprocess";
 
 export default {
 	preprocess: sveltePreprocess(),
-	// Keep the existing new Component / $set / $on / $destroy API until
-	// callers migrate to mount/unmount. Shared with the DOM regression test.
-	compilerOptions: { css: "injected", compatibility: { componentApi: 4 } },
+	// Shared with the DOM regression test (scripts/test/svelteDOM.cjs).
+	// Components are mounted through src/svelteMount.ts (Svelte 5 mount/unmount).
+	compilerOptions: { css: "injected" },
 };

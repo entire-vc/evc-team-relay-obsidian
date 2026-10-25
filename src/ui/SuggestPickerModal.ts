@@ -1,23 +1,24 @@
 import { App, Modal } from "obsidian";
-import type { ComponentProps, ComponentType, SvelteComponent } from "svelte";
+import type { Component } from "svelte";
+import { mountComponent, type MountedComponent } from "../svelteMount";
 
 /**
  * The suggest component must accept `focusOnMount` and `onChoose` on top of
- * whatever else it declares -- those two are supplied by this modal, not by
- * the caller (see `mountProps` below).
+ * whatever else it declares (`P`) -- those two are supplied by this modal,
+ * not by the caller (see `mountProps` below).
  */
-type SuggestComponent<T> = SvelteComponent<{
+type SuggestProps<T, P> = P & {
 	focusOnMount?: boolean;
 	onChoose?: (item: T) => void;
-}>;
+};
 
-export class SuggestPickerModal<T, C extends SuggestComponent<T>> extends Modal {
-	private mountedComponent?: C;
+export class SuggestPickerModal<T, P extends Record<string, unknown>> extends Modal {
+	private mountedComponent?: MountedComponent<SuggestProps<T, P>>;
 
 	constructor(
 		app: App,
-		private componentCtor: ComponentType<C>,
-		private mountProps: Omit<ComponentProps<C>, "focusOnMount" | "onChoose">,
+		private pickerComponent: Component<SuggestProps<T, P>>,
+		private mountProps: P,
 		private onPick: (item: T) => void,
 	) {
 		super(app);
@@ -32,7 +33,7 @@ export class SuggestPickerModal<T, C extends SuggestComponent<T>> extends Modal 
 	}
 
 	onOpen(): void {
-		this.mountedComponent = new this.componentCtor({
+		this.mountedComponent = mountComponent(this.pickerComponent, {
 			target: this.resolveHost(),
 			props: {
 				...this.mountProps,
@@ -41,17 +42,17 @@ export class SuggestPickerModal<T, C extends SuggestComponent<T>> extends Modal 
 					this.onPick(item);
 					this.close();
 				},
-			} as ComponentProps<C>,
+			},
 		});
 	}
 
 	onClose(): void {
-		this.mountedComponent?.$destroy();
+		this.mountedComponent?.destroy();
 	}
 
 	dismantle(): void {
-		this.componentCtor = null as unknown as ComponentType<C>;
-		this.mountProps = null as unknown as Omit<ComponentProps<C>, "focusOnMount" | "onChoose">;
+		this.pickerComponent = null as unknown as Component<SuggestProps<T, P>>;
+		this.mountProps = null as unknown as P;
 		this.onPick = null as unknown as (item: T) => void;
 	}
 }

@@ -6,7 +6,14 @@ import { SuggestPickerModal } from "./SuggestPickerModal";
 const DEFAULT_PLACEHOLDER = "Pick or create a folder...";
 
 /** Quick-switcher-style modal for picking (or creating) a vault folder path. */
-export class FolderPathPickerModal extends SuggestPickerModal<string, FolderPathAutocomplete> {
+type FolderPathProps = {
+	obsidianApp: App;
+	placeholder: string;
+	excludedPaths: Set<string>;
+	syncedFolders: ShareRegistry;
+};
+
+export class FolderPathPickerModal extends SuggestPickerModal<string, FolderPathProps> {
 	constructor(
 		app: App,
 		placeholder: string = DEFAULT_PLACEHOLDER,
@@ -14,7 +21,7 @@ export class FolderPathPickerModal extends SuggestPickerModal<string, FolderPath
 		shareRegistry: ShareRegistry,
 		onSelect: (folderPath: string) => void,
 	) {
-		const suggestProps = {
+		const suggestProps: FolderPathProps = {
 			obsidianApp: app,
 			placeholder,
 			excludedPaths: blockedPaths,

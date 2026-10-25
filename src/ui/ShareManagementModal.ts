@@ -531,7 +531,7 @@ export class ShareManagementModal extends Modal {
 								this.plugin.shareRegistry,
 								// FolderPathPickerModal's onSelect is typed `(folderPath: string) => void` --
 								// SuggestPickerModal.onChoose() (src/ui/SuggestPickerModal.ts) invokes it and
-								// then immediately calls this.close()/$destroy() without awaiting, so there is
+								// then immediately calls this.close() (which unmounts it) without awaiting, so there is
 								// no way for this callback's async work to hold up or be sequenced against the
 								// picker modal's own lifecycle either way. Safe to fire-and-forget PROVIDED
 								// (a) nothing here depends on the picker modal still being mounted, and (b) no

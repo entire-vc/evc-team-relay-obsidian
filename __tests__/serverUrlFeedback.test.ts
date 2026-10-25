@@ -1,6 +1,6 @@
 /** @jest-environment node */
 import path from "node:path";
-import type { SvelteComponent } from "svelte";
+import type { Component as SvelteComponentType } from "svelte";
 import { getLanguage, Platform } from "obsidian";
 import type { RelayOnPremServer } from "../src/RelayOnPremConfig";
 
@@ -11,8 +11,9 @@ const mutateValue = jest.fn();
 import { loadSvelteComponent } from "../scripts/test/svelteDOM.cjs";
 import { testGlobal } from "./mocks/testGlobal";
 
-let Component: typeof SvelteComponent;
-let component: SvelteComponent;
+let Component: SvelteComponentType<Record<string, unknown>>;
+let mountComponent: typeof import("../src/svelteMount").mountComponent;
+let component: ReturnType<typeof mountComponent> | undefined;
 let closeDom: () => void;
 
 // Compile the real component and its browser runtime. Only host/network
@@ -35,6 +36,7 @@ beforeAll(async () => {
 	Object.assign(testGlobal, { window: loaded.dom.window, document: loaded.dom.window.document,
 		activeDocument: loaded.dom.window.document, Event: loaded.dom.window.Event });
 	Component = loaded.default;
+	mountComponent = loaded.mountComponent;
 });
 
 async function flush() {
@@ -56,7 +58,7 @@ function mount(servers: RelayOnPremServer[] = []) {
 		settings = update(settings);
 		subscribers.forEach((run) => run(settings));
 	});
-	component = new Component({ target: document.body, props: {
+	component = mountComponent(Component, { target: document.body, props: {
 		live: { relayOnPremSettings: { subscribe, mutateValue },
 			authSession: { addServer, updateServer: jest.fn(), isLoggedInToServer: () => false } },
 	} });
@@ -83,7 +85,8 @@ beforeEach(() => {
 	(getLanguage as jest.Mock).mockReturnValue("en");
 });
 afterEach(() => {
-	component?.$destroy();
+	component?.destroy();
+	component = undefined;
 	document.body.innerHTML = "";
 });
 

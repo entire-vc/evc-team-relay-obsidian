@@ -3,6 +3,7 @@ import { MarkdownView } from "obsidian";
 import { Document } from "./Document";
 import { type DocumentViewBinding } from "./ViewBindings";
 import CollaboratorAwareness from "./components/CollaboratorAwareness.svelte";
+import { mountComponent, type MountedComponent } from "./svelteMount";
 
 const WRAPPER_CLASS = "title-with-awareness";
 
@@ -60,7 +61,7 @@ export class PresenceTitleDecorator extends Loggable {
 	documentBinding: DocumentViewBinding<MarkdownView>;
 	liveDocument: Document;
 	private dismantled = false;
-	private avatarsComponent?: CollaboratorAwareness;
+	private avatarsComponent?: MountedComponent<Record<string, unknown>>;
 	private avatarsContainerEl?: HTMLElement;
 
 	constructor(view: DocumentViewBinding<MarkdownView>) {
@@ -101,7 +102,7 @@ export class PresenceTitleDecorator extends Loggable {
 		}
 
 		try {
-			this.avatarsComponent = new CollaboratorAwareness({
+			this.avatarsComponent = mountComponent(CollaboratorAwareness, {
 				target: avatarContainer,
 				props: {
 					collabAwareness: awareness,
@@ -116,7 +117,7 @@ export class PresenceTitleDecorator extends Loggable {
 	private teardownAwarenessComponent(): void {
 		if (!this.avatarsComponent) return;
 		try {
-			this.avatarsComponent.$destroy();
+			this.avatarsComponent.destroy();
 			this.avatarsComponent = undefined;
 			this.log("Awareness component destroyed");
 		} catch (error: unknown) {

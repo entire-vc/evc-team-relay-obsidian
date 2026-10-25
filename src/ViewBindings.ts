@@ -14,6 +14,7 @@ import {
 	type WorkspaceLeaf,
 } from "obsidian";
 import EditorStatusActions from "src/components/EditorStatusActions.svelte";
+import { mountComponent, type MountedComponent } from "./svelteMount";
 import * as Y from "yjs";
 import { Document } from "./Document";
 import { type ConnectionState, type ProviderBacked } from "./ProviderBacked";
@@ -191,7 +192,7 @@ function renderOfflineBanner(
  * these instead of duplicating the mount/update/teardown logic.
  */
 class ViewActionsMount {
-	private component?: EditorStatusActions;
+	private component?: MountedComponent<Record<string, unknown>>;
 	private unsubscribe?: () => void;
 
 	render(
@@ -211,20 +212,20 @@ class ViewActionsMount {
 		if (!this.component) {
 			this.clear(containerEl);
 			this.unsubscribe?.();
-			this.component = new EditorStatusActions({
+			this.component = mountComponent(EditorStatusActions, {
 				target: actionsEl,
 				anchor: actionsEl.firstChild as Element,
 				props,
 			});
 			this.unsubscribe = doc.subscribe(actionsEl, (state: ConnectionState) => {
-				this.component?.$set({
+				this.component?.update({
 					liveView: target,
 					connectionState: state,
 					linked: doc.vaultShare.linked,
 				});
 			});
 		}
-		this.component.$set(props);
+		this.component.update(props);
 	}
 
 	clear(containerEl: HTMLElement): void {
@@ -236,7 +237,7 @@ class ViewActionsMount {
 	}
 
 	destroy(): void {
-		this.component?.$destroy();
+		this.component?.destroy();
 		this.component = undefined;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;

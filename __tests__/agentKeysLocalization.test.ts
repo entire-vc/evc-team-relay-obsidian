@@ -1,13 +1,14 @@
 /** @jest-environment node */
 import path from "node:path";
-import type { SvelteComponent } from "svelte";
+import type { Component as SvelteComponentType } from "svelte";
 import { getLanguage } from "obsidian";
 
 import { loadSvelteComponent } from "../scripts/test/svelteDOM.cjs";
 import { testGlobal } from "./mocks/testGlobal";
 
-let Component: typeof SvelteComponent;
-let component: SvelteComponent;
+let Component: SvelteComponentType<Record<string, unknown>>;
+let mountComponent: typeof import("../src/svelteMount").mountComponent;
+let component: ReturnType<typeof mountComponent> | undefined;
 let closeDom: () => void;
 
 // Exercise the rendered component, including both entry points into the dialog.
@@ -22,6 +23,7 @@ beforeAll(async () => {
 	Object.assign(testGlobal, { window: loaded.dom.window, document: loaded.dom.window.document,
 		activeDocument: loaded.dom.window.document, Event: loaded.dom.window.Event });
 	Component = loaded.default;
+	mountComponent = loaded.mountComponent;
 });
 
 async function flush() {
@@ -37,7 +39,8 @@ async function click(selector: string) {
 
 afterAll(() => closeDom?.());
 afterEach(() => {
-	component?.$destroy();
+	component?.destroy();
+	component = undefined;
 	document.body.innerHTML = "";
 });
 
@@ -53,7 +56,7 @@ describe.each([
 ])("agent key interface ($language)", (copy) => {
 	beforeEach(async () => {
 		(getLanguage as jest.Mock).mockReturnValue(copy.language);
-		component = new Component({ target: document.body, props: {
+		component = mountComponent(Component, { target: document.body, props: {
 			server: { id: "fixture-server" },
 			live: {
 				shareClient: {
