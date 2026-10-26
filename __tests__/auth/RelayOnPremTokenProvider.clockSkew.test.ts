@@ -1,5 +1,5 @@
 /**
- * #55b0a59e: the control-plane returns `expires_at` as an absolute server
+ * The control-plane returns `expires_at` as an absolute server
  * time, and every consumer (CredentialCache.needsRefresh/tokenIsValid,
  * ProviderBacked.hasUsableProviderToken) compares it with the client's own
  * clock. A client whose clock lags the server by S > renewal margin (60s)
@@ -75,7 +75,7 @@ function relayTokenBody(serverNow: number): RelayTokenResponse {
 	};
 }
 
-describe("relay token expiry vs a lagging client clock (#55b0a59e)", () => {
+describe("relay token expiry vs a lagging client clock", () => {
 	beforeEach(() => {
 		jest.useFakeTimers();
 		jest.setSystemTime(SERVER_START_MS - CLIENT_LAG_MS);

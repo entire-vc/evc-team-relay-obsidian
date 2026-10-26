@@ -138,7 +138,7 @@ class TokenRequestThrottle {
 }
 
 /**
- * Re-anchor a server-issued `expires_at` on the local clock (#55b0a59e).
+ * Re-anchor a server-issued `expires_at` on the local clock.
  *
  * `expires_at` is an absolute server time, but every consumer
  * (CredentialCache.needsRefresh/tokenIsValid, ProviderBacked) compares it with
