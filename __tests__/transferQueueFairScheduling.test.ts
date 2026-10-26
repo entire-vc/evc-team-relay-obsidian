@@ -234,6 +234,23 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		expect(queue.laneStats().uploads.importingShares).toEqual(["Big"]);
 	});
 
+	test("laneStats() reports run times of recent items, edits apart from an import", async () => {
+		const big = makeShare("Big");
+		const small = makeShare("Small");
+		queue.suspend();
+		for (let i = 0; i < 12; i++) void queue.enqueueUpload(makeDoc(big, `doc-${i}.md`), { priority: true });
+		void queue.enqueueUpload(makeDoc(small, "edit.md"), { priority: true });
+		queue.wake();
+		await flushMacrotasks();
+		clock.time += 4_000;
+		finish.get("Small:edit.md")?.();
+		finish.get("Big:doc-0.md")?.();
+		await flushMacrotasks();
+		const { durationMs } = queue.laneStats().uploads;
+		expect(durationMs.priority).toEqual({ count: 1, p50: 4_000, p95: 4_000, max: 4_000 });
+		expect(durationMs.bulk).toEqual({ count: 1, p50: 4_000, p95: 4_000, max: 4_000 });
+	});
+
 	test("priority items run before bulk ones of the same share", async () => {
 		const share = makeShare("S");
 		queue.suspend();
