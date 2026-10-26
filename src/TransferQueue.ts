@@ -365,16 +365,18 @@ export class TransferQueue extends Loggable {
 		const runnable = lane.queue.filter((item) => item.vaultShare.isOnline);
 
 		while (runnable.length > 0) {
-			const item = this.nextRunnable(lane, runnable);
+			let candidates = runnable;
 			if (lane.active.count >= this.laneLimit) {
 				// Reserved slots: priority work from a share with no priority item
 				// running in this lane yet. A share whose whole backlog is priority
 				// (an import written while its docs were offline) would otherwise
 				// hold them too, and an edit in another share would wait for one of
 				// its uploads to finish.
-				const reserved = item.priority && !this.hasActivePriority(lane, item.vaultShare);
-				if (!reserved || lane.active.count >= this.laneLimit + PRIORITY_RESERVED_SLOTS) break;
+				if (lane.active.count >= this.laneLimit + PRIORITY_RESERVED_SLOTS) break;
+				candidates = runnable.filter((queued) => queued.priority && !this.hasActivePriority(lane, queued.vaultShare));
+				if (candidates.length === 0) break;
 			}
+			const item = this.nextRunnable(lane, candidates);
 
 			runnable.splice(runnable.indexOf(item), 1);
 			lane.queue = lane.queue.filter((queued) => queued.entityGuid !== item.entityGuid);
