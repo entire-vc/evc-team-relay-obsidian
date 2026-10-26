@@ -114,14 +114,22 @@ export const PULL_DEADLINE_MS = 25_000;
 /**
  * An announced change whose pulled text doesn't match the announced
  * fingerprint yet (the marker can beat the content to this client) is
- * pulled again after these delays, then every RECHECK_REPEAT_MS until
- * RECHECK_WINDOW_MS after the announcement, then left to the sweep. The
- * marker travels on the live folder connection while the sender's upload
- * opens the document's own: under an 800+ document import that upload took
- * up to ~60s, and three re-checks (~40-57s) gave up on 18 of 80 edits.
+ * pulled again after these delays, then after the backed-off
+ * LATE_RECHECK_DELAYS_MS until RECHECK_WINDOW_MS after the announcement,
+ * then left to the sweep. The marker travels on the live folder connection
+ * while the sender's upload opens the document's own: under an 800+
+ * document import that upload took up to ~60s, and three re-checks
+ * (~40-57s) gave up on 18 of 80 edits.
  */
 const RECHECK_DELAYS_MS = [2_000, 5_000, 10_000];
-const RECHECK_REPEAT_MS = 15_000;
+/**
+ * Re-checks past the first three back off and wait in their own lane: served
+ * after fresh announcements and before the sweep, but always leaving the
+ * sweep one regular slot. An import announces hundreds of documents whose
+ * content lags; their repeat re-checks must neither hold a fresh edit back
+ * nor starve the sweep.
+ */
+const LATE_RECHECK_DELAYS_MS = [15_000, 30_000, 60_000];
 const RECHECK_WINDOW_MS = 180_000;
 const STATS_LOG_EVERY_MS = 60_000;
 const LATENCY_SAMPLES = 200;
@@ -140,6 +148,7 @@ interface PendingPull {
 
 interface ShareQueues {
 	priority: Map<string, PendingPull>;
+	late: Map<string, PendingPull>;
 	sweep: Map<string, PendingPull>;
 }
 
@@ -150,6 +159,8 @@ interface InFlight {
 	deadline?: number;
 	/** Started from the priority lane (an announced change or its re-check). */
 	announced: boolean;
+	/** Started from the late re-check lane. */
+	late: boolean;
 	/** Runs in the express slot, outside the `laneLimit` regular slots. */
 	express: boolean;
 }
@@ -159,7 +170,7 @@ export interface PollerStats {
 	/** Pulls currently running in the express slot (0 or 1). */
 	express: number;
 	oldestWaitMs: number;
-	queued: Record<string, { priority: number; sweep: number }>;
+	queued: Record<string, { priority: number; late: number; sweep: number }>;
 	timeouts: Partial<Record<PullPhase | "queued", number>>;
 	completed: number;
 	failed: number;
@@ -191,7 +202,8 @@ export class CrdtBackgroundSyncPoller {
 	 */
 	private readonly abandonedWrites = new Set<string>();
 	private readonly subscriptions = new Map<VaultShare, () => void>();
-	private readonly recheckTimers = new Set<number>();
+	/** At most one pending re-check per document; a newer announcement replaces it. */
+	private readonly recheckTimers = new Map<string, number>();
 	private readonly timeouts: Partial<Record<PullPhase | "queued", number>> = {};
 	private readonly deliveries: number[] = [];
 	private completed = 0;
@@ -237,7 +249,7 @@ export class CrdtBackgroundSyncPoller {
 			const now = this.timeProvider.now();
 			for (const file of folder.trackedEntries.values()) {
 				if (!isDocument(file) || !this.canQueue(file)) continue;
-				if (queues.priority.has(file.entityGuid)) continue;
+				if (queues.priority.has(file.entityGuid) || queues.late.has(file.entityGuid)) continue;
 				queues.sweep.set(file.entityGuid, { folder, file, queuedAt: now, attempt: 0 });
 			}
 		});
@@ -249,7 +261,7 @@ export class CrdtBackgroundSyncPoller {
 	private queuesFor(folder: VaultShare): ShareQueues {
 		let queues = this.queues.get(folder);
 		if (!queues) {
-			queues = { priority: new Map(), sweep: new Map() };
+			queues = { priority: new Map(), late: new Map(), sweep: new Map() };
 			this.queues.set(folder, queues);
 		}
 		return queues;
@@ -291,6 +303,8 @@ export class CrdtBackgroundSyncPoller {
 		const file = folder.trackedEntries.get(guid);
 		if (!file || !isDocument(file) || file.isOnline) return;
 		const now = this.timeProvider.now();
+		// A newer marker supersedes whatever re-check the older one left behind.
+		this.cancelRecheck(guid);
 		if (this.pulling.has(guid) || this.abandonedWrites.has(guid)) {
 			this.announcedWhilePulling.set(guid, { expected, at: now });
 			return;
@@ -304,19 +318,28 @@ export class CrdtBackgroundSyncPoller {
 		const guid = pull.file.entityGuid;
 		const existing = queues.priority.get(guid);
 		queues.sweep.delete(guid);
+		queues.late.delete(guid);
 		queues.priority.set(guid, {
 			...pull,
-			// Keep the earliest announcement so the latency covers the whole wait.
-			announcedAt: existing?.announcedAt ?? pull.announcedAt,
+			// Keep the earliest announcement of the same text so the latency
+			// covers the whole wait; a different text is a new edit with its
+			// own window.
+			announcedAt: existing && existing.expected === pull.expected ? existing.announcedAt : pull.announcedAt,
 			queuedAt: existing?.queuedAt ?? pull.queuedAt,
 		});
 	}
 
-	/** Next document to start: priority lane first, round-robin across shares within a lane. */
-	private takeNext(): { pull: PendingPull; announced: boolean } | undefined {
-		for (const lane of ["priority", "sweep"] as const) {
+	/**
+	 * Next document to start: priority lane first, then late re-checks while
+	 * they hold fewer than `limit - 1` slots, then the sweep; round-robin
+	 * across shares within a lane.
+	 */
+	private takeNext(limit: number): { pull: PendingPull; lane: keyof ShareQueues } | undefined {
+		const lateRunning = [...this.pulling.values()].filter((inFlight) => inFlight.late).length;
+		for (const lane of ["priority", "late", "sweep"] as const) {
+			if (lane === "late" && lateRunning >= Math.max(1, limit - 1)) continue;
 			const pull = this.takeFrom(lane, () => true);
-			if (pull) return { pull, announced: lane === "priority" };
+			if (pull) return { pull, lane };
 		}
 		return undefined;
 	}
@@ -365,19 +388,19 @@ export class CrdtBackgroundSyncPoller {
 				if (inFlight.express) expressBusy = true;
 				else regular++;
 			}
-			let next: { pull: PendingPull; announced: boolean; express: boolean } | undefined;
+			let next: { pull: PendingPull; lane: keyof ShareQueues; express: boolean } | undefined;
 			if (regular < limit) {
-				const taken = this.takeNext();
+				const taken = this.takeNext(limit);
 				if (taken) next = { ...taken, express: false };
 			} else if (!expressBusy) {
 				const pull = this.takeExpress();
-				if (pull) next = { pull, announced: true, express: true };
+				if (pull) next = { pull, lane: "priority", express: true };
 			}
 			if (!next) return;
 			// Re-validated at start: the editor may have opened it, or another
 			// path may have started pulling it, while it sat in the queue.
 			if (!next.pull.folder.isOnline || !this.canQueue(next.pull.file)) continue;
-			this.startPull(next.pull, next.announced, next.express);
+			this.startPull(next.pull, next.lane, next.express);
 		}
 	}
 
@@ -386,11 +409,18 @@ export class CrdtBackgroundSyncPoller {
 		return undefined;
 	}
 
-	private startPull(pull: PendingPull, announced: boolean, express: boolean): void {
+	private startPull(pull: PendingPull, lane: keyof ShareQueues, express: boolean): void {
 		const { folder, file } = pull;
 		const guid = file.entityGuid;
 		const controller = new AbortController();
-		const inFlight: InFlight = { pull, phase: "queued", controller, announced, express };
+		const inFlight: InFlight = {
+			pull,
+			phase: "queued",
+			controller,
+			announced: lane === "priority",
+			late: lane === "late",
+			express,
+		};
 		this.pulling.set(guid, inFlight);
 		const startedAt = this.timeProvider.now();
 		log("Re-checking unopened document for remote updates", {
@@ -462,7 +492,8 @@ export class CrdtBackgroundSyncPoller {
 		this.announcedWhilePulling.delete(guid);
 		const expected = lateAnnouncement?.expected ?? pull.expected;
 		if (expected === undefined) return;
-		const announcedAt = pull.announcedAt ?? lateAnnouncement?.at ?? pull.queuedAt;
+		// A marker that came in mid-pull starts a fresh window from its own arrival.
+		const announcedAt = lateAnnouncement?.at ?? pull.announcedAt ?? pull.queuedAt;
 
 		const remote = result?.remoteText;
 		if (ok && remote !== undefined && textFingerprint(remote) === expected) {
@@ -472,7 +503,9 @@ export class CrdtBackgroundSyncPoller {
 		// Not there yet (marker arrived ahead of the content, or the pull
 		// failed): try again shortly, a bounded number of times.
 		const attempt = lateAnnouncement ? 0 : pull.attempt;
-		const delay = RECHECK_DELAYS_MS[attempt] ?? RECHECK_REPEAT_MS;
+		const delay =
+			RECHECK_DELAYS_MS[attempt] ??
+			LATE_RECHECK_DELAYS_MS[Math.min(attempt - RECHECK_DELAYS_MS.length, LATE_RECHECK_DELAYS_MS.length - 1)];
 		if (this.timeProvider.now() + delay - announcedAt > RECHECK_WINDOW_MS) {
 			this.recheckGivenUp++;
 			log("announced change still not visible after re-checks; leaving it to the sweep", {
@@ -482,19 +515,42 @@ export class CrdtBackgroundSyncPoller {
 			return;
 		}
 		this.recheckScheduled++;
+		this.cancelRecheck(guid);
 		const timer = this.timeProvider.scheduleTimeout(() => {
-			this.recheckTimers.delete(timer);
-			if (this.destroyed || !this.canQueue(pull.file)) return;
-			this.enqueuePriority({
+			this.recheckTimers.delete(guid);
+			if (this.destroyed) return;
+			if (this.pulling.has(guid) && !this.announcedWhilePulling.has(guid)) {
+				// A sweep pull of it is running: check that pull's result instead.
+				this.announcedWhilePulling.set(guid, { expected, at: announcedAt });
+				return;
+			}
+			if (!this.canQueue(pull.file)) return;
+			const next: PendingPull = {
 				...pull,
 				expected,
 				announcedAt,
 				queuedAt: this.timeProvider.now(),
 				attempt: attempt + 1,
-			});
+			};
+			if (next.attempt <= RECHECK_DELAYS_MS.length) {
+				this.enqueuePriority(next);
+			} else {
+				const queues = this.queuesFor(pull.folder);
+				// A fresh announcement already queued for it covers this re-check.
+				if (queues.priority.has(guid)) return;
+				queues.sweep.delete(guid);
+				queues.late.set(guid, next);
+			}
 			this.drain();
 		}, delay);
-		this.recheckTimers.add(timer);
+		this.recheckTimers.set(guid, timer);
+	}
+
+	private cancelRecheck(guid: string): void {
+		const timer = this.recheckTimers.get(guid);
+		if (timer === undefined) return;
+		this.timeProvider.cancelTimeout(timer);
+		this.recheckTimers.delete(guid);
 	}
 
 	private recordDelivery(ms: number): void {
@@ -506,9 +562,9 @@ export class CrdtBackgroundSyncPoller {
 		const now = this.timeProvider.now();
 		let oldest = now;
 		const queued: PollerStats["queued"] = {};
-		for (const [folder, { priority, sweep }] of this.queues) {
-			queued[folder.path ?? folder.entityGuid] = { priority: priority.size, sweep: sweep.size };
-			for (const lane of [priority, sweep]) {
+		for (const [folder, { priority, late, sweep }] of this.queues) {
+			queued[folder.path ?? folder.entityGuid] = { priority: priority.size, late: late.size, sweep: sweep.size };
+			for (const lane of [priority, late, sweep]) {
 				const first = lane.values().next();
 				if (!first.done) oldest = Math.min(oldest, first.value.queuedAt);
 			}
@@ -536,7 +592,8 @@ export class CrdtBackgroundSyncPoller {
 		const now = this.timeProvider.now();
 		if (now - this.lastStatsLogAt < STATS_LOG_EVERY_MS) return;
 		const stats = this.stats();
-		const idle = stats.inflight === 0 && Object.values(stats.queued).every((q) => q.priority + q.sweep === 0);
+		const idle =
+			stats.inflight === 0 && Object.values(stats.queued).every((q) => q.priority + q.late + q.sweep === 0);
 		if (idle && stats.delivery.count === 0) return;
 		this.lastStatsLogAt = now;
 		log("Background sync stats", stats);
@@ -557,7 +614,7 @@ export class CrdtBackgroundSyncPoller {
 			if (phase !== "write") controller.abort();
 		}
 		this.pulling.clear();
-		for (const timer of this.recheckTimers) this.timeProvider.cancelTimeout(timer);
+		for (const timer of this.recheckTimers.values()) this.timeProvider.cancelTimeout(timer);
 		this.recheckTimers.clear();
 		for (const unsubscribe of this.subscriptions.values()) unsubscribe();
 		this.subscriptions.clear();

@@ -324,6 +324,136 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("repeat re-checks of an import's lagging documents back off: a few pulls each, not one every 15s", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("imp", 300, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		const settleAll = async () => {
+			while (held.length > 0) {
+				held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+				await flushPromises();
+			}
+		};
+		await settleAll();
+
+		for (let i = 0; i < 300; i++) folder.announce(`imp-${i}`, textFingerprint(`created ${i}`));
+		let callsAt40s = 0;
+		for (let t = 0; t <= 200_000; t += 1_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+			await settleAll();
+			if (t === 40_000) callsAt40s = pull.mock.calls.length;
+		}
+		// Past the three quick re-checks each document is pulled at most
+		// twice more (~62s, ~122s), instead of every 15s until 180s.
+		expect(pull.mock.calls.length - callsAt40s).toBeLessThanOrEqual(2 * 300);
+		expect(poller.stats().recheck.givenUp).toBe(300);
+		poller.destroy();
+	});
+
+	test("late re-checks leave the sweep a slot, and a fresh edit isn't held behind them", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const imp = makeFolder("imp", 301, pull, 3);
+		const other = makeFolder("other", 30, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([imp, other]) as never, 31_000);
+		poller.start();
+		const settleAll = async () => {
+			while (held.length > 0) {
+				held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+				await flushPromises();
+			}
+		};
+		await settleAll();
+
+		for (let i = 0; i < 300; i++) imp.announce(`imp-${i}`, textFingerprint(`created ${i}`));
+		for (let t = 0; t <= 30_000; t += 1_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+			await settleAll();
+		}
+		// 31s: the sweep refills and takes every regular slot (held).
+		clock.setTime(t0 + 31_000);
+		await flushPromises();
+		// 32s: all 300 documents are due for their first late re-check.
+		clock.setTime(t0 + 32_000);
+		await flushPromises();
+		for (const h of held.splice(0)) {
+			h.resolve({ outcome: "unchanged", remoteText: "old" });
+			await flushPromises();
+		}
+		const announcedImport = (guid: string) => /^imp-\d+$/.test(guid) && guid !== "imp-300";
+		const running = held.map((h) => h.file.entityGuid);
+		expect(running).toHaveLength(3);
+		expect(running.filter(announcedImport)).toHaveLength(2);
+		expect(running.filter((guid) => !announcedImport(guid))).toHaveLength(1);
+
+		imp.announce("imp-300", textFingerprint("edited"));
+		await flushPromises();
+		expect(held.map((h) => h.file.entityGuid)).toContain("imp-300");
+		poller.destroy();
+	});
+
+	test("a newer announcement replaces the pending re-check instead of starting a second chain", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("s", 1, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+
+		folder.announce("s-0", textFingerprint("v1"));
+		await flushPromises();
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+		// v1's re-check is due at 2s; v2 arrives at 1s.
+		clock.setTime(t0 + 1_000);
+		folder.announce("s-0", textFingerprint("v2"));
+		await flushPromises();
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+		const calls = pull.mock.calls.length;
+
+		clock.setTime(t0 + 2_000);
+		await flushPromises();
+		expect(pull.mock.calls.length).toBe(calls);
+
+		clock.setTime(t0 + 3_000);
+		await flushPromises();
+		expect(pull.mock.calls.length).toBe(calls + 1);
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "v2" });
+		await flushPromises();
+		const { delivery } = poller.stats();
+		expect(delivery.count).toBe(1);
+		// Measured from v2's own announcement.
+		expect(delivery.maxMs).toBe(2_000);
+		poller.destroy();
+	});
+
+	test("destroy() cancels pending re-checks", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("s", 1, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+		folder.announce("s-0", textFingerprint("new"));
+		await flushPromises();
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+		const calls = pull.mock.calls.length;
+		expect(poller.stats().recheck.scheduled).toBe(1);
+
+		poller.destroy();
+		clock.setTime(t0 + 60_000);
+		await flushPromises();
+		expect(pull.mock.calls.length).toBe(calls);
+	});
+
 	test("an announcement for a document already being pulled is checked against that pull's result", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
