@@ -202,20 +202,27 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		expect(started).toHaveLength(3);
 	});
 
-	test("an importing share gets slots back once its backlog is small", async () => {
+	test("an importing share ranks as priority again once its backlog is small", async () => {
 		const big = makeShare("Big");
-		for (let i = 0; i < 12; i++) void queue.enqueueUpload(makeDoc(big, `doc-${i}.md`), { priority: true });
+		const small = makeShare("Small");
+		queue.suspend();
+		for (let i = 0; i < 9; i++) void queue.enqueueUpload(makeDoc(big, `doc-${i}.md`), { priority: true });
+		clock.time += 10;
+		for (let i = 0; i < 5; i++) void queue.enqueueUpload(makeDoc(small, `bulk-${i}.md`));
+		queue.wake();
 		await flushMacrotasks();
+		// 9 priority items: Big ranks as bulk and shares the slots round-robin.
 		expect(started).toHaveLength(3);
-		for (let round = 0; round < 6; round++) {
-			for (const guid of [...finish.keys()]) {
-				const done = finish.get(guid);
-				finish.delete(guid);
-				done?.();
-			}
-			await flushMacrotasks();
-		}
-		expect(started).toHaveLength(12);
+		expect(started.some((guid) => guid.startsWith("Small:"))).toBe(true);
+
+		// One of Big's uploads finishes: 8 left, so Big is priority again and
+		// takes the freed slot ahead of Small's bulk.
+		const bigRunning = started.find((guid) => guid.startsWith("Big:")) ?? "";
+		finish.get(bigRunning)?.();
+		finish.delete(bigRunning);
+		await flushMacrotasks();
+		expect(started).toHaveLength(4);
+		expect(started[3].startsWith("Big:")).toBe(true);
 	});
 
 	test("laneStats() names shares whose priority backlog ranks as an import", async () => {
