@@ -83,7 +83,8 @@
  *    0.1.9: closed-note edits in one share took up to ~100s to arrive while
  *    an 800+ document bulk sync kept every regular slot in `connect` on
  *    another share). It only takes announced work from a share that has no
- *    announced pull in flight yet, so a single edit starts at once instead
+ *    announced pull in flight yet (or a late re-check from a share with
+ *    nothing in flight), so a single edit starts at once instead
  *    of waiting up to PULL_DEADLINE_MS for a regular slot, while a share
  *    with a large announced backlog (the bulk itself) can't occupy it. Bulk
  *    throughput is unchanged: the regular slots stay at `laneLimit`.
@@ -378,15 +379,22 @@ export class CrdtBackgroundSyncPoller {
 	}
 
 	/**
-	 * Next document for the express slot: announced work only, from a share
-	 * none of whose announced pulls is already running.
+	 * Next document for the express slot: announced work from a share none
+	 * of whose announced pulls is already running; failing that, a late
+	 * re-check from a share with nothing in flight at all (one starved by
+	 * another share's backlog, not the share producing it).
 	 */
-	private takeExpress(): PendingPull | undefined {
-		const busy = new Set<VaultShare>();
+	private takeExpress(): { pull: PendingPull; lane: keyof ShareQueues } | undefined {
+		const announcing = new Set<VaultShare>();
+		const active = new Set<VaultShare>();
 		for (const inFlight of this.pulling.values()) {
-			if (inFlight.announced) busy.add(inFlight.pull.folder);
+			active.add(inFlight.pull.folder);
+			if (inFlight.announced) announcing.add(inFlight.pull.folder);
 		}
-		return this.takeFrom("priority", (share) => !busy.has(share));
+		const announced = this.takeFrom("priority", (share) => !announcing.has(share));
+		if (announced) return { pull: announced, lane: "priority" };
+		const late = this.takeFrom("late", (share) => !active.has(share));
+		return late ? { pull: late, lane: "late" } : undefined;
 	}
 
 	private takeFrom(lane: keyof ShareQueues, eligible: (share: VaultShare) => boolean): PendingPull | undefined {
@@ -426,8 +434,8 @@ export class CrdtBackgroundSyncPoller {
 				const taken = this.takeNext(limit);
 				if (taken) next = { ...taken, express: false };
 			} else if (!expressBusy) {
-				const pull = this.takeExpress();
-				if (pull) next = { pull, lane: "priority", express: true };
+				const taken = this.takeExpress();
+				if (taken) next = { ...taken, express: true };
 			}
 			if (!next) return;
 			// Re-validated at start: the editor may have opened it, or another

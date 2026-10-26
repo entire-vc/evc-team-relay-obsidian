@@ -626,6 +626,45 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("a late re-check of another share takes the express slot while a bulk share holds every regular slot", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const bulk = makeFolder("bulk", 0, pull, 3);
+		const notes = makeFolder("notes", 0, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([bulk, notes]) as never, 3_600_000);
+		poller.start();
+		for (let i = 0; i < 100; i++) {
+			bulk.trackedEntries.set(`bulk-${i}`, {
+				__isDocument: true,
+				isOnline: false,
+				entityGuid: `bulk-${i}`,
+				entryPath: `bulk/${i}.md`,
+			});
+			bulk.announce(`bulk-${i}`, textFingerprint(`created ${i}`));
+		}
+		notes.trackedEntries.set("note", { __isDocument: true, isOnline: false, entityGuid: "note", entryPath: "notes/note.md" });
+		notes.announce("note", textFingerprint("edited"));
+		await flushPromises();
+
+		// The bulk pulls never settle; the note's content lags behind its
+		// announcement through the three quick re-checks and into the late lane.
+		const notePulls = () => startedGuids(pull).filter((guid) => guid === "note").length;
+		for (let t = 0; t <= 40_000; t += 1_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+			for (let i = held.length - 1; i >= 0; i--) {
+				if (held[i].file.entityGuid !== "note") continue;
+				const [note] = held.splice(i, 1);
+				note.resolve({ outcome: "unchanged", remoteText: t < 30_000 ? "old" : "edited" });
+				await flushPromises();
+			}
+		}
+		// Quick re-checks at ~2/7/17s, then the late one ~15s later.
+		expect(notePulls()).toBe(5);
+		expect(poller.stats().delivery.count).toBe(1);
+		poller.destroy();
+	});
+
 	test("one express pull at a time; regular slots stay at laneLimit", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
