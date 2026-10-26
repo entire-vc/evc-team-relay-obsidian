@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.5
+- Web-published folders: updates to the folder's page list are now batched instead of sent on every file event. Syncing many notes into a published folder at once no longer floods the server with requests. Failed updates back off and respect the server's `Retry-After`.
+
 ## 0.1.4
 - Removed a type assertion in the editor status bindings that became redundant with the Svelte 5 mount helper. No functional changes.
 
