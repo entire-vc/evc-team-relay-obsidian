@@ -413,6 +413,13 @@ export class ProviderBacked extends Loggable {
 	}
 
 	goOffline(): void {
+		// A retry scheduled by a failed bringOnline() would otherwise reconnect
+		// against this explicit "disconnected" intent -- e.g. a background
+		// pull whose token request failed would leave the document connected
+		// for good, outside any lane's accounting. Callers that
+		// want a retry after going offline (the connection-error handlers
+		// above) schedule it AFTER calling this.
+		this.reconnectGate.cancel();
 		this._liveProvider.disconnect();
 		this.credentialCache.dropFromQueue(this.entityGuid);
 		this.broadcastState();

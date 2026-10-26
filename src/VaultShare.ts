@@ -64,6 +64,7 @@ import { findNestingConflictPath } from "./vaultShareNesting";
 import { isRootSharePath, resolveShareFolder } from "./vaultRootPath";
 import { buildConflictCopyPath, isConflictCopyPath } from "./conflictCopyPath";
 import { partitionByKnownGuid } from "./mintGate";
+import { DocActivityChannel } from "./docActivity";
 import {
 	findServerMoves,
 	findStructuralMoves,
@@ -194,6 +195,8 @@ export class VaultShare extends ProviderBacked {
 
 	// -- Sync bookkeeping --
 	folderIndex: FolderIndex;
+	/** Per-document change markers -- see docActivity.ts. */
+	docActivity: DocActivityChannel;
 	attachmentSettings: AttachmentSyncSettings;
 	private isAuthority: boolean;
 	// Narrower than isAuthority (which the "migrate" recreate path in
@@ -279,6 +282,7 @@ export class VaultShare extends ProviderBacked {
 		this.attachmentSettings = this._buildSyncSettingsManager();
 		this.folderIndex = this._buildSyncStore();
 		this._wireSyncStoreListener();
+		this.docActivity = new DocActivityChannel(this.crdtDoc);
 
 		this.rootRelative = withRootRelativePaths(this, this.path, (globalPath: string) => {
 			return this.toVirtualPath(globalPath);
@@ -2887,6 +2891,7 @@ export class VaultShare extends ProviderBacked {
 			this.trackedEntries.delete(doc.entityGuid);
 		});
 		this.folderIndex.destroy();
+		this.docActivity?.destroy();
 		this.attachmentSettings.destroy();
 		super.dismantle();
 		this.crdtDoc.destroy();

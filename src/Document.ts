@@ -138,6 +138,23 @@ export class Document extends ProviderBacked implements SyncableEntry, MimeTyped
 		this._teardownCallbacks.push(() => this.crdtText?.unobserve(statsObserver));
 	}
 
+	/**
+	 * Announces this client's own text changes on the folder's activity map
+	 * so receivers with this note closed pull it first instead of waiting for
+	 * their sweep to reach it (docActivity.ts). `transaction.local`
+	 * is false for updates applied from the relay or from IndexedDB, so only
+	 * changes made here -- editor input, a closed-file upload applying the
+	 * vault diff -- are announced.
+	 */
+	private attachActivityObserver(): void {
+		const activityObserver = (event: Y.YTextEvent) => {
+			if (!event.transaction.local) return;
+			this._parent?.docActivity?.noteLocalEdit(this.entityGuid, () => this.crdtText.toString());
+		};
+		this.crdtText.observe(activityObserver);
+		this._teardownCallbacks.push(() => this.crdtText?.unobserve(activityObserver));
+	}
+
 	private attachDeltaLogger(): void {
 		const logObserver = (event: Y.YTextEvent) => {
 			const originCtor = (
@@ -166,6 +183,7 @@ export class Document extends ProviderBacked implements SyncableEntry, MimeTyped
 
 	private async bootstrapAfterSync(): Promise<void> {
 		this.attachStatsObserver();
+		this.attachActivityObserver();
 		this.refreshFileStats();
 		this.recordPersistenceMetadata();
 
