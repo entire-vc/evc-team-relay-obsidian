@@ -165,9 +165,10 @@ const RECONCILE_SETTLE_OUTER_TIMEOUT_MS = 8_000;
 const SLOW_REFETCH_MS = 5 * 60 * 1000;
 
 /**
- * Slots on top of `laneLimit` that only priority items may take. Bulk items
- * can hold a slot for 30s+ each (the provider-sync timeout); measured live,
- * a new note queued behind ~50 of them for minutes after a restart.
+ * Slots on top of `laneLimit` that only priority items may take, and only
+ * from a share with no priority item running in the lane. Bulk items can hold a slot
+ * for 30s+ each (the provider-sync timeout); measured live, a new note queued
+ * behind ~50 of them for minutes after a restart.
  */
 const PRIORITY_RESERVED_SLOTS = 1;
 const LANE_STATS_LOG_EVERY_MS = 60_000;
@@ -365,8 +366,15 @@ export class TransferQueue extends Loggable {
 
 		while (runnable.length > 0) {
 			const item = this.nextRunnable(lane, runnable);
-			const limit = item.priority ? this.laneLimit + PRIORITY_RESERVED_SLOTS : this.laneLimit;
-			if (lane.active.count >= limit) break;
+			if (lane.active.count >= this.laneLimit) {
+				// Reserved slots: priority work from a share with no priority item
+				// running in this lane yet. A share whose whole backlog is priority
+				// (an import written while its docs were offline) would otherwise
+				// hold them too, and an edit in another share would wait for one of
+				// its uploads to finish.
+				const reserved = item.priority && !this.hasActivePriority(lane, item.vaultShare);
+				if (!reserved || lane.active.count >= this.laneLimit + PRIORITY_RESERVED_SLOTS) break;
+			}
 
 			runnable.splice(runnable.indexOf(item), 1);
 			lane.queue = lane.queue.filter((queued) => queued.entityGuid !== item.entityGuid);
@@ -403,6 +411,14 @@ export class TransferQueue extends Loggable {
 		}
 
 		lane.processing = false;
+	}
+
+	private hasActivePriority(lane: QueueLaneState, vaultShare: VaultShare): boolean {
+		let found = false;
+		lane.active.each((item) => {
+			if (item.priority && item.vaultShare === vaultShare) found = true;
+		});
+		return found;
 	}
 
 	/**

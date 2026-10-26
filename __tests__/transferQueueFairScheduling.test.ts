@@ -131,6 +131,34 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		expect(started).toHaveLength(4);
 	});
 
+	test("a share whose whole backlog is priority can't take the reserved slot", async () => {
+		// Live under load: a 700-note import is queued as priority (each note
+		// was written while its doc was offline), so the import held the
+		// reserved slot too and an edit in another share waited ~30-40s for
+		// one of the import's uploads to finish before its own could start.
+		const big = makeShare("Big");
+		const small = makeShare("Small");
+		for (let i = 0; i < 10; i++) void queue.enqueueUpload(makeDoc(big, `doc-${i}.md`), { priority: true });
+		await flushMacrotasks();
+		expect(started).toHaveLength(3);
+
+		void queue.enqueueUpload(makeDoc(small, "edited.md"), { priority: true });
+		await flushMacrotasks();
+		expect(started).toHaveLength(4);
+		expect(started[3]).toBe("Small:edited.md");
+	});
+
+	test("the reserved slot serves a share with no priority item running", async () => {
+		const share = makeShare("S");
+		void queue.enqueueUpload(makeDoc(share, "first.md"), { priority: true });
+		await flushMacrotasks();
+		expect(started).toEqual(["S:first.md"]);
+		for (let i = 0; i < 5; i++) void queue.enqueueUpload(makeDoc(share, `more${i}.md`), { priority: true });
+		await flushMacrotasks();
+		// Regular slots fill up; the reserved one stays free for other shares.
+		expect(started).toHaveLength(3);
+	});
+
 	test("priority items run before bulk ones of the same share", async () => {
 		const share = makeShare("S");
 		queue.suspend();
