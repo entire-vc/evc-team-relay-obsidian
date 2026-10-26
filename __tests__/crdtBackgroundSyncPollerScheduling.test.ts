@@ -16,6 +16,15 @@
  *   (f) destroy() aborts in-flight pulls and drops announcement listeners
  * Every case except (e) MUST fail on the global-FIFO, no-deadline poller
  * (origin/main@09f889d).
+ *
+ * Express slot:
+ *   (g) an edit announced in one share starts at once while another share's
+ *       bulk sync holds every regular slot
+ *   (h) a share whose announced pull is already running can't take the
+ *       express slot, so a bulk share's announced backlog doesn't hold it
+ *   (i) one express pull at a time; regular slots stay at laneLimit
+ * (g) and (h) MUST fail on the poller without the express slot
+ * (origin/main@d7f58c8).
  */
 
 import { describe, test, expect, beforeEach, jest } from "@jest/globals";
@@ -215,11 +224,17 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 
 		folder.announce("s-90", textFingerprint("new text"));
 		await flushPromises();
-		expect(pull).toHaveBeenCalledTimes(3); // all slots busy -- waits for one
+		expect(startedGuids(pull)[3]).toBe("s-90"); // express slot
+
+		// The share's announced pull now runs, so the next one waits for a
+		// regular slot -- and still goes ahead of the sweep backlog.
+		folder.announce("s-91", textFingerprint("more text"));
+		await flushPromises();
+		expect(pull).toHaveBeenCalledTimes(4);
 
 		held.shift()?.resolve({ outcome: "unchanged", remoteText: "" });
 		await flushPromises();
-		expect(startedGuids(pull)[3]).toBe("s-90");
+		expect(startedGuids(pull)[4]).toBe("s-91");
 		poller.destroy();
 	});
 
@@ -282,6 +297,114 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		await flushPromises();
 		expect(poller.stats().queued.s.sweep).toBe(2);
 		expect(startedGuids(pull)).toEqual(["s-0", "s-1", "s-2"]);
+		poller.destroy();
+	});
+
+	test("an edit announced in a small share starts at once while a bulk share holds every regular slot", async () => {
+		const held: Held[] = [];
+		// Bulk pulls hang in connect, as measured live under an 800+ document sync.
+		const pull = jest.fn<PullFn>().mockImplementation((file, control) => {
+			control.onPhase?.("connect");
+			return new Promise<PullResult>((resolve) => held.push({ file, control, resolve }));
+		});
+		const bulk = makeFolder("bulk", 800, pull, 3);
+		const notes = makeFolder("notes", 0, pull, 3);
+		notes.trackedEntries.set("note", {
+			__isDocument: true,
+			isOnline: false,
+			entityGuid: "note",
+			entryPath: "notes/note.md",
+		});
+		const poller = new CrdtBackgroundSyncPoller(
+			clock as never,
+			makeRegistry([bulk, notes]) as never,
+			60_000,
+		);
+		poller.start();
+		// The regular slots go round-robin; drain the small share's sweep first.
+		const notesSweep = held.findIndex((h) => h.file.entityGuid === "note");
+		held.splice(notesSweep, 1)[0].resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+		expect(startedGuids(pull).filter((g) => g.startsWith("bulk-"))).toHaveLength(3);
+
+		notes.announce("note", textFingerprint("edited"));
+		await flushPromises();
+		// Without the express slot it waits up to PULL_DEADLINE_MS for a bulk pull.
+		expect(startedGuids(pull).at(-1)).toBe("note");
+		expect(poller.stats().express).toBe(1);
+		expect(poller.stats().inflight).toBe(4);
+
+		clock.setTime(t0 + 4_000);
+		held.find((h) => h.file.entityGuid === "note")?.resolve({ outcome: "flushed", remoteText: "edited" });
+		await flushPromises();
+		expect(poller.stats().delivery).toEqual({ count: 1, p50Ms: 4_000, p95Ms: 4_000, maxMs: 4_000 });
+		expect(poller.stats().express).toBe(0);
+		poller.destroy();
+	});
+
+	test("a bulk share's announced backlog can't take the express slot; another share's edit can", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const bulk = makeFolder("bulk", 0, pull, 3);
+		const notes = makeFolder("notes", 0, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(
+			clock as never,
+			makeRegistry([bulk, notes]) as never,
+			60_000,
+		);
+		poller.start();
+		for (let i = 0; i < 100; i++) {
+			bulk.trackedEntries.set(`bulk-${i}`, {
+				__isDocument: true,
+				isOnline: false,
+				entityGuid: `bulk-${i}`,
+				entryPath: `bulk/${i}.md`,
+			});
+			bulk.announce(`bulk-${i}`, textFingerprint(`created ${i}`));
+		}
+		notes.trackedEntries.set("note", {
+			__isDocument: true,
+			isOnline: false,
+			entityGuid: "note",
+			entryPath: "notes/note.md",
+		});
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["bulk-0", "bulk-1", "bulk-2"]);
+		expect(poller.stats().express).toBe(0);
+
+		notes.announce("note", textFingerprint("edited"));
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["bulk-0", "bulk-1", "bulk-2", "note"]);
+		expect(poller.stats().express).toBe(1);
+		poller.destroy();
+	});
+
+	test("one express pull at a time; regular slots stay at laneLimit", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const bulk = makeFolder("bulk", 50, pull, 2);
+		const a = makeFolder("a", 1, pull, 2);
+		const b = makeFolder("b", 1, pull, 2);
+		const poller = new CrdtBackgroundSyncPoller(
+			clock as never,
+			makeRegistry([bulk, a, b]) as never,
+			60_000,
+		);
+		poller.start();
+		// Two regular slots: bulk-0 and a-0. b-0 waits for the sweep.
+		expect(startedGuids(pull)).toEqual(["bulk-0", "a-0"]);
+
+		b.announce("b-0", textFingerprint("edit b"));
+		bulk.announce("bulk-40", textFingerprint("edit bulk"));
+		await flushPromises();
+		// b-0 takes the express slot; bulk-40 waits for a regular one.
+		expect(startedGuids(pull)).toEqual(["bulk-0", "a-0", "b-0"]);
+		expect(poller.stats().inflight).toBe(3);
+
+		held.find((h) => h.file.entityGuid === "a-0")?.resolve({ outcome: "unchanged", remoteText: "" });
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["bulk-0", "a-0", "b-0", "bulk-40"]);
+		expect(poller.stats().inflight).toBe(3);
 		poller.destroy();
 	});
 

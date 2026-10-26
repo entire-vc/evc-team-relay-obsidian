@@ -79,6 +79,14 @@
  *    and a pass is bounded by the share's size, not by how often it ticks.
  *    Free slots go to priority work first, and within each lane round-robin
  *    across shares, so no share waits behind another share's backlog.
+ *  - One express slot on top of `laneLimit` (found in load testing of
+ *    0.1.9: closed-note edits in one share took up to ~100s to arrive while
+ *    an 800+ document bulk sync kept every regular slot in `connect` on
+ *    another share). It only takes announced work from a share that has no
+ *    announced pull in flight yet, so a single edit starts at once instead
+ *    of waiting up to PULL_DEADLINE_MS for a regular slot, while a share
+ *    with a large announced backlog (the bulk itself) can't occupy it. Bulk
+ *    throughput is unchanged: the regular slots stay at `laneLimit`.
  *  - The sweep stays as the fallback for writers that don't announce
  *    changes (older clients, server-side edits); the announcement is the
  *    fast path that makes a single edit in a large vault arrive in seconds.
@@ -134,10 +142,16 @@ interface InFlight {
 	phase: PullPhase | "queued";
 	controller: AbortController;
 	deadline?: number;
+	/** Started from the priority lane (an announced change or its re-check). */
+	announced: boolean;
+	/** Runs in the express slot, outside the `laneLimit` regular slots. */
+	express: boolean;
 }
 
 export interface PollerStats {
 	inflight: number;
+	/** Pulls currently running in the express slot (0 or 1). */
+	express: number;
 	oldestWaitMs: number;
 	queued: Record<string, { priority: number; sweep: number }>;
 	timeouts: Partial<Record<PullPhase | "queued", number>>;
@@ -289,20 +303,38 @@ export class CrdtBackgroundSyncPoller {
 	}
 
 	/** Next document to start: priority lane first, round-robin across shares within a lane. */
-	private takeNext(): PendingPull | undefined {
-		const shares = [...this.queues.keys()];
-		if (shares.length === 0) return undefined;
+	private takeNext(): { pull: PendingPull; announced: boolean } | undefined {
 		for (const lane of ["priority", "sweep"] as const) {
-			for (let i = 0; i < shares.length; i++) {
-				const index = (this.cursor + i) % shares.length;
-				const queue = this.queues.get(shares[index])?.[lane];
-				const next = queue?.entries().next();
-				if (!queue || !next || next.done) continue;
-				const [guid, pull] = next.value;
-				queue.delete(guid);
-				this.cursor = (index + 1) % shares.length;
-				return pull;
-			}
+			const pull = this.takeFrom(lane, () => true);
+			if (pull) return { pull, announced: lane === "priority" };
+		}
+		return undefined;
+	}
+
+	/**
+	 * Next document for the express slot: announced work only, from a share
+	 * none of whose announced pulls is already running.
+	 */
+	private takeExpress(): PendingPull | undefined {
+		const busy = new Set<VaultShare>();
+		for (const inFlight of this.pulling.values()) {
+			if (inFlight.announced) busy.add(inFlight.pull.folder);
+		}
+		return this.takeFrom("priority", (share) => !busy.has(share));
+	}
+
+	private takeFrom(lane: keyof ShareQueues, eligible: (share: VaultShare) => boolean): PendingPull | undefined {
+		const shares = [...this.queues.keys()];
+		for (let i = 0; i < shares.length; i++) {
+			const index = (this.cursor + i) % shares.length;
+			if (!eligible(shares[index])) continue;
+			const queue = this.queues.get(shares[index])?.[lane];
+			const next = queue?.entries().next();
+			if (!queue || !next || next.done) continue;
+			const [guid, pull] = next.value;
+			queue.delete(guid);
+			this.cursor = (index + 1) % shares.length;
+			return pull;
 		}
 		return undefined;
 	}
@@ -316,13 +348,26 @@ export class CrdtBackgroundSyncPoller {
 	private drain(): void {
 		while (!this.destroyed) {
 			const limit = this.laneLimit();
-			if (limit === undefined || this.pulling.size >= limit) return;
-			const pull = this.takeNext();
-			if (!pull) return;
+			if (limit === undefined) return;
+			let regular = 0;
+			let expressBusy = false;
+			for (const inFlight of this.pulling.values()) {
+				if (inFlight.express) expressBusy = true;
+				else regular++;
+			}
+			let next: { pull: PendingPull; announced: boolean; express: boolean } | undefined;
+			if (regular < limit) {
+				const taken = this.takeNext();
+				if (taken) next = { ...taken, express: false };
+			} else if (!expressBusy) {
+				const pull = this.takeExpress();
+				if (pull) next = { pull, announced: true, express: true };
+			}
+			if (!next) return;
 			// Re-validated at start: the editor may have opened it, or another
 			// path may have started pulling it, while it sat in the queue.
-			if (!pull.folder.isOnline || !this.canQueue(pull.file)) continue;
-			this.startPull(pull);
+			if (!next.pull.folder.isOnline || !this.canQueue(next.pull.file)) continue;
+			this.startPull(next.pull, next.announced, next.express);
 		}
 	}
 
@@ -331,16 +376,17 @@ export class CrdtBackgroundSyncPoller {
 		return undefined;
 	}
 
-	private startPull(pull: PendingPull): void {
+	private startPull(pull: PendingPull, announced: boolean, express: boolean): void {
 		const { folder, file } = pull;
 		const guid = file.entityGuid;
 		const controller = new AbortController();
-		const inFlight: InFlight = { pull, phase: "queued", controller };
+		const inFlight: InFlight = { pull, phase: "queued", controller, announced, express };
 		this.pulling.set(guid, inFlight);
 		const startedAt = this.timeProvider.now();
 		log("Re-checking unopened document for remote updates", {
 			path: file.entryPath,
 			announced: pull.expected !== undefined,
+			express,
 			waitedMs: startedAt - pull.queuedAt,
 		});
 
@@ -457,6 +503,7 @@ export class CrdtBackgroundSyncPoller {
 		const sorted = [...this.deliveries].sort((a, b) => a - b);
 		return {
 			inflight: this.pulling.size,
+			express: [...this.pulling.values()].filter((inFlight) => inFlight.express).length,
 			oldestWaitMs: now - oldest,
 			queued,
 			timeouts: { ...this.timeouts },
