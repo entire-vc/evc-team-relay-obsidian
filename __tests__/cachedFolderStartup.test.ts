@@ -198,6 +198,7 @@ describe("cached folder startup", () => {
 			teardowns: [], trackedEntries: new Map(),
 			attachmentSettings: { destroy: jest.fn() },
 			_config: { destroy: jest.fn() }, pathSet: { clearAll: jest.fn() },
+			lostClaimSettler: { cancelAll: jest.fn() },
 		});
 		const providerTeardown = jest.spyOn(ProviderBacked.prototype, "dismantle").mockImplementation(() => {});
 		try {

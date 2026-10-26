@@ -78,6 +78,7 @@ import {
 	hasUnsyncedEdit,
 	hasUnsyncedCanvasEdit,
 } from "./preserveBeforeTrash";
+import { LostClaimSettler, preserveThenAdopt, settleLostClaim } from "./lostClaimWinner";
 import type { CanvasData } from "./HostCanvasView";
 import {
 	claimVpathIfUnclaimed,
@@ -486,6 +487,9 @@ export class VaultShare extends ProviderBacked {
 	/** One startup barrier for observers, manual sync, and automatic tree scans. */
 	/** Old paths of server moves whose destination already exists locally. */
 	private followedMoveSkips = new Set<string>();
+	private lostClaimSettler = new LostClaimSettler((vpath, e) =>
+		this.warn(`Failed to settle the lost upload claim on ${vpath}`, e),
+	);
 
 	private awaitFolderTreeReady(): Promise<boolean> {
 		if (this.isTornDown) return Promise.resolve(false);
@@ -809,7 +813,9 @@ export class VaultShare extends ProviderBacked {
 	 * code compared against `CanvasDocument.exportData` but flushed
 	 * `canvas.json` -- preserved here rather than "simplified" away);
 	 * `diverged` is the type-appropriate comparison (plain-text equality
-	 * for Documents, deep-object equality for CanvasDocument JSON).
+	 * for Documents, deep-object equality for CanvasDocument JSON);
+	 * `winnerEmpty` tells a winner whose text hasn't been uploaded yet apart
+	 * from real content (see lostClaimWinner.ts).
 	 */
 	private async _reconcileLostUploadClaim<T extends Document | CanvasDocument, S>(
 		vpath: string,
@@ -817,6 +823,7 @@ export class VaultShare extends ProviderBacked {
 		winnerContent: (item: T) => S,
 		flushContent: (item: T) => string,
 		diverged: (local: string, winner: S) => boolean,
+		winnerEmpty: (winner: S) => boolean,
 	): Promise<T> {
 		this.folderIndex.clearPendingUpload(vpath);
 		await this.awaitVpathResolved(vpath);
@@ -824,41 +831,61 @@ export class VaultShare extends ProviderBacked {
 		const item = mint(vpath);
 		await this.awaitDocSynced(item);
 
-		let localContent: string;
-		try {
-			localContent = await this.readContents(item);
-		} catch (e: unknown) {
-			this.warn(
-				`Could not readContents ${vpath} to reconcile after losing the upload claim`,
-				e,
-			);
-			return item;
-		}
+		// The winner's guid can arrive well before its text (its upload lane
+		// may be hundreds of files deep), so the comparison waits for the text
+		// to land -- detached, so the files after this one in adoptLocalFiles
+		// don't queue behind it, and on CRDT updates of the doc, which stays
+		// online until then (the background pull skips online docs).
+		const isAlive = () =>
+			!this.isTornDown && !this.deletedEntries.has(item) && !item.crdtDoc.isDestroyed;
+		this.lostClaimSettler.start(vpath, (signal) =>
+			settleLostClaim<S>({
+				read: () => winnerContent(item),
+				isEmpty: winnerEmpty,
+				subscribe: (onChange, onGone) => {
+					item.crdtDoc.on("update", onChange);
+					item.crdtDoc.on("destroy", onGone);
+					return () => {
+						item.crdtDoc.off("update", onChange);
+						item.crdtDoc.off("destroy", onGone);
+					};
+				},
+				signal,
+				readLocal: () => this.readContents(item),
+				diverged,
+				preserveAndAdopt: (local) =>
+					this._preserveAndAdoptWinner(item, local, flushContent, isAlive),
+				isAlive,
+			}),
+		);
+		return item;
+	}
 
-		const winner = winnerContent(item);
-		if (!diverged(localContent, winner)) {
-			return item;
-		}
-
+	private async _preserveAndAdoptWinner<T extends Document | CanvasDocument>(
+		item: T,
+		localContent: string,
+		flushContent: (item: T) => string,
+		isAlive: () => boolean,
+	): Promise<void> {
 		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 		try {
-			const conflictPath = await this.writeConflictCopy(
-				item,
-				localContent,
-				`upload race ${timestamp}`,
-			);
-			await this.writeContents(item, flushContent(item));
+			const conflictPath = await preserveThenAdopt({
+				writeCopy: () =>
+					this.writeConflictCopy(item, localContent, `upload race ${timestamp}`),
+				writeOriginal: () => this.writeContents(item, flushContent(item)),
+				isAlive,
+			});
+			if (conflictPath === undefined) return;
 			this.log(
 				`[${item.entryPath}] Lost the upload-claim race and had different local content -- ` +
 					`adopted the winner's content, preserved ours at ${conflictPath}`,
 			);
 		} catch (e: unknown) {
 			this.warn(
-				`Failed to preserve local content for ${vpath} before adopting the upload-claim winner's content -- skipping to avoid silent data loss`,
+				`Failed to preserve local content for ${item.entryPath} before adopting the upload-claim winner's content -- skipping to avoid silent data loss`,
 				e,
 			);
 		}
-		return item;
 	}
 
 	/** @see _reconcileLostUploadClaim */
@@ -869,6 +896,7 @@ export class VaultShare extends ProviderBacked {
 			(doc) => doc.content,
 			(doc) => doc.content,
 			hasUnsyncedEdit,
+			(text) => text === "",
 		);
 	}
 
@@ -880,6 +908,7 @@ export class VaultShare extends ProviderBacked {
 			(canvas) => CanvasDocument.exportData(canvas.crdtDoc),
 			(canvas) => canvas.canvasJson,
 			hasUnsyncedCanvasEdit,
+			(data) => (data.nodes?.length ?? 0) === 0 && (data.edges?.length ?? 0) === 0,
 		);
 	}
 
@@ -2892,6 +2921,7 @@ export class VaultShare extends ProviderBacked {
 
 	dismantle() {
 		this.isTornDown = true;
+		this.lostClaimSettler.cancelAll();
 		this.cancelInitialFolderSync?.();
 		this.cancelInitialFolderSync = null;
 		this.teardowns.forEach((unsub) => {
