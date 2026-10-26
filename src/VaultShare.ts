@@ -78,7 +78,11 @@ import {
 	hasUnsyncedEdit,
 	hasUnsyncedCanvasEdit,
 } from "./preserveBeforeTrash";
-import { awaitWinnerContent, lostClaimAction } from "./lostClaimWinner";
+import {
+	LOST_CLAIM_WINNER_WAIT_MS,
+	LostClaimSettler,
+	settleLostClaim,
+} from "./lostClaimWinner";
 import type { CanvasData } from "./HostCanvasView";
 import {
 	claimVpathIfUnclaimed,
@@ -487,6 +491,9 @@ export class VaultShare extends ProviderBacked {
 	/** One startup barrier for observers, manual sync, and automatic tree scans. */
 	/** Old paths of server moves whose destination already exists locally. */
 	private followedMoveSkips = new Set<string>();
+	private lostClaimSettler = new LostClaimSettler((vpath, e) =>
+		this.warn(`Failed to settle the lost upload claim on ${vpath}`, e),
+	);
 
 	private awaitFolderTreeReady(): Promise<boolean> {
 		if (this.isTornDown) return Promise.resolve(false);
@@ -828,37 +835,44 @@ export class VaultShare extends ProviderBacked {
 		const item = mint(vpath);
 		await this.awaitDocSynced(item);
 
-		let localContent: string;
-		try {
-			localContent = await this.readContents(item);
-		} catch (e: unknown) {
-			this.warn(
-				`Could not readContents ${vpath} to reconcile after losing the upload claim`,
-				e,
-			);
-			return item;
-		}
-
 		// The winner's guid can arrive well before its text (its upload lane
-		// may be hundreds of files deep), so give the text a moment to land
-		// before comparing against what may only be an empty placeholder.
-		const winner = await awaitWinnerContent(() => winnerContent(item), winnerEmpty);
-		const action = lostClaimAction(localContent, winner, diverged, winnerEmpty);
-		if (action === "keep") {
-			return item;
-		}
-		if (action === "await-winner") {
-			// Not a conflict: the winner's text simply isn't on the relay yet.
-			// Copying ours out would duplicate the note for every member, and
-			// writing the empty placeholder over ours would blank it. Leave the
-			// file as it is; the background pull settles it once the text lands.
-			this.log(
-				`[${item.entryPath}] Lost the upload-claim race; winner's content not on the relay yet -- ` +
-					`keeping the local file as is`,
-			);
-			return item;
-		}
+		// may be hundreds of files deep), so the comparison waits for the text
+		// to land -- detached, so the files after this one in adoptLocalFiles
+		// don't queue behind it, and on CRDT updates of the doc, which stays
+		// online until then (the background pull skips online docs).
+		this.lostClaimSettler.start(vpath, async () => {
+			const action = await settleLostClaim<S>({
+				read: () => winnerContent(item),
+				isEmpty: winnerEmpty,
+				subscribe: (onChange) => {
+					item.crdtDoc.on("update", onChange);
+					return () => item.crdtDoc.off("update", onChange);
+				},
+				maxWaitMs: LOST_CLAIM_WINNER_WAIT_MS,
+				readLocal: () => this.readContents(item),
+				diverged,
+				preserveAndAdopt: (local) => this._preserveAndAdoptWinner(item, local, flushContent),
+				isAlive: () => !this.isTornDown && !this.deletedEntries.has(item),
+			});
+			if (action === "await-winner") {
+				// Not a conflict: the winner's text never reached the relay in
+				// time. Copying ours out would duplicate the note for every
+				// member, and writing the empty placeholder over ours would
+				// blank it. Leave the file as it is.
+				this.log(
+					`[${item.entryPath}] Lost the upload-claim race; winner's content still not on the relay ` +
+						`after ${LOST_CLAIM_WINNER_WAIT_MS / 1000}s -- keeping the local file as is`,
+				);
+			}
+		});
+		return item;
+	}
 
+	private async _preserveAndAdoptWinner<T extends Document | CanvasDocument>(
+		item: T,
+		localContent: string,
+		flushContent: (item: T) => string,
+	): Promise<void> {
 		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 		try {
 			const conflictPath = await this.writeConflictCopy(
@@ -873,11 +887,10 @@ export class VaultShare extends ProviderBacked {
 			);
 		} catch (e: unknown) {
 			this.warn(
-				`Failed to preserve local content for ${vpath} before adopting the upload-claim winner's content -- skipping to avoid silent data loss`,
+				`Failed to preserve local content for ${item.entryPath} before adopting the upload-claim winner's content -- skipping to avoid silent data loss`,
 				e,
 			);
 		}
-		return item;
 	}
 
 	/** @see _reconcileLostUploadClaim */

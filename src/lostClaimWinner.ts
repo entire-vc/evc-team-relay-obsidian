@@ -40,34 +40,109 @@ export function lostClaimAction<S>(
 	return "preserve-and-adopt";
 }
 
-export interface AwaitWinnerContentOptions {
-	maxWaitMs?: number;
-	pollMs?: number;
-	sleep?: (ms: number) => Promise<void>;
-	now?: () => number;
+/**
+ * How long a loser waits for the winner's text. Long on purpose: an initial
+ * sync of a large folder puts hundreds of uploads ahead of it in the winner's
+ * lane, and giving up early only means the file is never reconciled.
+ */
+export const LOST_CLAIM_WINNER_WAIT_MS = 15 * 60_000;
+
+export interface WinnerContentWait<S> {
+	/** Current winner content, read from the synced CRDT. */
+	read: () => S;
+	isEmpty: (winner: S) => boolean;
+	/** Calls `onChange` on every CRDT update; returns the unsubscribe. */
+	subscribe: (onChange: () => void) => () => void;
+	maxWaitMs: number;
+	scheduleTimeout?: (fn: () => void, ms: number) => unknown;
+	cancelTimeout?: (handle: unknown) => void;
 }
 
-const defaultSleep = (ms: number): Promise<void> =>
-	new Promise((resolve) => window.setTimeout(resolve, ms));
+/**
+ * Resolves with the winner's content as soon as it is non-empty, or with the
+ * last (empty) read once `maxWaitMs` elapses. Event-driven rather than
+ * polled: the winner's upload lane can be hundreds of files deep, so the
+ * wait has to be long, and many lost claims can be waiting at once.
+ */
+export function awaitWinnerContent<S>(wait: WinnerContentWait<S>): Promise<S> {
+	const {
+		read,
+		isEmpty,
+		subscribe,
+		maxWaitMs,
+		scheduleTimeout = (fn, ms) => window.setTimeout(fn, ms),
+		cancelTimeout = (handle) => window.clearTimeout(handle as number),
+	} = wait;
+	const first = read();
+	if (!isEmpty(first)) return Promise.resolve(first);
+	return new Promise<S>((resolve) => {
+		let done = false;
+		const finish = (winner: S) => {
+			if (done) return;
+			done = true;
+			cancelTimeout(timer);
+			unsubscribe();
+			resolve(winner);
+		};
+		const unsubscribe = subscribe(() => {
+			const winner = read();
+			if (!isEmpty(winner)) finish(winner);
+		});
+		const timer = scheduleTimeout(() => finish(read()), maxWaitMs);
+	});
+}
+
+export interface LostClaimSettle<S> extends WinnerContentWait<S> {
+	/** Reads the local vault file. Called only AFTER the wait. */
+	readLocal: () => Promise<string>;
+	diverged: (local: string, winner: S) => boolean;
+	/** Saves `local` as a conflict copy, then writes the winner's content. */
+	preserveAndAdopt: (local: string) => Promise<void>;
+	/** False once the entry or its share has been torn down. */
+	isAlive: () => boolean;
+}
 
 /**
- * Re-reads the winner's content until it is non-empty or `maxWaitMs`
- * elapses, and returns the last read. Covers the common case where the
- * winner uploads its text within seconds of publishing the guid; a winner
- * with a long upload backlog times out here and the caller leaves the local
- * file for the ordinary background pull to settle.
+ * Waits for the winner's content, then decides against the local file as it
+ * is at that moment: an edit the user made during the wait is what gets
+ * preserved, never a snapshot taken before it.
  */
-export async function awaitWinnerContent<S>(
-	read: () => S,
-	isEmpty: (winner: S) => boolean,
-	options: AwaitWinnerContentOptions = {},
-): Promise<S> {
-	const { maxWaitMs = 10_000, pollMs = 250, sleep = defaultSleep, now = Date.now } = options;
-	const deadline = now() + maxWaitMs;
-	let winner = read();
-	while (isEmpty(winner) && now() < deadline) {
-		await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
-		winner = read();
+export async function settleLostClaim<S>(
+	settle: LostClaimSettle<S>,
+): Promise<LostClaimAction | "gone"> {
+	const winner = await awaitWinnerContent(settle);
+	if (!settle.isAlive()) return "gone";
+	const local = await settle.readLocal();
+	if (!settle.isAlive()) return "gone";
+	const action = lostClaimAction(local, winner, settle.diverged, settle.isEmpty);
+	if (action === "preserve-and-adopt") {
+		await settle.preserveAndAdopt(local);
 	}
-	return winner;
+	return action;
+}
+
+/**
+ * Runs lost-claim settles detached from the caller, at most one per key.
+ * VaultShare.adoptLocalFiles resolves files one after another, so a settle
+ * awaited inline would hold every following file for as long as the
+ * winner's text takes to arrive.
+ */
+export class LostClaimSettler {
+	private readonly pending = new Set<string>();
+
+	constructor(private readonly onError: (key: string, e: unknown) => void) {}
+
+	/** Starts a settle for `key` unless one is running; never waits for it. */
+	start(key: string, run: () => Promise<unknown>): boolean {
+		if (this.pending.has(key)) return false;
+		this.pending.add(key);
+		void run()
+			.catch((e: unknown) => this.onError(key, e))
+			.finally(() => this.pending.delete(key));
+		return true;
+	}
+
+	isPending(key: string): boolean {
+		return this.pending.has(key);
+	}
 }
