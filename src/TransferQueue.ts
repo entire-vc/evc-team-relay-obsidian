@@ -245,6 +245,14 @@ export class TransferQueue extends Loggable {
 		return { uploads: this.statsFor(this.syncLane), fetches: this.statsFor(this.downloadLane) };
 	}
 
+	/** Priority fetches of `vaultShare` that are queued or running. */
+	priorityFetches(vaultShare: VaultShare): number {
+		const own = (item: TransferTask) => item.priority && item.vaultShare === vaultShare;
+		return (
+			this.downloadLane.queue.filter(own).length + this.downloadLane.active.toArray().filter(own).length
+		);
+	}
+
 	private statsFor(lane: QueueLaneState): LaneStats {
 		const now = this.clock.now();
 		const queuedByShare: Record<string, number> = {};
@@ -1013,6 +1021,15 @@ export class TransferQueue extends Loggable {
 				vaultContentsAfter === "" &&
 				remoteText !== "" &&
 				!(await doc.vaultShare.hasFile(doc));
+			if (missingOnDisk) {
+				// Never recreate a folder the user is deleting; otherwise a
+				// removed or renamed parent must exist before the write.
+				if (doc.vaultShare.isDeletePending(doc.entryPath)) {
+					this.releasePulledDoc(doc, intent);
+					return { outcome: "unchanged", remoteText };
+				}
+				await doc.vaultShare.ensureParentDir(doc.entryPath);
+			}
 			if (syncBase === undefined && !missingOnDisk) {
 				// Never round-tripped through a successful upload cycle for
 				// this doc -- can't tell a genuine unsynced edit apart from

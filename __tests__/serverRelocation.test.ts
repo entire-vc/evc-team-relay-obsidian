@@ -127,7 +127,7 @@ function offlineMoveFixture() {
 				}
 			},
 		},
-		_ensureParentDir: async () => { local.add("Shared/artifacts"); },
+		ensureParentDir: async () => { local.add("Shared/artifacts"); },
 	});
 	return { cache, server, share, confirm, renames, adopted, local };
 }
@@ -293,7 +293,7 @@ function noMemoryFixture(disk: Record<string, string>) {
 				}
 			},
 		},
-		_ensureParentDir: async () => {},
+		ensureParentDir: async () => {},
 	});
 	return { share, files, trashed, renames };
 }

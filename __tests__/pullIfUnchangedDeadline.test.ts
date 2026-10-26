@@ -46,6 +46,7 @@ interface FakeDocOptions {
 	syncBase?: string;
 	vaultContents?: string;
 	fileExists?: boolean;
+	deletePending?: boolean;
 }
 
 function makeFakeDoc(opts: FakeDocOptions = {}) {
@@ -53,6 +54,7 @@ function makeFakeDoc(opts: FakeDocOptions = {}) {
 	const writeContents = jest.fn<(doc: unknown, content: string) => Promise<void>>(async () => {});
 	const writeConflictCopy = jest.fn<(...args: unknown[]) => Promise<void>>(async () => {});
 	const setSyncBase = jest.fn<(text: string) => Promise<void>>(async () => {});
+	const ensureParentDir = jest.fn<(vpath: string) => Promise<void>>(async () => {});
 	const fakeDoc = Object.create(Document.prototype) as Document;
 	Object.defineProperty(fakeDoc, "entryPath", { value: "note.md" });
 	Object.defineProperty(fakeDoc, "entityGuid", { value: "test-guid" });
@@ -72,13 +74,15 @@ function makeFakeDoc(opts: FakeDocOptions = {}) {
 		value: {
 			readContents: async () => opts.vaultContents ?? "shared content",
 			hasFile: async () => opts.fileExists ?? true,
+			isDeletePending: () => opts.deletePending ?? false,
+			ensureParentDir,
 			writeConflictCopy,
 			writeContents,
 			folderIndex: { tracks: () => true },
 			credentialCache: { dropFromQueue: () => {} },
 		},
 	});
-	return { fakeDoc, goOffline, writeContents, writeConflictCopy, setSyncBase };
+	return { fakeDoc, goOffline, writeContents, writeConflictCopy, setSyncBase, ensureParentDir };
 }
 
 function makeQueue(): TransferQueue {
@@ -202,7 +206,7 @@ describe("pullIfUnchanged — deadline abort and connection release", () => {
 	});
 
 	test("no base and no file on disk: a peer's new note is written, with its base", async () => {
-		const { fakeDoc, goOffline, writeContents, setSyncBase } = makeFakeDoc({
+		const { fakeDoc, goOffline, writeContents, setSyncBase, ensureParentDir } = makeFakeDoc({
 			syncBase: undefined,
 			vaultContents: "",
 			fileExists: false,
@@ -213,7 +217,23 @@ describe("pullIfUnchanged — deadline abort and connection release", () => {
 		});
 		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "relay content EDITED BY PEER");
 		expect(setSyncBase).toHaveBeenCalledWith("relay content EDITED BY PEER");
+		expect(ensureParentDir).toHaveBeenCalledWith("note.md");
 		expect(goOffline).toHaveBeenCalledTimes(1);
+	});
+
+	test("no base, no file, but its folder is being deleted: nothing is recreated", async () => {
+		const { fakeDoc, writeContents, ensureParentDir } = makeFakeDoc({
+			syncBase: undefined,
+			vaultContents: "",
+			fileExists: false,
+			deletePending: true,
+		});
+		await expect(makeQueue().pullIfUnchanged(fakeDoc)).resolves.toEqual({
+			outcome: "unchanged",
+			remoteText: "relay content EDITED BY PEER",
+		});
+		expect(ensureParentDir).not.toHaveBeenCalled();
+		expect(writeContents).not.toHaveBeenCalled();
 	});
 
 	test("no base and an EMPTY file that does exist: still left alone", async () => {

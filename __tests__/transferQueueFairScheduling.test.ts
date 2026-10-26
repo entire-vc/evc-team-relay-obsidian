@@ -151,6 +151,19 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		expect(started[3]).toBe("S:bulk5.md");
 	});
 
+	test("priorityFetches() counts one share's queued and running priority fetches", async () => {
+		const a = makeShare("A");
+		const b = makeShare("B");
+		jest.spyOn(queue as unknown as { fetchDocument: (doc: Document) => Promise<void> }, "fetchDocument").mockImplementation(
+			() => new Promise<void>(() => {}),
+		);
+		for (let i = 0; i < 6; i++) void queue.enqueueFetch(makeDoc(a, `a${i}.md`), { priority: i < 5 });
+		void queue.enqueueFetch(makeDoc(b, "b.md"));
+		await flushMacrotasks();
+		expect(queue.priorityFetches(a)).toBe(5);
+		expect(queue.priorityFetches(b)).toBe(0);
+	});
+
 	test("laneStats() reports queue per share, priority backlog, active count and oldest wait", async () => {
 		const a = makeShare("A");
 		const b = makeShare("B");
