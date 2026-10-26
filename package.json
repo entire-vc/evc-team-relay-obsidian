@@ -1,6 +1,6 @@
 {
   "name": "team-relay-sync",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Enterprise collaboration with self-hosted relay infrastructure for Obsidian.",
   "main": "main.js",
   "scripts": {
