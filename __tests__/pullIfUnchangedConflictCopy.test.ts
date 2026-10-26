@@ -172,7 +172,7 @@ describe("pullIfUnchanged — sync-base gates the overwrite, never silently disc
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(writeConflictCopy).not.toHaveBeenCalled();
 		expect(queue.enqueueUpload).toHaveBeenCalledTimes(1);
-		expect(queue.enqueueUpload).toHaveBeenCalledWith(fakeDoc);
+		expect(queue.enqueueUpload).toHaveBeenCalledWith(fakeDoc, { priority: true });
 	});
 
 	test(" edge: an EMPTY vault file with the relay unchanged keeps the previous restore behaviour (the upload path skips empty content, so queueing it would loop)", async () => {

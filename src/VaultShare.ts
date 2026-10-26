@@ -547,7 +547,7 @@ export class VaultShare extends ProviderBacked {
 					await this.trashDuplicatesOfMovedRoot(from, to);
 					continue;
 				}
-				await this._ensureParentDir(to);
+				await this.ensureParentDir(to);
 				await this.fileOps.renameFile(source, normalizePath(this.absolutePath(to)));
 				console.debug(`[VaultShare] ${this.path}: followed server move ${from} -> ${to}`);
 			} catch (e: unknown) {
@@ -1338,7 +1338,7 @@ export class VaultShare extends ProviderBacked {
 		// Applies a rename the server already committed to our local copy.
 		diffLog?.push(`renamed ${file.path} -> ${this.absolutePath(path)} per serverId state`);
 		if (file instanceof TFile) {
-			await this._ensureParentDir(path, diffLog);
+			await this.ensureParentDir(path, diffLog);
 		}
 		await this.fileOps
 			.renameFile(file, normalizePath(this.absolutePath(path)))
@@ -1347,7 +1347,8 @@ export class VaultShare extends ProviderBacked {
 			});
 	}
 
-	private async _ensureParentDir(
+	/** Creates `vpath`'s parent folder if it's missing. */
+	async ensureParentDir(
 		vpath: string,
 		diffLog?: string[],
 	): Promise<void> {
@@ -1364,7 +1365,7 @@ export class VaultShare extends ProviderBacked {
 		diffLog?: string[],
 	): Promise<SyncableEntry> {
 		console.debug(`[VaultShare] _onServerCreate: vpath=${vpath}, type=${meta.type}, id=${meta.id?.slice(0,8)}`);
-		await this._ensureParentDir(vpath, diffLog);
+		await this.ensureParentDir(vpath, diffLog);
 
 		switch (meta.type) {
 			case ItemKind.Document:
@@ -2190,10 +2191,11 @@ export class VaultShare extends ProviderBacked {
 		);
 	}
 
-	public publishCanvas(vpath: string, update = true): CanvasDocument {
+	public publishCanvas(vpath: string, update = true, priority = false): CanvasDocument {
 		return this._uploadTyped<CanvasDocument>(
 			vpath,
 			update,
+			priority,
 			CanvasDocument.matchesTrackedExtension,
 			(guid, v) => this.ensureCanvas(guid, v),
 			(canvas, contents) => {
@@ -2289,7 +2291,13 @@ export class VaultShare extends ProviderBacked {
 			update,
 			Document.matchesTrackedExtension,
 			(guid, v) => this.ensureDoc(guid, v),
-			(doc) => void this.transfers.enqueueFetch(doc),
+			// A peer's new note: someone is waiting for it to appear. A
+			// share's first pull creates every note at once; only its first
+			// few go ahead, the rest stay bulk so they can't hold every slot.
+			(doc) =>
+				void this.transfers.enqueueFetch(doc, {
+					priority: this.transfers.priorityFetches(this) < this.transfers.laneLimit,
+				}),
 		);
 	}
 
@@ -2324,10 +2332,11 @@ export class VaultShare extends ProviderBacked {
 		return item;
 	}
 
-	publishDoc(vpath: string, update = true): Document {
+	publishDoc(vpath: string, update = true, priority = false): Document {
 		return this._uploadTyped<Document>(
 			vpath,
 			update,
+			priority,
 			Document.matchesTrackedExtension,
 			(guid, v) => this.ensureDoc(guid, v),
 			(doc, contents) => {
@@ -2346,6 +2355,7 @@ export class VaultShare extends ProviderBacked {
 	private _uploadTyped<T extends Document | CanvasDocument>(
 		vpath: string,
 		update: boolean,
+		priority: boolean,
 		checkExtension: (v: string) => boolean,
 		mint: (guid: string, vpath: string) => T,
 		seed: (item: T, contents: string) => void,
@@ -2388,7 +2398,7 @@ export class VaultShare extends ProviderBacked {
 				}
 				void (isDocument(item) ? item.markSyncOrigin("local") : item.markSyncOrigin("local"));
 				this.log(`[${item.entryPath}] Uploading file`);
-				await this.transfers.enqueueUpload(item);
+				await this.transfers.enqueueUpload(item, { priority });
 				void this.noteUploaded(item);
 			}
 		})();
@@ -2570,17 +2580,17 @@ export class VaultShare extends ProviderBacked {
 		return file;
 	}
 
-	publishFile(tfile: TAbstractFile, update = true): SyncableEntry {
+	publishFile(tfile: TAbstractFile, update = true, priority = false): SyncableEntry {
 		const vpath = this.toVirtualPath(tfile.path);
 		if (tfile instanceof TFolder) {
 			return this.folderAt(vpath, update);
 		}
 		if (tfile instanceof TFile) {
 			if (Document.matchesTrackedExtension(vpath)) {
-				return this.publishDoc(vpath, update);
+				return this.publishDoc(vpath, update, priority);
 			}
 			if (CanvasDocument.matchesTrackedExtension(vpath) && currentToggles().enableCanvasSync) {
-				return this.publishCanvas(vpath, update);
+				return this.publishCanvas(vpath, update, priority);
 			}
 			if (this.folderIndex.isSyncable(vpath)) {
 				return this.publishAttachment(vpath, update);
@@ -2709,7 +2719,8 @@ export class VaultShare extends ProviderBacked {
 
 		const { lost } = await this.claimUploadPaths([vpath]);
 		if (lost.length === 0) {
-			this.publishFile(tfile);
+			// One note created now, not a bulk adoption pass: queue it ahead.
+			this.publishFile(tfile, true, true);
 			return;
 		}
 		if (Document.matchesTrackedExtension(vpath)) {

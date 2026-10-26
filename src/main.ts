@@ -2011,7 +2011,7 @@ export default class TeamRelayPlugin extends Plugin {
 						// Enqueue a background sync to push vault content to relay.
 						// When connected, LiveCMPluginValue handles sync automatically.
 						if (file && isDocument(file) && !file.isOnline) {
-							void folder.transfers.enqueueUpload(file);
+							void folder.transfers.enqueueUpload(file, { priority: true });
 						}
 					}
 					// Trigger metadata resolve with the actual TFile (not our Document proxy)
