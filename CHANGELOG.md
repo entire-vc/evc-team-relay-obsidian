@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.14
+- Fixed: while one shared folder receives a large import from another device, edits to closed notes in other shared folders are no longer left waiting behind it. Some of them could stay missing for many minutes.
+
 ## 0.1.13
 - Fixed: an edit to a closed note that reaches the server late, for example while the other device is importing hundreds of notes, now still arrives on its own instead of waiting for the next full background pass. Repeat checks for slow notes back off, so they no longer delay other edits.
 
