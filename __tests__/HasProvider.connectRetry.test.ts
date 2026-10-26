@@ -137,6 +137,30 @@ describe("ProviderBacked.bringOnline() retries after a failed first token reques
 		expect(hp.isOnline).toBe(true);
 	});
 
+	test("goOffline() after a failed bringOnline() cancels the scheduled retry", async () => {
+		// A background pull whose token request failed releases the doc with
+		// goOffline(); the retry must not reconnect it behind that intent.
+		const getToken = jest
+			.fn<() => Promise<DocumentGrant>>()
+			.mockRejectedValueOnce(new Error("503 control plane"))
+			.mockResolvedValue(VALID_TOKEN);
+
+		const hp = new ProviderBacked(
+			"33333333-3333-4333-8333-333333333333",
+			new RemoteFolderAddress("relay-onprem", "33333333-3333-4333-8333-333333333333"),
+			makeTokenStore(getToken),
+			{ getCurrentUserForServer: () => undefined, on: () => (() => {}) } as unknown as AuthSession,
+			"server-b",
+		);
+
+		expect(await hp.bringOnline()).toBe(false);
+		hp.goOffline();
+		await jest.advanceTimersByTimeAsync(10_000);
+
+		expect(getToken).toHaveBeenCalledTimes(1);
+		expect(hp.isOnline).toBe(false);
+	});
+
 	test("CONTROL: a successful first bringOnline() does not schedule a spurious extra retry", async () => {
 		const getToken = jest.fn<() => Promise<DocumentGrant>>().mockResolvedValue(VALID_TOKEN);
 

@@ -129,7 +129,7 @@ describe("CrdtBackgroundSyncPoller", () => {
 		timeProvider.setTime(startTime + 30_000);
 		await flushPromises();
 
-		expect(folder.transfers.pullIfUnchanged).toHaveBeenCalledWith(file);
+		expect(folder.transfers.pullIfUnchanged).toHaveBeenCalledWith(file, expect.anything());
 	});
 
 	test("start() checks immediately, without waiting for the first interval", () => {
@@ -144,7 +144,7 @@ describe("CrdtBackgroundSyncPoller", () => {
 		);
 		poller.start();
 
-		expect(folder.transfers.pullIfUnchanged).toHaveBeenCalledWith(file);
+		expect(folder.transfers.pullIfUnchanged).toHaveBeenCalledWith(file, expect.anything());
 	});
 
 	test("skips a folder with no workspaceId (not relay-linked)", async () => {
@@ -214,20 +214,21 @@ describe("CrdtBackgroundSyncPoller", () => {
 		const poller = new CrdtBackgroundSyncPoller(
 			timeProvider as any,
 			makeRegistry([folder]) as any,
-			30_000,
+			20_000,
 		);
 		poller.start(); // immediate poll starts the still-pending call
 		expect(folder.transfers.pullIfUnchanged).toHaveBeenCalledTimes(1);
 
-		// Next tick fires while the first call is still unresolved -- must be skipped.
-		timeProvider.setTime(startTime + 30_000);
+		// Next tick fires while the first call is still unresolved (and still
+		// inside its PULL_DEADLINE_MS) -- must be skipped.
+		timeProvider.setTime(startTime + 20_000);
 		await flushPromises();
 		expect(folder.transfers.pullIfUnchanged).toHaveBeenCalledTimes(1);
 
 		// Resolve the slow call, then the following tick should fire again.
 		resolvePull();
 		await flushPromises();
-		timeProvider.setTime(startTime + 60_000);
+		timeProvider.setTime(startTime + 40_000);
 		await flushPromises();
 		expect(folder.transfers.pullIfUnchanged).toHaveBeenCalledTimes(2);
 	});
@@ -270,8 +271,8 @@ describe("CrdtBackgroundSyncPoller", () => {
 		timeProvider.setTime(startTime + 30_000);
 		await flushPromises();
 
-		expect(folderA.transfers.pullIfUnchanged).toHaveBeenCalledWith(fileA);
-		expect(folderB.transfers.pullIfUnchanged).toHaveBeenCalledWith(fileB);
+		expect(folderA.transfers.pullIfUnchanged).toHaveBeenCalledWith(fileA, expect.anything());
+		expect(folderB.transfers.pullIfUnchanged).toHaveBeenCalledWith(fileB, expect.anything());
 	});
 
 	test("start is idempotent (second call does not double-register the interval)", async () => {

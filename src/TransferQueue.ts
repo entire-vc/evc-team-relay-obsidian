@@ -99,6 +99,29 @@ function percentOf(part: number, whole: number): number {
 	return whole > 0 ? Math.round((part / whole) * 100) : 0;
 }
 
+/** Where a pullIfUnchanged() call currently is -- reported for timeout attribution. */
+export type PullPhase =
+	| "read-vault"
+	| "first-sync"
+	| "connect"
+	| "await-online"
+	| "grace"
+	| "compare"
+	| "preserve"
+	| "write";
+
+export interface PullControl {
+	/** Once aborted, the pull writes nothing more and releases its connection. */
+	signal?: AbortSignal;
+	onPhase?: (phase: PullPhase) => void;
+}
+
+export interface PullResult {
+	outcome: "flushed" | "unchanged" | "kept-local" | "no-base" | "connect-failed" | "aborted";
+	/** The relay text the pull compared against, when it got that far. */
+	remoteText?: string;
+}
+
 /** pullIfUnchanged(): cap on waiting for the socket to reach "connected". */
 const PULL_CONNECT_TIMEOUT_MS = 15_000;
 /** pullIfUnchanged(): grace window after "connected" for the Yjs sync round-trip to land. */
@@ -793,14 +816,28 @@ export class TransferQueue extends Loggable {
 	 * will reconcile such a doc correctly once it runs and has a base to
 	 * check against.
 	 */
-	async pullIfUnchanged(doc: Document): Promise<void> {
+	async pullIfUnchanged(doc: Document, control: PullControl = {}): Promise<PullResult> {
+		const { signal, onPhase } = control;
+		// Every await below may outlive the caller's deadline:
+		// once `signal` is aborted the caller has already freed this pull's
+		// slot, so the continuation must not write anything and must drop
+		// whatever connection it opened, then stop.
+		const aborted = () => signal?.aborted === true;
+		onPhase?.("read-vault");
 		const vaultContentsBefore = await this.readVaultContents(doc);
+		if (aborted()) return { outcome: "aborted" };
+		onPhase?.("first-sync");
 		await doc.awaitFirstSync();
+		if (aborted()) return { outcome: "aborted" };
 		const intent = doc.connectionIntent;
+		onPhase?.("connect");
 		const connected = await doc.bringOnline();
-		if (!connected) {
-			this.warn("[pullIfUnchanged] connect failed for", doc.entryPath);
-			return;
+		if (!connected || aborted()) {
+			// bringOnline() can leave a retry scheduled (or, if it resolved
+			// late, an open socket); a background pull must not keep either.
+			this.releasePulledDoc(doc, intent);
+			if (!connected) this.warn("[pullIfUnchanged] connect failed for", doc.entryPath);
+			return { outcome: connected ? "aborted" : "connect-failed" };
 		}
 
 		// Deliberately NOT doc.onceEverSynced(): its "synced" featureKey is
@@ -813,11 +850,22 @@ export class TransferQueue extends Loggable {
 		// disconnect) -- but reaching "connected" only means the socket is
 		// open, not that the Yjs sync handshake has landed a remote diff yet,
 		// so a short fixed grace window follows it before reading doc.content.
+		onPhase?.("await-online");
 		await this.raceTimeout(doc.onceOnline(), PULL_CONNECT_TIMEOUT_MS);
+		if (aborted()) {
+			this.releasePulledDoc(doc, intent);
+			return { outcome: "aborted" };
+		}
+		onPhase?.("grace");
 		await this.delay(PULL_SYNC_GRACE_MS);
 
+		onPhase?.("compare");
 		const remoteText = doc.content;
 		const vaultContentsAfter = await this.readVaultContents(doc);
+		if (aborted()) {
+			this.releasePulledDoc(doc, intent);
+			return { outcome: "aborted" };
+		}
 		if (
 			vaultContentsAfter === vaultContentsBefore &&
 			!sameTextContent(remoteText, vaultContentsAfter) &&
@@ -829,7 +877,12 @@ export class TransferQueue extends Loggable {
 				// this doc -- can't tell a genuine unsynced edit apart from
 				// our own in-flight seed racing this read. Leave
 				// it for uploadDocumentViaSocket() to reconcile properly.
-				return;
+				this.releasePulledDoc(doc, intent);
+				return { outcome: "no-base", remoteText };
+			}
+			if (aborted()) {
+				this.releasePulledDoc(doc, intent);
+				return { outcome: "aborted" };
 			}
 			if (sameTextContent(remoteText, syncBase) && vaultContentsAfter !== "") {
 				// The relay has NOT moved since this client last confirmed
@@ -855,8 +908,9 @@ export class TransferQueue extends Loggable {
 				void this.enqueueUpload(doc).catch((err: unknown) => {
 					this.warn("[pullIfUnchanged] queueing upload of local edit failed", doc.entryPath, err);
 				});
-				return;
+				return { outcome: "kept-local", remoteText };
 			}
+			onPhase?.("preserve");
 			// An empty read means a file that is not on disk yet (or an empty
 			// one): there is nothing to preserve, only the relay text to write.
 			if (
@@ -882,6 +936,17 @@ export class TransferQueue extends Loggable {
 						`overwrite for ${doc.entryPath}`,
 				);
 			}
+			// The conflict-copy write above can outlast the caller's deadline.
+			// Stop before overwriting: the vault file still holds the local
+			// text (and now a copy of it), so leaving it is always safe.
+			if (aborted()) {
+				this.releasePulledDoc(doc, intent);
+				return { outcome: "aborted" };
+			}
+			// Point of no return: the overwrite and the sync-base update below
+			// run as one unit. Callers must not abort past this phase; a
+			// deadline here only stops waiting for it (see the poller).
+			onPhase?.("write");
 			// MUST be awaited, not fire-and-forgotten: CrdtBackgroundSyncPoller
 			// (this method's only caller) tracks in-flight calls to this method
 			// in its own `pulling` set precisely so the SAME doc's guid can't be
@@ -897,6 +962,12 @@ export class TransferQueue extends Loggable {
 			// fast-paths. The log line below also asserts the flush
 			// already happened, which would be a lie without the await.
 			await doc.vaultShare.writeContents(doc, remoteText);
+			// Deliberately NO abort check from here on: once the overwrite has
+			// landed the base must follow the disk, or the next pull reads our
+			// own delivered text as a local edit and writes a spurious conflict
+			// copy. A write already handed to the vault can't be
+			// taken back; what cancellation guarantees is that no write STARTS
+			// after it.
 			// The file now holds exactly what the relay holds, so THIS is the
 			// new last-agreed content. Without recording it the base stays at
 			// whatever the last upload cycle left, and the next pull of the
@@ -907,9 +978,12 @@ export class TransferQueue extends Loggable {
 			// the receiver, from the second edit on.
 			await doc.setSyncBase(remoteText);
 			this.log(`[pullIfUnchanged] flushed remote update to disk for ${doc.entryPath}`);
+			this.releasePulledDoc(doc, intent);
+			return { outcome: "flushed", remoteText };
 		}
 
 		this.releasePulledDoc(doc, intent);
+		return { outcome: "unchanged", remoteText };
 	}
 
 	/** Drops the connection pullIfUnchanged() opened, unless the doc was already online or is being edited. */
