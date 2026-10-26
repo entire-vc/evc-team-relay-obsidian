@@ -655,7 +655,16 @@ export class WebSyncManager {
 		}, Math.max(0, fireAt - now));
 	}
 
-	/** After a 429/5xx: hold every push for this share until Retry-After or the backoff delay, then retry. */
+	/** Folder shares registered for auto-sync are the only ones the scheduler pushes for. */
+	private isFolderAutoSync(folderPath: string): boolean {
+		return this.autoSyncShares.get(folderPath)?.kind === "folder";
+	}
+
+	/**
+	 * After a 429/5xx: hold every push for this share until Retry-After or the
+	 * backoff delay. Auto-sync shares are then retried by the scheduler; a share
+	 * in manual web-sync mode is not pushed automatically, so the user retries.
+	 */
 	private backOffFolderItemsPush(folderPath: string, state: FolderItemsPushState, error: unknown): void {
 		state.failures++;
 		const retryAfterMs = error instanceof RelayHttpError ? error.retryAfterMs : undefined;
@@ -666,8 +675,10 @@ export class WebSyncManager {
 			FOLDER_ITEMS_BACKOFF_MAX_MS,
 		);
 		state.notBefore = Date.now() + delay;
-		state.dirty = true;
-		if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+		if (this.isFolderAutoSync(folderPath)) {
+			state.dirty = true;
+			if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+		}
 		log("Transient failure updating web_folder_items, backing off", {
 			folderPath,
 			delayMs: delay,
@@ -744,11 +755,14 @@ export class WebSyncManager {
 			const backoffLeft = state.notBefore - Date.now();
 			if (backoffLeft > 0) {
 				// The server asked us to back off. Don't wait it out here (callers
-				// hold the outbound echo-guard, which pauses inbound sync); leave
-				// the retry to the scheduler and fail this call without a PATCH.
-				state.dirty = true;
-				if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
-				if (state.timer === null) this.armFolderItemsTimer(folderPath, state);
+				// hold the outbound echo-guard, which pauses inbound sync); fail
+				// this call without a PATCH. An auto-sync share is retried by the
+				// scheduler once the backoff ends; a manual-mode share by the user.
+				if (this.isFolderAutoSync(folderPath)) {
+					state.dirty = true;
+					if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+					if (state.timer === null) this.armFolderItemsTimer(folderPath, state);
+				}
 				throw new RelayHttpError(
 					429,
 					`Folder structure push deferred: server asked to retry in ${Math.ceil(backoffLeft / 1000)}s`,
@@ -756,6 +770,9 @@ export class WebSyncManager {
 				);
 			}
 			const wait = this.folderItemsReadyAt(state) - Date.now();
+			// No await between this break and sendFolderItems() setting
+			// state.inFlight, so a caller that wakes later sees it at the top of
+			// the loop: at most one PATCH in flight per share.
 			if (wait <= 0) break;
 			await new Promise<void>((resolve) => window.setTimeout(resolve, wait));
 		}

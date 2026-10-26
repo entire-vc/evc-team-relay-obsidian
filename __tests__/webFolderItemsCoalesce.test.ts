@@ -246,6 +246,51 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(updateShare).toHaveBeenCalledTimes(2);
 	});
 
+	test("concurrent manual syncs and the scheduler never overlap a PATCH", async () => {
+		let inFlight = 0;
+		let maxInFlight = 0;
+		updateShare.mockImplementation(async () => {
+			inFlight++;
+			maxInFlight = Math.max(maxInFlight, inFlight);
+			await new Promise<void>((resolve) => window.setTimeout(resolve, 2000));
+			inFlight--;
+			return {};
+		});
+
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		// All of these wait for the same 30s interval and wake together.
+		addFile(folder, "b.md");
+		const manual = [1, 2, 3].map(() => manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1"));
+		manager.onFileCreated(addFile(folder, "c.md"));
+		await jest.advanceTimersByTimeAsync(120_000);
+		await Promise.all(manual);
+
+		expect(maxInFlight).toBe(1);
+		expect(lastItems(updateShare)).toHaveLength(3);
+		expect(updateShare.mock.calls.length).toBeLessThanOrEqual(3);
+	});
+
+	test("a 429 on a manual-mode share holds pushes until Retry-After without arming a retry", async () => {
+		manager.unregisterAutoSyncShare(FOLDER);
+		addFile(folder, "a.md");
+		updateShare.mockRejectedValueOnce(
+			new RelayHttpError(429, "Failed to update share: 429 Too Many Requests", 120_000),
+		);
+		await expect(manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1")).rejects.toThrow("429");
+		expect(jest.getTimerCount()).toBe(0);
+
+		await jest.advanceTimersByTimeAsync(40_000);
+		await expect(manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1")).rejects.toThrow("retry in 80s");
+		await jest.advanceTimersByTimeAsync(10 * 60_000);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		await manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1");
+		expect(updateShare).toHaveBeenCalledTimes(2);
+	});
+
 	test("a manual structure sync waits for an in-flight push and counts as the last push", async () => {
 		let release!: () => void;
 		updateShare.mockImplementationOnce(
