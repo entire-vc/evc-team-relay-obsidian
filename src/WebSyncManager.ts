@@ -30,11 +30,15 @@ const SYNCABLE_FOLDER_FILE_EXTENSIONS = new Set(["md", "canvas"]);
 // documents fires N create events, and pushing on each one sent N PATCHes
 // with an O(N) body, enough to overload the server. Pushes
 // now wait for a quiet period (capped by a max wait so a long pull still
-// publishes progress), run at most one at a time per share with the latest
-// state winning, skip lists identical to the last one the server accepted,
-// and back off on 429/5xx instead of retrying in a loop.
+// publishes progress), go out at most once per FOLDER_ITEMS_MIN_INTERVAL_MS
+// per share, run one at a time with the latest state winning, skip lists
+// identical to the last one the server accepted, and back off on 429/5xx
+// instead of retrying in a loop. The minimum interval matters for a slow
+// pull: events spaced further apart than the debounce would otherwise each
+// get their own PATCH.
 const FOLDER_ITEMS_DEBOUNCE_MS = 3000;
 const FOLDER_ITEMS_MAX_WAIT_MS = 30_000;
+const FOLDER_ITEMS_MIN_INTERVAL_MS = 30_000;
 const FOLDER_ITEMS_BACKOFF_BASE_MS = 5000;
 const FOLDER_ITEMS_BACKOFF_MAX_MS = 300_000;
 
@@ -51,6 +55,8 @@ interface FolderItemsPushState {
 	lastSentFingerprint: string | null;
 	// Backoff gate after a 429/5xx: no push before this time.
 	notBefore: number;
+	// When the last PATCH for this share started (0 = never).
+	lastPushAt: number;
 	failures: number;
 }
 
@@ -592,6 +598,7 @@ export class WebSyncManager {
 				dirty: false,
 				lastSentFingerprint: null,
 				notBefore: 0,
+				lastPushAt: 0,
 				failures: 0,
 			};
 			this.folderItemsPush.set(folderPath, state);
@@ -610,6 +617,7 @@ export class WebSyncManager {
 		items: WebFolderEntry[],
 		fingerprint: string,
 	): Promise<void> {
+		state.lastPushAt = Date.now();
 		const request = this.clientManager.updateShare(serverId, state.shareId, {
 			web_folder_items: items,
 		});
@@ -632,7 +640,8 @@ export class WebSyncManager {
 			now + FOLDER_ITEMS_DEBOUNCE_MS,
 			(state.firstPendingAt ?? now) + FOLDER_ITEMS_MAX_WAIT_MS,
 		);
-		const fireAt = Math.max(trailing, state.notBefore);
+		const throttle = state.lastPushAt > 0 ? state.lastPushAt + FOLDER_ITEMS_MIN_INTERVAL_MS : 0;
+		const fireAt = Math.max(trailing, throttle, state.notBefore);
 		if (state.timer !== null) window.clearTimeout(state.timer);
 		state.timer = window.setTimeout(() => {
 			state.timer = null;

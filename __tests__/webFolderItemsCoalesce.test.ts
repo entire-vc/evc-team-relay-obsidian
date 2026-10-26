@@ -107,6 +107,37 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(lastItems(updateShare)).toHaveLength(120);
 	});
 
+	test("a slow trickle of events is throttled to one PATCH per 30s", async () => {
+		// Gaps longer than the 3s debounce: without a minimum interval every
+		// event would get its own PATCH (~100 here).
+		for (let i = 0; i < 100; i++) {
+			manager.onFileCreated(addFile(folder, `drip-${i}.md`));
+			await jest.advanceTimersByTimeAsync(4000);
+		}
+		await jest.advanceTimersByTimeAsync(60_000);
+
+		expect(updateShare.mock.calls.length).toBeLessThanOrEqual(Math.ceil(400 / 30) + 1);
+		expect(lastItems(updateShare)).toHaveLength(100);
+	});
+
+	test("PATCHes for one share are at least 30s apart", async () => {
+		const sentAt: number[] = [];
+		updateShare.mockImplementation(async () => {
+			sentAt.push(Date.now());
+			return {};
+		});
+		for (let i = 0; i < 40; i++) {
+			manager.onFileCreated(addFile(folder, `gap-${i}.md`));
+			await jest.advanceTimersByTimeAsync(i % 2 === 0 ? 4000 : 9000);
+		}
+		await jest.advanceTimersByTimeAsync(60_000);
+
+		for (let i = 1; i < sentAt.length; i++) {
+			expect(sentAt[i] - sentAt[i - 1]).toBeGreaterThanOrEqual(30_000);
+		}
+		expect(lastItems(updateShare)).toHaveLength(40);
+	});
+
 	test("events that do not change the item list send no PATCH", async () => {
 		const note = addFile(folder, "a.md");
 		manager.onFileCreated(note);
@@ -141,26 +172,28 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(updateShare).toHaveBeenCalledTimes(1);
 
 		release();
-		await jest.advanceTimersByTimeAsync(5000);
+		// Next push waits out the 30s minimum interval from the first one.
+		await jest.advanceTimersByTimeAsync(30_000);
 		expect(updateShare).toHaveBeenCalledTimes(2);
 		expect(lastItems(updateShare).map((i) => i.path)).toEqual(["a.md", "b.md", "c.md"]);
 	});
 
 	test("429 with Retry-After: waits the requested time, then retries once", async () => {
 		updateShare.mockRejectedValueOnce(
-			new RelayHttpError(429, "Failed to update share: 429 Too Many Requests", 20_000),
+			new RelayHttpError(429, "Failed to update share: 429 Too Many Requests", 45_000),
 		);
 
 		manager.onFileCreated(addFile(folder, "a.md"));
 		await jest.advanceTimersByTimeAsync(3500);
 		expect(updateShare).toHaveBeenCalledTimes(1);
 
-		// Further events during the backoff must not bring the retry forward.
+		// Further events during the backoff must not bring the retry forward,
+		// including past the 30s minimum interval.
 		manager.onFileCreated(addFile(folder, "b.md"));
-		await jest.advanceTimersByTimeAsync(15_000);
+		await jest.advanceTimersByTimeAsync(40_000);
 		expect(updateShare).toHaveBeenCalledTimes(1);
 
-		await jest.advanceTimersByTimeAsync(5000);
+		await jest.advanceTimersByTimeAsync(6000);
 		expect(updateShare).toHaveBeenCalledTimes(2);
 		expect(lastItems(updateShare)).toHaveLength(2);
 
