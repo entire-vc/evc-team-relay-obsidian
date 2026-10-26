@@ -44,6 +44,8 @@ interface FakeDocOptions {
 	awaitFirstSync?: () => Promise<void>;
 	bringOnline?: () => Promise<boolean>;
 	syncBase?: string;
+	vaultContents?: string;
+	fileExists?: boolean;
 }
 
 function makeFakeDoc(opts: FakeDocOptions = {}) {
@@ -68,7 +70,8 @@ function makeFakeDoc(opts: FakeDocOptions = {}) {
 	Object.defineProperty(fakeDoc, "setSyncBase", { value: setSyncBase });
 	Object.defineProperty(fakeDoc, "vaultShare", {
 		value: {
-			readContents: async () => "shared content",
+			readContents: async () => opts.vaultContents ?? "shared content",
+			hasFile: async () => opts.fileExists ?? true,
 			writeConflictCopy,
 			writeContents,
 			folderIndex: { tracks: () => true },
@@ -196,6 +199,30 @@ describe("pullIfUnchanged — deadline abort and connection release", () => {
 		});
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(goOffline).toHaveBeenCalledTimes(1);
+	});
+
+	test("no base and no file on disk: a peer's new note is written, with its base", async () => {
+		const { fakeDoc, goOffline, writeContents, setSyncBase } = makeFakeDoc({
+			syncBase: undefined,
+			vaultContents: "",
+			fileExists: false,
+		});
+		await expect(makeQueue().pullIfUnchanged(fakeDoc)).resolves.toEqual({
+			outcome: "flushed",
+			remoteText: "relay content EDITED BY PEER",
+		});
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "relay content EDITED BY PEER");
+		expect(setSyncBase).toHaveBeenCalledWith("relay content EDITED BY PEER");
+		expect(goOffline).toHaveBeenCalledTimes(1);
+	});
+
+	test("no base and an EMPTY file that does exist: still left alone", async () => {
+		const { fakeDoc, writeContents } = makeFakeDoc({ syncBase: undefined, vaultContents: "", fileExists: true });
+		await expect(makeQueue().pullIfUnchanged(fakeDoc)).resolves.toEqual({
+			outcome: "no-base",
+			remoteText: "relay content EDITED BY PEER",
+		});
+		expect(writeContents).not.toHaveBeenCalled();
 	});
 
 	test("not aborted: flushes and reports the relay text it wrote", async () => {

@@ -10,7 +10,7 @@ import type { Subscriber, Unsubscriber } from "./notifiers/Notifier";
 import { NotifierSet } from "./notifiers/NotifierSet";
 import { NotifierMap } from "./notifiers/NotifierMap";
 import type { VaultShare, ShareRegistry } from "./VaultShare";
-import { compareVaultPaths, comparePathStrings } from "./pathOrdering";
+import { compareVaultPaths } from "./pathOrdering";
 import type { DocumentGrant } from "./relay/TokenShapes";
 import { CanvasDocument } from "./CanvasDocument";
 import { deepValueEquals } from "./deepValueEquals";
@@ -35,6 +35,28 @@ export interface TransferTask {
 	syncEntry: Document | CanvasDocument | AttachmentFile;
 	taskStatus: "pending" | "running" | "completed" | "failed";
 	vaultShare: VaultShare;
+	/** A single note someone is waiting on now, not part of a bulk pass. */
+	priority: boolean;
+	/** Clock time the item was queued, for oldest-wait accounting. */
+	queuedAt: number;
+}
+
+export interface EnqueueOptions {
+	/**
+	 * A single note a person is waiting on (a local edit or create, a peer's
+	 * new note): served before bulk work and allowed one reserved slot, so
+	 * it never waits behind a startup pass over hundreds of documents.
+	 */
+	priority?: boolean;
+}
+
+/** Per-lane queue snapshot exposed by `TransferQueue.laneStats()`. */
+export interface LaneStats {
+	queued: number;
+	priorityQueued: number;
+	active: number;
+	oldestWaitMs: number;
+	queuedByShare: Record<string, number>;
 }
 
 export interface TransferBatch {
@@ -92,6 +114,8 @@ interface QueueLaneState {
 	readonly startupFailureLabel: string;
 	readonly runFailureLabel: string;
 	readonly onItemCompleted: (group: TransferBatch) => void;
+	/** Per share, the sequence number of the last item this lane started. */
+	readonly lastServed: Map<VaultShare, number>;
 }
 
 /** `Math.round((part / whole) * 100)`, treating a zero-sized whole as 0% rather than NaN. */
@@ -140,6 +164,14 @@ const RECONCILE_SETTLE_OUTER_TIMEOUT_MS = 8_000;
 /** Spacing of the slow re-fetch rounds for a doc that keeps reading empty (#266). */
 const SLOW_REFETCH_MS = 5 * 60 * 1000;
 
+/**
+ * Slots on top of `laneLimit` that only priority items may take. Bulk items
+ * can hold a slot for 30s+ each (the provider-sync timeout); measured live,
+ * a new note queued behind ~50 of them for minutes after a restart.
+ */
+const PRIORITY_RESERVED_SLOTS = 1;
+const LANE_STATS_LOG_EVERY_MS = 60_000;
+
 export class TransferQueue extends Loggable {
 	public activeUploads = new NotifierSet<TransferTask>();
 	public activeFetches = new NotifierSet<TransferTask>();
@@ -149,6 +181,8 @@ export class TransferQueue extends Loggable {
 	private downloadLane: QueueLaneState;
 
 	private paused = true;
+	private serveSeq = 0;
+	private lastStatsLogAt = 0;
 
 	teardowns: Unsubscriber[] = [];
 
@@ -181,6 +215,7 @@ export class TransferQueue extends Loggable {
 				group.finishedUploads++;
 				group.finishedTotal++;
 			},
+			lastServed: new Map<VaultShare, number>(),
 		};
 		this.downloadLane = {
 			queue: [],
@@ -195,12 +230,44 @@ export class TransferQueue extends Loggable {
 				group.finishedFetches++;
 				group.finishedTotal++;
 			},
+			lastServed: new Map<VaultShare, number>(),
 		};
 
 		this.clock.scheduleInterval(() => {
 			void this.drainLane(this.syncLane);
 			void this.drainLane(this.downloadLane);
+			this.maybeLogLaneStats();
 		}, 1000);
+	}
+
+	/** Queue sizes per share, priority backlog, active count and oldest wait, per lane. */
+	laneStats(): { uploads: LaneStats; fetches: LaneStats } {
+		return { uploads: this.statsFor(this.syncLane), fetches: this.statsFor(this.downloadLane) };
+	}
+
+	private statsFor(lane: QueueLaneState): LaneStats {
+		const now = this.clock.now();
+		const queuedByShare: Record<string, number> = {};
+		let oldest = now;
+		for (const item of lane.queue) {
+			queuedByShare[item.vaultShare.path] = (queuedByShare[item.vaultShare.path] ?? 0) + 1;
+			oldest = Math.min(oldest, item.queuedAt);
+		}
+		return {
+			queued: lane.queue.length,
+			priorityQueued: lane.queue.filter((item) => item.priority).length,
+			active: lane.active.count,
+			oldestWaitMs: now - oldest,
+			queuedByShare,
+		};
+	}
+
+	private maybeLogLaneStats(): void {
+		if (this.syncLane.queue.length === 0 && this.downloadLane.queue.length === 0) return;
+		const now = this.clock.now();
+		if (now - this.lastStatsLogAt < LANE_STATS_LOG_EVERY_MS) return;
+		this.lastStatsLogAt = now;
+		this.log("[laneStats]", JSON.stringify(this.laneStats()));
 	}
 
 	/**
@@ -288,14 +355,17 @@ export class TransferQueue extends Loggable {
 
 		const runnable = lane.queue.filter((item) => item.vaultShare.isOnline);
 
-		while (runnable.length > 0 && lane.active.count < this.laneLimit) {
-			const item = runnable.shift();
-			if (!item) break;
+		while (runnable.length > 0) {
+			const item = this.nextRunnable(lane, runnable);
+			const limit = item.priority ? this.laneLimit + PRIORITY_RESERVED_SLOTS : this.laneLimit;
+			if (lane.active.count >= limit) break;
 
+			runnable.splice(runnable.indexOf(item), 1);
 			lane.queue = lane.queue.filter((queued) => queued.entityGuid !== item.entityGuid);
 
 			item.taskStatus = "running";
 			lane.active.include(item);
+			lane.lastServed.set(item.vaultShare, ++this.serveSeq);
 
 			try {
 				lane
@@ -325,6 +395,44 @@ export class TransferQueue extends Loggable {
 		}
 
 		lane.processing = false;
+	}
+
+	/**
+	 * Picks the next item to start: priority items before bulk ones; within
+	 * that class the share with the fewest running items in this lane, then
+	 * the one served longest ago; within the share, the oldest item. A plain
+	 * path-sorted FIFO let one large share hold every slot while a small
+	 * share's single note waited for the whole backlog.
+	 */
+	private nextRunnable(lane: QueueLaneState, runnable: TransferTask[]): TransferTask {
+		const urgent = runnable.some((item) => item.priority);
+		const activeByShare = new Map<VaultShare, number>();
+		lane.active.each((item) => {
+			activeByShare.set(item.vaultShare, (activeByShare.get(item.vaultShare) ?? 0) + 1);
+		});
+		let best: TransferTask | undefined;
+		for (const item of runnable) {
+			if (urgent && !item.priority) continue;
+			if (!best) {
+				best = item;
+				continue;
+			}
+			const running = activeByShare.get(item.vaultShare) ?? 0;
+			const bestRunning = activeByShare.get(best.vaultShare) ?? 0;
+			if (running !== bestRunning) {
+				if (running < bestRunning) best = item;
+				continue;
+			}
+			const served = lane.lastServed.get(item.vaultShare) ?? 0;
+			const bestServed = lane.lastServed.get(best.vaultShare) ?? 0;
+			if (served !== bestServed) {
+				if (served < bestServed) best = item;
+				continue;
+			}
+			if (item.queuedAt < best.queuedAt) best = item;
+		}
+		// `runnable` is non-empty, so the loop always picked something.
+		return best ?? runnable[0];
 	}
 
 	private runSyncItem(item: TransferTask): Promise<unknown> {
@@ -403,9 +511,13 @@ export class TransferQueue extends Loggable {
 	 * @param item The document to synchronize
 	 * @returns A promise that resolves when the sync completes
 	 */
-	async enqueueUpload(item: AttachmentFile | Document | CanvasDocument): Promise<void> {
+	async enqueueUpload(
+		item: AttachmentFile | Document | CanvasDocument,
+		options: EnqueueOptions = {},
+	): Promise<void> {
 		if (this.syncLane.inFlight.has(item.entityGuid)) {
 			this.debug(`[enqueueUpload] Item ${item.entityGuid} already in progress, skipping`);
+			if (options.priority) this.promote(this.syncLane, item.entityGuid);
 			const existing = this.syncLane.waiters.get(item.entityGuid);
 			if (existing) {
 				return new Promise<void>((resolve, reject) => {
@@ -422,7 +534,7 @@ export class TransferQueue extends Loggable {
 		group.queuedUploads++;
 		this.batches.put(item.vaultShare, group);
 
-		return this.pushToLane(this.syncLane, item);
+		return this.pushToLane(this.syncLane, item, options.priority ?? false);
 	}
 
 	/**
@@ -434,11 +546,15 @@ export class TransferQueue extends Loggable {
 	 * @param item The document to download
 	 * @returns A promise that resolves when the download completes
 	 */
-	enqueueFetch(item: AttachmentFile | Document | CanvasDocument): Promise<void> {
+	enqueueFetch(
+		item: AttachmentFile | Document | CanvasDocument,
+		options: EnqueueOptions = {},
+	): Promise<void> {
 		if (this.downloadLane.inFlight.has(item.entityGuid)) {
 			this.debug(
 				`[enqueueFetch] Item ${item.entityGuid} already in progress, skipping`,
 			);
+			if (options.priority) this.promote(this.downloadLane, item.entityGuid);
 			const existing = this.downloadLane.waiters.get(item.entityGuid);
 			if (existing) {
 				void this.drainLane(this.downloadLane);
@@ -456,7 +572,7 @@ export class TransferQueue extends Loggable {
 		group.queuedTotal++;
 		this.batches.put(item.vaultShare, group);
 
-		return this.pushToLane(this.downloadLane, item);
+		return this.pushToLane(this.downloadLane, item, options.priority ?? false);
 	}
 
 	/**
@@ -522,7 +638,7 @@ export class TransferQueue extends Loggable {
 			return Promise.resolve();
 		}
 
-		return this.pushToLane(this.syncLane, item);
+		return this.pushToLane(this.syncLane, item, false);
 	}
 
 	// NB (disclosed deviation, preserved not "fixed"): the three enqueue*
@@ -554,7 +670,10 @@ export class TransferQueue extends Loggable {
 		return this.batches.lookup(vaultShare) ?? this.newSyncGroup(vaultShare);
 	}
 
-	private makeQueueItem(item: AttachmentFile | Document | CanvasDocument): TransferTask {
+	private makeQueueItem(
+		item: AttachmentFile | Document | CanvasDocument,
+		priority: boolean,
+	): TransferTask {
 		const vaultShare = item.vaultShare;
 		return {
 			entityGuid: item.entityGuid,
@@ -562,23 +681,34 @@ export class TransferQueue extends Loggable {
 			syncEntry: item,
 			taskStatus: "pending",
 			vaultShare,
+			priority,
+			queuedAt: this.clock.now(),
 		};
+	}
+
+	/** Moves an already-queued item into the priority class; a running one is left alone. */
+	private promote(lane: QueueLaneState, entityGuid: string): void {
+		const queued = lane.queue.find((item) => item.entityGuid === entityGuid);
+		if (queued && !queued.priority) {
+			queued.priority = true;
+			void this.drainLane(lane);
+		}
 	}
 
 	/** Registers `item` on `lane`'s queue and returns a promise that resolves/rejects on completion. */
 	private pushToLane(
 		lane: QueueLaneState,
 		item: AttachmentFile | Document | CanvasDocument,
+		priority: boolean,
 	): Promise<void> {
 		lane.inFlight.add(item.entityGuid);
 		const completion = new Promise<void>((resolve, reject) => {
 			lane.waiters.set(item.entityGuid, { resolve, reject });
 		});
 
-		lane.queue.push(this.makeQueueItem(item));
-		// Queue items carry a FULL vault path, entries carry a share-relative
-		// one — same ordering rule, different field, so compare the strings.
-		lane.queue.sort((a, b) => comparePathStrings(a.absolutePath, b.absolutePath));
+		// Arrival order, not path order: nextRunnable() picks across shares,
+		// and enqueueShareUpload() already enqueues each pass path-sorted.
+		lane.queue.push(this.makeQueueItem(item, priority));
 		void this.drainLane(lane);
 
 		return completion;
@@ -872,7 +1002,18 @@ export class TransferQueue extends Loggable {
 			doc.vaultShare.folderIndex.tracks(doc.entryPath)
 		) {
 			const syncBase = await doc.getSyncBase();
-			if (syncBase === undefined) {
+			// A peer's new note whose text reached the relay after this
+			// client's initial fetch gave up on it (fetchDocument() only
+			// retries an empty relay doc for a bounded time) has no base and
+			// no file: nothing local can be lost, so write it instead of
+			// waiting for a restart to fetch it again. Live: 54 chars sat in
+			// the receiver's CRDT with no file on disk.
+			const missingOnDisk =
+				syncBase === undefined &&
+				vaultContentsAfter === "" &&
+				remoteText !== "" &&
+				!(await doc.vaultShare.hasFile(doc));
+			if (syncBase === undefined && !missingOnDisk) {
 				// Never round-tripped through a successful upload cycle for
 				// this doc -- can't tell a genuine unsynced edit apart from
 				// our own in-flight seed racing this read. Leave
@@ -884,7 +1025,7 @@ export class TransferQueue extends Loggable {
 				this.releasePulledDoc(doc, intent);
 				return { outcome: "aborted" };
 			}
-			if (sameTextContent(remoteText, syncBase) && vaultContentsAfter !== "") {
+			if (syncBase !== undefined && sameTextContent(remoteText, syncBase) && vaultContentsAfter !== "") {
 				// The relay has NOT moved since this client last confirmed
 				// agreeing with it: the only divergence is this client's OWN
 				// edit, still on its way to the relay. Nothing is waiting to be
@@ -905,7 +1046,7 @@ export class TransferQueue extends Loggable {
 						`keeping local edit and queueing its upload`,
 				);
 				this.releasePulledDoc(doc, intent);
-				void this.enqueueUpload(doc).catch((err: unknown) => {
+				void this.enqueueUpload(doc, { priority: true }).catch((err: unknown) => {
 					this.warn("[pullIfUnchanged] queueing upload of local edit failed", doc.entryPath, err);
 				});
 				return { outcome: "kept-local", remoteText };
@@ -914,6 +1055,7 @@ export class TransferQueue extends Loggable {
 			// An empty read means a file that is not on disk yet (or an empty
 			// one): there is nothing to preserve, only the relay text to write.
 			if (
+				syncBase !== undefined &&
 				hasPreservableContent(vaultContentsAfter) &&
 				!sameTextContent(vaultContentsAfter, syncBase)
 			) {
