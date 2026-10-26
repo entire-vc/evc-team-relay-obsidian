@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.15
+- Fixed: an edit to a closed note that fails to upload while the server is busy is now sent again within seconds, instead of waiting minutes for the next background pass. An edit saved while the same note is still uploading is no longer skipped.
+- Fixed: a change from another device that is slow to become visible on the server keeps being checked for up to ten minutes instead of three, so it no longer waits for the next full background pass. While another shared folder receives a large import, these checks and fresh edits to closed notes get a reserved slot, and a fresh edit always comes first.
+
 ## 0.1.14
 - Fixed: while one shared folder receives a large import from another device, edits to closed notes in other shared folders are no longer left waiting behind it. Some of them could stay missing for many minutes.
 
