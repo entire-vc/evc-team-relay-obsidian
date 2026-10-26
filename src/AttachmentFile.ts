@@ -369,6 +369,11 @@ export class AttachmentFile
 
 	/** Guard for pushToRemote(): can we even attempt an upload right now? */
 	private canPush(): boolean {
+		if (!this.vaultShare) {
+			// dismantle() already detached this entry from its shared folder; a
+			// retry/reconnect that fires afterwards has nothing to connect to.
+			return false;
+		}
 		if (!this.vaultShare.isOnline) {
 			this.log("push blocked: shared folder offline");
 			return false;
@@ -520,6 +525,11 @@ export class AttachmentFile
 	}
 
 	async bringOnline(): Promise<boolean> {
+		if (!this.vaultShare) {
+			// dismantle() already detached this entry from its shared folder; a
+			// retry/reconnect that fires afterwards has nothing to connect to.
+			return false;
+		}
 		if (this.vaultShare.resourceAddress instanceof FolderAddress) {
 			// Local only
 			return false;
