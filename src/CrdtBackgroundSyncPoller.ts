@@ -330,16 +330,31 @@ export class CrdtBackgroundSyncPoller {
 	}
 
 	/**
-	 * Next document to start: priority lane first, then late re-checks while
-	 * they hold fewer than `limit - 1` slots, then the sweep; round-robin
-	 * across shares within a lane.
+	 * Next document to start: round-robin across shares, and within the
+	 * share whose turn it is, its priority lane first, then its late
+	 * re-checks (while they hold fewer than `limit - 1` slots overall), then
+	 * its sweep. Shares take turns before lanes do: a share receiving an
+	 * import announces a new document every few seconds, and ranking every
+	 * share's announcements ahead of every other share's re-checks and sweep
+	 * let that stream hold all regular slots, so edits elsewhere whose
+	 * content arrived after their marker were never pulled again.
 	 */
 	private takeNext(limit: number): { pull: PendingPull; lane: keyof ShareQueues } | undefined {
 		const lateRunning = [...this.pulling.values()].filter((inFlight) => inFlight.late).length;
-		for (const lane of ["priority", "late", "sweep"] as const) {
-			if (lane === "late" && lateRunning >= Math.max(1, limit - 1)) continue;
-			const pull = this.takeFrom(lane, () => true);
-			if (pull) return { pull, lane };
+		const shares = [...this.queues.keys()];
+		for (let i = 0; i < shares.length; i++) {
+			const index = (this.cursor + i) % shares.length;
+			const queues = this.queues.get(shares[index]);
+			if (!queues) continue;
+			for (const lane of ["priority", "late", "sweep"] as const) {
+				if (lane === "late" && lateRunning >= Math.max(1, limit - 1)) continue;
+				const next = queues[lane].entries().next();
+				if (next.done) continue;
+				const [guid, pull] = next.value;
+				queues[lane].delete(guid);
+				this.cursor = (index + 1) % shares.length;
+				return { pull, lane };
+			}
 		}
 		return undefined;
 	}

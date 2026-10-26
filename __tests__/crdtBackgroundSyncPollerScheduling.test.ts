@@ -396,6 +396,56 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("a share receiving an import can't hold every slot: another share's late re-check still runs", async () => {
+		// Live on 0.1.13: the receiving share announced a new document every
+		// few seconds while each pull took ~20s, so its announcements always
+		// filled the regular slots and the probe share's late re-checks and
+		// sweep never ran -- 10 edits were still missing 25 minutes later.
+		const started: { guid: string; at: number; resolve: (result: PullResult) => void }[] = [];
+		const pull = jest.fn<PullFn>().mockImplementation(
+			(file) =>
+				new Promise<PullResult>((resolve) => {
+					started.push({ guid: file.entityGuid, at: clock.now() - t0, resolve });
+				}),
+		);
+		const bulk = makeFolder("bulk", 0, pull, 3);
+		const probe = makeFolder("probe", 1, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([bulk, probe]) as never, 3_600_000);
+		poller.start();
+		started.splice(0).forEach((s) => s.resolve({ outcome: "unchanged", remoteText: "old" }));
+		await flushPromises();
+
+		probe.announce("probe-0", textFingerprint("edited"));
+		const settled = new Set<number>();
+		for (let t = 0; t <= 120_000; t += 1_000) {
+			clock.setTime(t0 + t);
+			if (t % 2_000 === 0) {
+				const guid = `bulk-${t / 2_000}`;
+				bulk.trackedEntries.set(guid, { __isDocument: true, isOnline: false, entityGuid: guid, entryPath: `bulk/${guid}.md` });
+				bulk.announce(guid, textFingerprint(guid));
+			}
+			await flushPromises();
+			for (let i = 0; i < started.length; i++) {
+				const s = started[i];
+				if (settled.has(i)) continue;
+				// Probe pulls answer in 1s; the edit reaches the relay at 40s.
+				// Bulk pulls take 20s each.
+				if (s.guid === "probe-0" && t - s.at >= 1_000) {
+					settled.add(i);
+					s.resolve({ outcome: "unchanged", remoteText: t >= 40_000 ? "edited" : "old" });
+				} else if (s.guid !== "probe-0" && t - s.at >= 20_000) {
+					settled.add(i);
+					s.resolve({ outcome: "unchanged", remoteText: s.guid });
+				}
+				await flushPromises();
+			}
+		}
+		const lateProbePulls = started.filter((s) => s.guid === "probe-0" && s.at >= 40_000);
+		expect(lateProbePulls.length).toBeGreaterThanOrEqual(1);
+		expect(lateProbePulls[0].at).toBeLessThanOrEqual(90_000);
+		poller.destroy();
+	});
+
 	test("a newer announcement replaces the pending re-check instead of starting a second chain", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
