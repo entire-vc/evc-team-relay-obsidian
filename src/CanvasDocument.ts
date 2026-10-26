@@ -223,6 +223,11 @@ export class CanvasDocument extends ProviderBacked implements SyncableEntry, Mim
 	}
 
 	async bringOnline(): Promise<boolean> {
+		if (!this.vaultShare) {
+			// dismantle() already detached this entry from its shared folder; a
+			// retry/reconnect that fires afterwards has nothing to connect to.
+			return false;
+		}
 		if (this.vaultShare.resourceAddress instanceof FolderAddress) {
 			// Local only
 			return false;
