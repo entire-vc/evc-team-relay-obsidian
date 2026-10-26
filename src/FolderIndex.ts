@@ -17,6 +17,22 @@ import {
 import type { AttachmentSyncSettings } from "./AttachmentSyncSettings";
 
 /**
+ * Deleted Y.Map keys. Yjs keeps the last item of every key in `_map`,
+ * flagged `deleted` once removed; it survives encode/apply and GC, so a
+ * replayed IndexedDB copy or a fresh server sync still carries it.
+ */
+function wasDeletedKey<T>(map: Y.Map<T>, key: string): boolean {
+	return map._map.get(key)?.deleted === true;
+}
+
+function hasDeletedKey<T>(map: Y.Map<T>): boolean {
+	for (const item of map._map.values()) {
+		if (item.deleted) return true;
+	}
+	return false;
+}
+
+/**
  * True when two pieces of file/folder metadata describe the same underlying
  * object (same id/mimetype/type/hash). Used to skip no-op writes into the
  * shared Y.Map so we don't generate CRDT churn for a value that isn't
@@ -185,6 +201,22 @@ export class FolderIndex extends Notifier<FolderIndex> {
 	 */
 	hasYMapEntry(vpath: string): boolean {
 		return this.records.has(vpath);
+	}
+
+	/**
+	 * Whether the shared index once held `vpath` and a peer has since deleted
+	 * it: the key survives in the Y.Map only as a tombstone. A brand-new share
+	 * has no tombstones, which is what tells a confirmed remote delete apart
+	 * from an empty first snapshot.
+	 */
+	wasRemoved(vpath: string): boolean {
+		if (this.records.has(vpath) || this.flatIdMap.has(vpath)) return false;
+		return wasDeletedKey(this.records, vpath) || wasDeletedKey(this.flatIdMap, vpath);
+	}
+
+	/** Whether any path was ever deleted from the shared index. */
+	hasRemovedRecords(): boolean {
+		return hasDeletedKey(this.records) || hasDeletedKey(this.flatIdMap);
 	}
 
 	eachRecord(callbackFn: (meta: ItemRecord, path: string) => void): void {
