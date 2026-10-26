@@ -1559,9 +1559,12 @@ export class VaultShare extends ProviderBacked {
 			allRemotePaths.add(path);
 		});
 
-		// Safety: if remote state is empty, this is likely a first sync —
-		// do NOT delete local files (they should be uploaded to remote instead)
-		if (allRemotePaths.size === 0) {
+		// An empty remote is either a first sync (local files are still to be
+		// uploaded, never delete them) or a peer deleting the last entries.
+		// Only the second leaves tombstones in the index, so with an empty
+		// remote delete just the paths it confirms were removed.
+		const confirmedOnly = allRemotePaths.size === 0;
+		if (confirmedOnly && !this.folderIndex.hasRemovedRecords()) {
 			return [];
 		}
 
@@ -1579,6 +1582,9 @@ export class VaultShare extends ProviderBacked {
 
 		const deletes: DeleteOp[] = [];
 		for (const file of [...trackedEntries, ...folders]) {
+			if (confirmedOnly && !this.folderIndex.wasRemoved(this.toVirtualPath(file.path))) {
+				continue;
+			}
 			const op = this._maybeDeleteOrphanedFile(file, allRemotePaths, diffLog);
 			if (op) {
 				deletes.push(op);
