@@ -6,7 +6,7 @@
 
 import { Notice, TFile, Vault, debounce } from "obsidian";
 import { RelayOnPremShareClientManager } from "./RelayOnPremShareClientManager";
-import type { WebFolderEntry } from "./RelayOnPremShareClient";
+import type { RelayOnPremShare, WebFolderEntry } from "./RelayOnPremShareClient";
 import { namedLogger } from "./logging";
 import { RelayHttpError, isTransientRelayFailure } from "./relayRequestErrors";
 import {
@@ -616,7 +616,7 @@ export class WebSyncManager {
 		serverId: string,
 		items: WebFolderEntry[],
 		fingerprint: string,
-	): Promise<void> {
+	): Promise<RelayOnPremShare> {
 		state.lastPushAt = Date.now();
 		const request = this.clientManager.updateShare(serverId, state.shareId, {
 			web_folder_items: items,
@@ -626,9 +626,10 @@ export class WebSyncManager {
 			() => undefined,
 		);
 		try {
-			await request;
+			const share = await request;
 			state.lastSentFingerprint = fingerprint;
 			state.failures = 0;
+			return share;
 		} finally {
 			state.inFlight = null;
 		}
@@ -714,13 +715,15 @@ export class WebSyncManager {
 
 	/**
 	 * Sync folder structure (web_folder_items) to web for a specific share.
-	 * Called from context menu "Sync" to ensure deleted files are reflected on web-publish.
+	 * Called from context menu "Sync" and the share modal to ensure deleted files are
+	 * reflected on web-publish. Returns the updated share, or null when the list
+	 * already matches what was last sent (no PATCH).
 	 */
 	async syncFolderStructureToWeb(
 		folderPath: string,
 		serverId: string,
 		shareId: string,
-	): Promise<void> {
+	): Promise<RelayOnPremShare | null> {
 		// Shares the scheduler's state so a manual sync never overlaps an
 		// event-driven PATCH, obeys the same minimum interval and backoff, and
 		// later unchanged events see what it sent.
@@ -731,20 +734,22 @@ export class WebSyncManager {
 			items = this.getFolderItems(folderPath);
 			if (JSON.stringify(items) === state.lastSentFingerprint) {
 				log("Folder structure already up to date on web", { folderPath });
-				return;
+				return null;
 			}
 			const wait = this.folderItemsReadyAt(state) - Date.now();
 			if (wait <= 0) break;
 			await new Promise<void>((resolve) => window.setTimeout(resolve, wait));
 		}
+		let share: RelayOnPremShare;
 		try {
-			await this.sendFolderItems(state, serverId, items, JSON.stringify(items));
+			share = await this.sendFolderItems(state, serverId, items, JSON.stringify(items));
 		} finally {
 			if (state.dirty && this.folderItemsPush.get(folderPath) === state) {
 				this.armFolderItemsTimer(folderPath, state);
 			}
 		}
 		log("Synced folder structure to web", { folderPath, itemCount: items.length });
+		return share;
 	}
 
 	/**

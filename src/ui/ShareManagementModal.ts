@@ -867,7 +867,16 @@ export class ShareManagementModal extends Modal {
 			// WebSyncManager's own syncFile()/syncFolderFile() — echo-guard it
 			// the same way, per-push (guard is ref-counted, safe to wrap each
 			// push individually rather than the whole function).
-			if (this.plugin.shareClientManager) {
+			if (this.plugin.webSyncManager && this.plugin.shareClientManager) {
+				// Go through WebSyncManager so this push shares the per-share
+				// state with event-driven pushes: same minimum interval and
+				// backoff, no overlap, and no PATCH when the list is unchanged.
+				const webSyncManager = this.plugin.webSyncManager;
+				const share = this.selectedShare;
+				updatedShare = await withOutboundSyncGuard(webSyncManager, () =>
+					webSyncManager.syncFolderStructureToWeb(share.path, share.serverId, share.id)
+				);
+			} else if (this.plugin.shareClientManager) {
 				console.debug("[WebSync] Using shareClientManager, serverId:", this.selectedShare.serverId);
 				const clientManager = this.plugin.shareClientManager;
 				const share = this.selectedShare;
@@ -885,17 +894,19 @@ export class ShareManagementModal extends Modal {
 				throw new Error("No share client available");
 			}
 
-			console.debug("[WebSync] updateShare response:", JSON.stringify({
-				id: updatedShare.id,
-				web_slug: updatedShare.web_slug,
-				web_published: updatedShare.web_published,
-			}));
+			if (updatedShare) {
+				console.debug("[WebSync] updateShare response:", JSON.stringify({
+					id: updatedShare.id,
+					web_slug: updatedShare.web_slug,
+					web_published: updatedShare.web_published,
+				}));
 
-			// Update local state
-			this.selectedShare = {
-				...this.selectedShare,
-				...updatedShare,
-			};
+				// Update local state
+				this.selectedShare = {
+					...this.selectedShare,
+					...updatedShare,
+				};
+			}
 
 			// Sync content of each markdown file (v1.8 web editing)
 			const slug = this.selectedShare.web_slug;

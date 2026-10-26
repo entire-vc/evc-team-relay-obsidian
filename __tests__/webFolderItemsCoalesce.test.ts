@@ -14,9 +14,13 @@
 import { describe, test, expect, jest, beforeEach, afterEach } from "@jest/globals";
 import { TFile, TFolder, Vault } from "obsidian";
 import { WebSyncManager } from "../src/WebSyncManager";
+import { ShareManagementModal } from "../src/ui/ShareManagementModal";
 import type { RelayOnPremShareClientManager } from "../src/RelayOnPremShareClientManager";
 import type { UpdateShareRequest } from "../src/RelayOnPremShareClient";
 import { RelayHttpError, parseRetryAfterMs } from "../src/relayRequestErrors";
+
+// The modal pulls in a .svelte component jest cannot compile; folder sync never uses it.
+jest.mock("../src/ui/FolderPathPickerModal", () => ({ FolderPathPickerModal: class {} }));
 
 const FOLDER = "published";
 
@@ -344,5 +348,60 @@ describe("parseRetryAfterMs", () => {
 	test("missing or garbage → undefined", () => {
 		expect(parseRetryAfterMs(null)).toBeUndefined();
 		expect(parseRetryAfterMs("soon")).toBeUndefined();
+	});
+});
+
+describe("ShareManagementModal folder sync — shares the per-share push state", () => {
+	let updateShare: UpdateShareMock;
+	let manager: WebSyncManager;
+	let folder: TFolder;
+	let modal: { syncFolderItems: () => Promise<void> };
+
+	beforeEach(() => {
+		jest.useFakeTimers();
+		updateShare = jest.fn(async () => ({})) as UpdateShareMock;
+		const made = makeFolderVault();
+		folder = made.folder;
+		const clientManager = makeClientManager(updateShare);
+		manager = new WebSyncManager(made.vault, clientManager);
+		manager.registerAutoSyncShare(FOLDER, "share1", "srv1", "folder", "slug");
+		// Only the fields syncFolderItems() reads; no web_slug, so no content pass.
+		modal = Object.assign(Object.create(ShareManagementModal.prototype) as object, {
+			app: { vault: made.vault },
+			plugin: { webSyncManager: manager, shareClientManager: clientManager },
+			selectedShare: { id: "share1", serverId: "srv1", kind: "folder", path: FOLDER },
+		}) as unknown as { syncFolderItems: () => Promise<void> };
+	});
+
+	afterEach(() => {
+		manager.destroy();
+		jest.useRealTimers();
+	});
+
+	test("the modal's sync waits out the 30s interval after a scheduled push", async () => {
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+		const firstAt = Date.now() - 500;
+
+		addFile(folder, "b.md");
+		const sync = modal.syncFolderItems();
+		await jest.advanceTimersByTimeAsync(20_000);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		await jest.advanceTimersByTimeAsync(15_000);
+		await sync;
+		expect(updateShare).toHaveBeenCalledTimes(2);
+		expect(Date.now() - firstAt).toBeGreaterThanOrEqual(30_000);
+		expect(lastItems(updateShare)).toHaveLength(2);
+	});
+
+	test("the modal's sync sends nothing when the list is unchanged", async () => {
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		await modal.syncFolderItems();
+		expect(updateShare).toHaveBeenCalledTimes(1);
 	});
 });

@@ -133,6 +133,14 @@ export class WorkspaceLeaf {
 
 export class Workspace {}
 
+export class Modal {
+	app: unknown;
+
+	constructor(app: unknown) {
+		this.app = app;
+	}
+}
+
 export class ItemView {
 	leaf: WorkspaceLeaf;
 
