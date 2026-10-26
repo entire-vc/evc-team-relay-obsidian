@@ -23,6 +23,8 @@ export interface RelayTokenResponse {
 	relay_url: string;
 	token: string;
 	expires_at: string;
+	/** Lifetime in seconds; not sent by the current control-plane. */
+	expires_in?: number;
 }
 
 export interface FileTokenRequest {
@@ -36,6 +38,8 @@ export interface FileTokenApiResponse {
 	token: string;
 	base_url: string;
 	expires_at: string;
+	/** Lifetime in seconds; not sent by the current control-plane. */
+	expires_in?: number;
 }
 
 export interface RelayOnPremTokenConfig {
@@ -131,6 +135,36 @@ class TokenRequestThrottle {
 		}
 		this.queue = [];
 	}
+}
+
+/**
+ * Re-anchor a server-issued `expires_at` on the local clock.
+ *
+ * `expires_at` is an absolute server time, but every consumer
+ * (CredentialCache.needsRefresh/tokenIsValid, ProviderBacked) compares it with
+ * the client's own Date.now(). A client clock lagging the server by more than
+ * the 60s renewal margin kept a dead relay token "live" and dialled the WS
+ * handshake with it (401 expired). Keeping only the granted lifetime
+ * (expires_at - server Date header) and adding it to the local receive time
+ * makes the skew irrelevant. The Date header has whole-second resolution, so
+ * one second is shaved off to stay on the safe side. An explicit `expires_in`
+ * (seconds) wins over the header when the server sends one. Without either the
+ * server's absolute expiry is used, as before.
+ */
+export function localExpiryTime(
+	expiresAt: string,
+	serverDate: string | null,
+	expiresInSec?: number,
+): number {
+	if (typeof expiresInSec === "number" && Number.isFinite(expiresInSec) && expiresInSec >= 0) {
+		return Date.now() + expiresInSec * 1000 - 1000;
+	}
+	const serverExpiry = new Date(expiresAt).getTime();
+	const serverNow = serverDate ? Date.parse(serverDate) : NaN;
+	if (Number.isNaN(serverExpiry) || Number.isNaN(serverNow)) {
+		return serverExpiry;
+	}
+	return Date.now() + (serverExpiry - serverNow) - 1000;
 }
 
 export class RelayOnPremTokenProvider {
@@ -238,13 +272,13 @@ export class RelayOnPremTokenProvider {
 			const data = await response.json() as RelayTokenResponse;
 
 			// Convert to DocumentGrant format expected by the plugin
-			const expiresAt = new Date(data.expires_at);
+			const expiryTime = localExpiryTime(data.expires_at, response.headers.get("Date"), data.expires_in);
 			const clientToken: DocumentGrant = {
 				token: data.token,
 				url: data.relay_url,
 				docId: docId,
 				folder: folderId,
-				expiryTime: expiresAt.getTime(),
+				expiryTime,
 				authorization: mode === "write" ? "full" : "read-only",
 			};
 
@@ -338,7 +372,7 @@ export class RelayOnPremTokenProvider {
 			}
 
 			const data = (await response.json()) as FileTokenApiResponse;
-			const expiresAt = new Date(data.expires_at);
+			const expiryTime = localExpiryTime(data.expires_at, response.headers.get("Date"), data.expires_in);
 
 			const fileToken: FileGrant = {
 				token: data.token,
@@ -349,7 +383,7 @@ export class RelayOnPremTokenProvider {
 				url: data.base_url,
 				docId: fileId,
 				folder: folderId,
-				expiryTime: expiresAt.getTime(),
+				expiryTime,
 				// Not read by BlobClient.ts (verified) — real read/write enforcement
 				// happens server-side per-route, not via this cached label.
 				authorization: "full",
