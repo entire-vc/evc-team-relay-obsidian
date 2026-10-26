@@ -14,9 +14,13 @@
 import { describe, test, expect, jest, beforeEach, afterEach } from "@jest/globals";
 import { TFile, TFolder, Vault } from "obsidian";
 import { WebSyncManager } from "../src/WebSyncManager";
+import { ShareManagementModal } from "../src/ui/ShareManagementModal";
 import type { RelayOnPremShareClientManager } from "../src/RelayOnPremShareClientManager";
 import type { UpdateShareRequest } from "../src/RelayOnPremShareClient";
 import { RelayHttpError, parseRetryAfterMs } from "../src/relayRequestErrors";
+
+// The modal pulls in a .svelte component jest cannot compile; folder sync never uses it.
+jest.mock("../src/ui/FolderPathPickerModal", () => ({ FolderPathPickerModal: class {} }));
 
 const FOLDER = "published";
 
@@ -107,6 +111,37 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(lastItems(updateShare)).toHaveLength(120);
 	});
 
+	test("a slow trickle of events is throttled to one PATCH per 30s", async () => {
+		// Gaps longer than the 3s debounce: without a minimum interval every
+		// event would get its own PATCH (~100 here).
+		for (let i = 0; i < 100; i++) {
+			manager.onFileCreated(addFile(folder, `drip-${i}.md`));
+			await jest.advanceTimersByTimeAsync(4000);
+		}
+		await jest.advanceTimersByTimeAsync(60_000);
+
+		expect(updateShare.mock.calls.length).toBeLessThanOrEqual(Math.ceil(400 / 30) + 1);
+		expect(lastItems(updateShare)).toHaveLength(100);
+	});
+
+	test("PATCHes for one share are at least 30s apart", async () => {
+		const sentAt: number[] = [];
+		updateShare.mockImplementation(async () => {
+			sentAt.push(Date.now());
+			return {};
+		});
+		for (let i = 0; i < 40; i++) {
+			manager.onFileCreated(addFile(folder, `gap-${i}.md`));
+			await jest.advanceTimersByTimeAsync(i % 2 === 0 ? 4000 : 9000);
+		}
+		await jest.advanceTimersByTimeAsync(60_000);
+
+		for (let i = 1; i < sentAt.length; i++) {
+			expect(sentAt[i] - sentAt[i - 1]).toBeGreaterThanOrEqual(30_000);
+		}
+		expect(lastItems(updateShare)).toHaveLength(40);
+	});
+
 	test("events that do not change the item list send no PATCH", async () => {
 		const note = addFile(folder, "a.md");
 		manager.onFileCreated(note);
@@ -141,26 +176,28 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(updateShare).toHaveBeenCalledTimes(1);
 
 		release();
-		await jest.advanceTimersByTimeAsync(5000);
+		// Next push waits out the 30s minimum interval from the first one.
+		await jest.advanceTimersByTimeAsync(30_000);
 		expect(updateShare).toHaveBeenCalledTimes(2);
 		expect(lastItems(updateShare).map((i) => i.path)).toEqual(["a.md", "b.md", "c.md"]);
 	});
 
 	test("429 with Retry-After: waits the requested time, then retries once", async () => {
 		updateShare.mockRejectedValueOnce(
-			new RelayHttpError(429, "Failed to update share: 429 Too Many Requests", 20_000),
+			new RelayHttpError(429, "Failed to update share: 429 Too Many Requests", 45_000),
 		);
 
 		manager.onFileCreated(addFile(folder, "a.md"));
 		await jest.advanceTimersByTimeAsync(3500);
 		expect(updateShare).toHaveBeenCalledTimes(1);
 
-		// Further events during the backoff must not bring the retry forward.
+		// Further events during the backoff must not bring the retry forward,
+		// including past the 30s minimum interval.
 		manager.onFileCreated(addFile(folder, "b.md"));
-		await jest.advanceTimersByTimeAsync(15_000);
+		await jest.advanceTimersByTimeAsync(40_000);
 		expect(updateShare).toHaveBeenCalledTimes(1);
 
-		await jest.advanceTimersByTimeAsync(5000);
+		await jest.advanceTimersByTimeAsync(6000);
 		expect(updateShare).toHaveBeenCalledTimes(2);
 		expect(lastItems(updateShare)).toHaveLength(2);
 
@@ -181,6 +218,76 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(updateShare).toHaveBeenCalledTimes(1);
 
 		await jest.advanceTimersByTimeAsync(2 * 60_000);
+		expect(updateShare).toHaveBeenCalledTimes(2);
+	});
+
+	test("a 429 on a manual sync holds every later push until Retry-After", async () => {
+		addFile(folder, "a.md");
+		updateShare.mockRejectedValueOnce(
+			new RelayHttpError(429, "Failed to update share: 429 Too Many Requests", 120_000),
+		);
+		await expect(manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1")).rejects.toThrow("429");
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		// Inside the backoff a manual sync fails at once (callers hold the
+		// echo-guard, so it must not sit out a long Retry-After) and sends nothing.
+		await jest.advanceTimersByTimeAsync(40_000);
+		manager.onFileCreated(addFile(folder, "b.md"));
+		await expect(manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1")).rejects.toThrow("retry in 80s");
+		await jest.advanceTimersByTimeAsync(60_000);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		// The scheduler retries once the Retry-After has passed.
+		await jest.advanceTimersByTimeAsync(25_000);
+		expect(updateShare).toHaveBeenCalledTimes(2);
+		expect(lastItems(updateShare)).toHaveLength(2);
+
+		await jest.advanceTimersByTimeAsync(60_000);
+		expect(updateShare).toHaveBeenCalledTimes(2);
+	});
+
+	test("concurrent manual syncs and the scheduler never overlap a PATCH", async () => {
+		let inFlight = 0;
+		let maxInFlight = 0;
+		updateShare.mockImplementation(async () => {
+			inFlight++;
+			maxInFlight = Math.max(maxInFlight, inFlight);
+			await new Promise<void>((resolve) => window.setTimeout(resolve, 2000));
+			inFlight--;
+			return {};
+		});
+
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		// All of these wait for the same 30s interval and wake together.
+		addFile(folder, "b.md");
+		const manual = [1, 2, 3].map(() => manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1"));
+		manager.onFileCreated(addFile(folder, "c.md"));
+		await jest.advanceTimersByTimeAsync(120_000);
+		await Promise.all(manual);
+
+		expect(maxInFlight).toBe(1);
+		expect(lastItems(updateShare)).toHaveLength(3);
+		expect(updateShare.mock.calls.length).toBeLessThanOrEqual(3);
+	});
+
+	test("a 429 on a manual-mode share holds pushes until Retry-After without arming a retry", async () => {
+		manager.unregisterAutoSyncShare(FOLDER);
+		addFile(folder, "a.md");
+		updateShare.mockRejectedValueOnce(
+			new RelayHttpError(429, "Failed to update share: 429 Too Many Requests", 120_000),
+		);
+		await expect(manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1")).rejects.toThrow("429");
+		expect(jest.getTimerCount()).toBe(0);
+
+		await jest.advanceTimersByTimeAsync(40_000);
+		await expect(manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1")).rejects.toThrow("retry in 80s");
+		await jest.advanceTimersByTimeAsync(10 * 60_000);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		await manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1");
 		expect(updateShare).toHaveBeenCalledTimes(2);
 	});
 
@@ -205,6 +312,10 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(manualDone).toBe(false);
 
 		release();
+		// Then it waits out the 30s minimum interval from the first PATCH.
+		await jest.advanceTimersByTimeAsync(20_000);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+		await jest.advanceTimersByTimeAsync(10_000);
 		await manual;
 		expect(updateShare).toHaveBeenCalledTimes(2);
 		expect(lastItems(updateShare).map((i) => i.path)).toEqual(["a.md", "b.md"]);
@@ -213,6 +324,34 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		manager.onFileDeleted(`${FOLDER}/missing.md`);
 		await jest.advanceTimersByTimeAsync(10_000);
 		expect(updateShare).toHaveBeenCalledTimes(2);
+	});
+
+	test("a manual sync right after a scheduled push waits out the 30s interval", async () => {
+		const sentAt: number[] = [];
+		updateShare.mockImplementation(async () => {
+			sentAt.push(Date.now());
+			return {};
+		});
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(sentAt).toHaveLength(1);
+
+		addFile(folder, "b.md");
+		const manual = manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1");
+		await jest.advanceTimersByTimeAsync(30_000);
+		await manual;
+
+		expect(sentAt).toHaveLength(2);
+		expect(sentAt[1] - sentAt[0]).toBeGreaterThanOrEqual(30_000);
+	});
+
+	test("a manual sync with nothing new sends no PATCH and does not wait", async () => {
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		await manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1");
+		expect(updateShare).toHaveBeenCalledTimes(1);
 	});
 
 	test("a manual sync for a share with no prior events records its list", async () => {
@@ -279,5 +418,60 @@ describe("parseRetryAfterMs", () => {
 	test("missing or garbage → undefined", () => {
 		expect(parseRetryAfterMs(null)).toBeUndefined();
 		expect(parseRetryAfterMs("soon")).toBeUndefined();
+	});
+});
+
+describe("ShareManagementModal folder sync — shares the per-share push state", () => {
+	let updateShare: UpdateShareMock;
+	let manager: WebSyncManager;
+	let folder: TFolder;
+	let modal: { syncFolderItems: () => Promise<void> };
+
+	beforeEach(() => {
+		jest.useFakeTimers();
+		updateShare = jest.fn(async () => ({})) as UpdateShareMock;
+		const made = makeFolderVault();
+		folder = made.folder;
+		const clientManager = makeClientManager(updateShare);
+		manager = new WebSyncManager(made.vault, clientManager);
+		manager.registerAutoSyncShare(FOLDER, "share1", "srv1", "folder", "slug");
+		// Only the fields syncFolderItems() reads; no web_slug, so no content pass.
+		modal = Object.assign(Object.create(ShareManagementModal.prototype) as object, {
+			app: { vault: made.vault },
+			plugin: { webSyncManager: manager, shareClientManager: clientManager },
+			selectedShare: { id: "share1", serverId: "srv1", kind: "folder", path: FOLDER },
+		}) as unknown as { syncFolderItems: () => Promise<void> };
+	});
+
+	afterEach(() => {
+		manager.destroy();
+		jest.useRealTimers();
+	});
+
+	test("the modal's sync waits out the 30s interval after a scheduled push", async () => {
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+		const firstAt = Date.now() - 500;
+
+		addFile(folder, "b.md");
+		const sync = modal.syncFolderItems();
+		await jest.advanceTimersByTimeAsync(20_000);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		await jest.advanceTimersByTimeAsync(15_000);
+		await sync;
+		expect(updateShare).toHaveBeenCalledTimes(2);
+		expect(Date.now() - firstAt).toBeGreaterThanOrEqual(30_000);
+		expect(lastItems(updateShare)).toHaveLength(2);
+	});
+
+	test("the modal's sync sends nothing when the list is unchanged", async () => {
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		await modal.syncFolderItems();
+		expect(updateShare).toHaveBeenCalledTimes(1);
 	});
 });

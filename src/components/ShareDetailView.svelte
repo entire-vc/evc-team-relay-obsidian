@@ -441,7 +441,14 @@
 				const items = await getFolderItems(currentShare.path);
 				if (items.length === 0) { new Notice(uiText("shareDetail.webPublish.folderEmptyNotice")); return; }
 				let updated;
-				if (live.shareClientManager) {
+				if (live.webSyncManager && live.shareClientManager) {
+					// Through WebSyncManager: shares the per-share interval, backoff
+					// and in-flight state with event-driven pushes; null if unchanged.
+					const webSyncManager = live.webSyncManager;
+					updated = await withOutboundSyncGuard(webSyncManager, () =>
+						webSyncManager.syncFolderStructureToWeb(currentShare.path, share.serverId, share.id)
+					);
+				} else if (live.shareClientManager) {
 					updated = await withOutboundSyncGuard(live.webSyncManager, () =>
 						live.shareClientManager!.updateShare(share.serverId, share.id, { web_folder_items: items })
 					);

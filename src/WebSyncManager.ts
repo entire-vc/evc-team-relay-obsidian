@@ -6,7 +6,7 @@
 
 import { Notice, TFile, Vault, debounce } from "obsidian";
 import { RelayOnPremShareClientManager } from "./RelayOnPremShareClientManager";
-import type { WebFolderEntry } from "./RelayOnPremShareClient";
+import type { RelayOnPremShare, WebFolderEntry } from "./RelayOnPremShareClient";
 import { namedLogger } from "./logging";
 import { RelayHttpError, isTransientRelayFailure } from "./relayRequestErrors";
 import {
@@ -30,11 +30,15 @@ const SYNCABLE_FOLDER_FILE_EXTENSIONS = new Set(["md", "canvas"]);
 // documents fires N create events, and pushing on each one sent N PATCHes
 // with an O(N) body, enough to overload the server. Pushes
 // now wait for a quiet period (capped by a max wait so a long pull still
-// publishes progress), run at most one at a time per share with the latest
-// state winning, skip lists identical to the last one the server accepted,
-// and back off on 429/5xx instead of retrying in a loop.
+// publishes progress), go out at most once per FOLDER_ITEMS_MIN_INTERVAL_MS
+// per share, run one at a time with the latest state winning, skip lists
+// identical to the last one the server accepted, and back off on 429/5xx
+// instead of retrying in a loop. The minimum interval matters for a slow
+// pull: events spaced further apart than the debounce would otherwise each
+// get their own PATCH.
 const FOLDER_ITEMS_DEBOUNCE_MS = 3000;
 const FOLDER_ITEMS_MAX_WAIT_MS = 30_000;
+const FOLDER_ITEMS_MIN_INTERVAL_MS = 30_000;
 const FOLDER_ITEMS_BACKOFF_BASE_MS = 5000;
 const FOLDER_ITEMS_BACKOFF_MAX_MS = 300_000;
 
@@ -51,6 +55,8 @@ interface FolderItemsPushState {
 	lastSentFingerprint: string | null;
 	// Backoff gate after a 429/5xx: no push before this time.
 	notBefore: number;
+	// When the last PATCH for this share started (0 = never).
+	lastPushAt: number;
 	failures: number;
 }
 
@@ -592,6 +598,7 @@ export class WebSyncManager {
 				dirty: false,
 				lastSentFingerprint: null,
 				notBefore: 0,
+				lastPushAt: 0,
 				failures: 0,
 			};
 			this.folderItemsPush.set(folderPath, state);
@@ -609,7 +616,8 @@ export class WebSyncManager {
 		serverId: string,
 		items: WebFolderEntry[],
 		fingerprint: string,
-	): Promise<void> {
+	): Promise<RelayOnPremShare> {
+		state.lastPushAt = Date.now();
 		const request = this.clientManager.updateShare(serverId, state.shareId, {
 			web_folder_items: items,
 		});
@@ -618,12 +626,19 @@ export class WebSyncManager {
 			() => undefined,
 		);
 		try {
-			await request;
+			const share = await request;
 			state.lastSentFingerprint = fingerprint;
 			state.failures = 0;
+			return share;
 		} finally {
 			state.inFlight = null;
 		}
+	}
+
+	/** Earliest time the next PATCH for this share may start (throttle and backoff). */
+	private folderItemsReadyAt(state: FolderItemsPushState): number {
+		const throttle = state.lastPushAt > 0 ? state.lastPushAt + FOLDER_ITEMS_MIN_INTERVAL_MS : 0;
+		return Math.max(throttle, state.notBefore);
 	}
 
 	private armFolderItemsTimer(folderPath: string, state: FolderItemsPushState): void {
@@ -632,12 +647,43 @@ export class WebSyncManager {
 			now + FOLDER_ITEMS_DEBOUNCE_MS,
 			(state.firstPendingAt ?? now) + FOLDER_ITEMS_MAX_WAIT_MS,
 		);
-		const fireAt = Math.max(trailing, state.notBefore);
+		const fireAt = Math.max(trailing, this.folderItemsReadyAt(state));
 		if (state.timer !== null) window.clearTimeout(state.timer);
 		state.timer = window.setTimeout(() => {
 			state.timer = null;
 			void this.flushFolderItemsPush(folderPath, state);
 		}, Math.max(0, fireAt - now));
+	}
+
+	/** Folder shares registered for auto-sync are the only ones the scheduler pushes for. */
+	private isFolderAutoSync(folderPath: string): boolean {
+		return this.autoSyncShares.get(folderPath)?.kind === "folder";
+	}
+
+	/**
+	 * After a 429/5xx: hold every push for this share until Retry-After or the
+	 * backoff delay. Auto-sync shares are then retried by the scheduler; a share
+	 * in manual web-sync mode is not pushed automatically, so the user retries.
+	 */
+	private backOffFolderItemsPush(folderPath: string, state: FolderItemsPushState, error: unknown): void {
+		state.failures++;
+		const retryAfterMs = error instanceof RelayHttpError ? error.retryAfterMs : undefined;
+		// A server-sent Retry-After is honoured as is; the cap only
+		// bounds our own exponential fallback.
+		const delay = retryAfterMs ?? Math.min(
+			FOLDER_ITEMS_BACKOFF_BASE_MS * 2 ** (state.failures - 1),
+			FOLDER_ITEMS_BACKOFF_MAX_MS,
+		);
+		state.notBefore = Date.now() + delay;
+		if (this.isFolderAutoSync(folderPath)) {
+			state.dirty = true;
+			if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+		}
+		log("Transient failure updating web_folder_items, backing off", {
+			folderPath,
+			delayMs: delay,
+			error: error instanceof Error ? error.message : String(error),
+		});
 	}
 
 	private async flushFolderItemsPush(folderPath: string, state: FolderItemsPushState): Promise<void> {
@@ -661,22 +707,7 @@ export class WebSyncManager {
 			log("Updated web_folder_items", { folderPath, itemCount: items.length });
 		} catch (error: unknown) {
 			if (isTransientRelayFailure(error)) {
-				state.failures++;
-				const retryAfterMs = error instanceof RelayHttpError ? error.retryAfterMs : undefined;
-				// A server-sent Retry-After is honoured as is; the cap only
-				// bounds our own exponential fallback.
-				const delay = retryAfterMs ?? Math.min(
-					FOLDER_ITEMS_BACKOFF_BASE_MS * 2 ** (state.failures - 1),
-					FOLDER_ITEMS_BACKOFF_MAX_MS,
-				);
-				state.notBefore = Date.now() + delay;
-				state.dirty = true;
-				if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
-				log("Transient failure updating web_folder_items, backing off", {
-					folderPath,
-					delayMs: delay,
-					error: error instanceof Error ? error.message : String(error),
-				});
+				this.backOffFolderItemsPush(folderPath, state, error);
 			} else {
 				// Not retried; the next change in the folder pushes again.
 				log("Failed to update web_folder_items", {
@@ -700,26 +731,66 @@ export class WebSyncManager {
 
 	/**
 	 * Sync folder structure (web_folder_items) to web for a specific share.
-	 * Called from context menu "Sync" to ensure deleted files are reflected on web-publish.
+	 * Called from context menu "Sync" and the share modal to ensure deleted files are
+	 * reflected on web-publish. Returns the updated share, or null when the list
+	 * already matches what was last sent (no PATCH).
 	 */
 	async syncFolderStructureToWeb(
 		folderPath: string,
 		serverId: string,
 		shareId: string,
-	): Promise<void> {
+	): Promise<RelayOnPremShare | null> {
 		// Shares the scheduler's state so a manual sync never overlaps an
-		// event-driven PATCH and later unchanged events see what it sent.
+		// event-driven PATCH, obeys the same minimum interval and backoff, and
+		// later unchanged events see what it sent.
 		const state = this.getFolderItemsPushState(folderPath, shareId);
-		while (state.inFlight !== null) await state.inFlight;
-		const items = this.getFolderItems(folderPath);
+		let items: WebFolderEntry[];
+		for (;;) {
+			while (state.inFlight !== null) await state.inFlight;
+			items = this.getFolderItems(folderPath);
+			if (JSON.stringify(items) === state.lastSentFingerprint) {
+				log("Folder structure already up to date on web", { folderPath });
+				return null;
+			}
+			const backoffLeft = state.notBefore - Date.now();
+			if (backoffLeft > 0) {
+				// The server asked us to back off. Don't wait it out here (callers
+				// hold the outbound echo-guard, which pauses inbound sync); fail
+				// this call without a PATCH. An auto-sync share is retried by the
+				// scheduler once the backoff ends; a manual-mode share by the user.
+				if (this.isFolderAutoSync(folderPath)) {
+					state.dirty = true;
+					if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+					if (state.timer === null) this.armFolderItemsTimer(folderPath, state);
+				}
+				throw new RelayHttpError(
+					429,
+					`Folder structure push deferred: server asked to retry in ${Math.ceil(backoffLeft / 1000)}s`,
+					backoffLeft,
+				);
+			}
+			const wait = this.folderItemsReadyAt(state) - Date.now();
+			// No await between this break and sendFolderItems() setting
+			// state.inFlight, so a caller that wakes later sees it at the top of
+			// the loop: at most one PATCH in flight per share.
+			if (wait <= 0) break;
+			await new Promise<void>((resolve) => window.setTimeout(resolve, wait));
+		}
+		let share: RelayOnPremShare;
 		try {
-			await this.sendFolderItems(state, serverId, items, JSON.stringify(items));
+			share = await this.sendFolderItems(state, serverId, items, JSON.stringify(items));
+		} catch (error: unknown) {
+			// Same backoff as scheduled pushes, so neither this caller nor the
+			// scheduler sends again before Retry-After; the error still surfaces.
+			if (isTransientRelayFailure(error)) this.backOffFolderItemsPush(folderPath, state, error);
+			throw error;
 		} finally {
 			if (state.dirty && this.folderItemsPush.get(folderPath) === state) {
 				this.armFolderItemsTimer(folderPath, state);
 			}
 		}
 		log("Synced folder structure to web", { folderPath, itemCount: items.length });
+		return share;
 	}
 
 	/**

@@ -119,7 +119,7 @@ import {
 	diffRelayOnPremServers,
 } from "./relay/reconcileRelayOnPremServers";
 import type { IAuthProvider } from "./auth/IAuthProvider";
-import { RelayOnPremShareClient } from "./RelayOnPremShareClient";
+import { RelayOnPremShareClient, type WebFolderEntry } from "./RelayOnPremShareClient";
 import { RelayOnPremShareClientManager, type ShareWithServer } from "./RelayOnPremShareClientManager";
 import { dedupeFolderSharesByPath } from "./dedupeFolderSharesByPath";
 import { QuickShareModal } from "./ui/QuickShareModal";
@@ -1606,11 +1606,10 @@ export default class TeamRelayPlugin extends Plugin {
 						} else if (share.kind === "folder") {
 							const folderAbs = resolveShareFolder(this.pluginVault, share.path);
 							if (folderAbs) {
-								// 1. Build recursive folder items and PATCH structure
+								// 1. Build recursive folder items and PATCH structure. Via
+								// WebSyncManager so it obeys the per-share interval/backoff.
 								const items = collectWebFolderItems(folderAbs, share.path);
-								await this.shareClientManager!.updateShare(share.serverId, share.id, {
-									web_folder_items: items,
-								});
+								await this.pushFolderItems(share, items);
 								// 2. POST content for each doc/canvas
 								if (share.web_slug) {
 									for (const item of items) {
@@ -1646,6 +1645,21 @@ export default class TeamRelayPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * PATCH a folder share's web_folder_items through WebSyncManager, so the
+	 * push shares the per-share minimum interval, backoff and in-flight state
+	 * with event-driven pushes.
+	 */
+	private async pushFolderItems(share: ShareWithServer, items: WebFolderEntry[]): Promise<void> {
+		if (this.webSyncManager) {
+			await this.webSyncManager.syncFolderStructureToWeb(share.path, share.serverId, share.id);
+			return;
+		}
+		await this.shareClientManager!.updateShare(share.serverId, share.id, {
+			web_folder_items: items,
+		});
+	}
+
 	private async _initialFullSync(shares: ShareWithServer[]): Promise<void> {
 		if (!this.shareClientManager) return;
 		this.logInfo("Running initial full-sync for stale auto-sync shares", shares.length);
@@ -1662,9 +1676,7 @@ export default class TeamRelayPlugin extends Plugin {
 						continue;
 					}
 					const items = collectWebFolderItems(folderAbs, share.path);
-					await this.shareClientManager!.updateShare(share.serverId, share.id, {
-						web_folder_items: items,
-					});
+					await this.pushFolderItems(share, items);
 					if (share.web_slug) {
 						let syncedCount = 0;
 						for (const item of items) {
