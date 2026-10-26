@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.16
+- Fixed: on a computer whose clock runs more than a minute behind the server, the plugin no longer keeps using an expired connection token. Previously the live connection to a shared note was refused about once a minute until the token was renewed.
+
 ## 0.1.15
 - Fixed: an edit to a closed note that fails to upload while the server is busy is now sent again within seconds, instead of waiting minutes for the next background pass. An edit saved while the same note is still uploading is no longer skipped.
 - Fixed: a change from another device that is slow to become visible on the server keeps being checked for up to ten minutes instead of three, so it no longer waits for the next full background pass. While another shared folder receives a large import, these checks and fresh edits to closed notes get a reserved slot, and a fresh edit always comes first.
