@@ -297,7 +297,7 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
-	test("an announced change that never shows up is re-checked for a bounded window, then given up", async () => {
+	test("an announced change that never shows up keeps being re-checked past the window, then is given up", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
 		const folder = makeFolder("s", 1, pull, 1);
@@ -307,18 +307,28 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		await flushPromises();
 
 		folder.announce("s-0", textFingerprint("new"));
-		for (let t = 0; t <= 400_000; t += 1_000) {
+		let callsAt200s = 0;
+		for (let t = 0; t <= 800_000; t += 1_000) {
 			clock.setTime(t0 + t);
 			await flushPromises();
 			while (held.length > 0) {
 				held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
 				await flushPromises();
 			}
+			if (t === 200_000) {
+				callsAt200s = pull.mock.calls.length;
+				expect(poller.stats().recheck.givenUp).toBe(0);
+			}
 		}
 		const calls = pull.mock.calls.length;
-		expect(poller.stats().recheck.givenUp).toBe(1);
-		expect(poller.stats().recheck.scheduled).toBeGreaterThan(3);
-		clock.setTime(t0 + 500_000);
+		const stats = poller.stats();
+		// Once a minute from the front of the sweep between 180s and 600s.
+		expect(calls - callsAt200s).toBeGreaterThanOrEqual(5);
+		expect(stats.recheck.swept).toBeGreaterThanOrEqual(5);
+		expect(stats.recheck.givenUp).toBe(1);
+		expect(stats.givenUp).toEqual([{ path: "s/0.md", outcome: "unchanged", attempts: expect.any(Number) }]);
+		expect(stats.outcomes.unchanged).toBe(calls);
+		clock.setTime(t0 + 900_000);
 		await flushPromises();
 		expect(pull.mock.calls.length).toBe(calls);
 		poller.destroy();
@@ -340,16 +350,17 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 
 		for (let i = 0; i < 300; i++) folder.announce(`imp-${i}`, textFingerprint(`created ${i}`));
 		let callsAt40s = 0;
-		for (let t = 0; t <= 200_000; t += 1_000) {
+		let callsAt175s = 0;
+		for (let t = 0; t <= 175_000; t += 1_000) {
 			clock.setTime(t0 + t);
 			await flushPromises();
 			await settleAll();
 			if (t === 40_000) callsAt40s = pull.mock.calls.length;
+			if (t === 175_000) callsAt175s = pull.mock.calls.length;
 		}
 		// Past the three quick re-checks each document is pulled at most
-		// twice more (~62s, ~122s), instead of every 15s until 180s.
-		expect(pull.mock.calls.length - callsAt40s).toBeLessThanOrEqual(2 * 300);
-		expect(poller.stats().recheck.givenUp).toBe(300);
+		// twice more (~62s, ~122s) within the window, instead of every 15s.
+		expect(callsAt175s - callsAt40s).toBeLessThanOrEqual(2 * 300);
 		poller.destroy();
 	});
 
@@ -612,6 +623,91 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		await flushPromises();
 		expect(startedGuids(pull)).toEqual(["bulk-0", "bulk-1", "bulk-2", "note"]);
 		expect(poller.stats().express).toBe(1);
+		poller.destroy();
+	});
+
+	test("a late re-check of another share takes the express slot while a bulk share holds every regular slot", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const bulk = makeFolder("bulk", 0, pull, 3);
+		const notes = makeFolder("notes", 0, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([bulk, notes]) as never, 3_600_000);
+		poller.start();
+		for (let i = 0; i < 100; i++) {
+			bulk.trackedEntries.set(`bulk-${i}`, {
+				__isDocument: true,
+				isOnline: false,
+				entityGuid: `bulk-${i}`,
+				entryPath: `bulk/${i}.md`,
+			});
+			bulk.announce(`bulk-${i}`, textFingerprint(`created ${i}`));
+		}
+		notes.trackedEntries.set("note", { __isDocument: true, isOnline: false, entityGuid: "note", entryPath: "notes/note.md" });
+		notes.announce("note", textFingerprint("edited"));
+		await flushPromises();
+
+		// The bulk pulls never settle; the note's content lags behind its
+		// announcement through the three quick re-checks and into the late lane.
+		const notePulls = () => startedGuids(pull).filter((guid) => guid === "note").length;
+		for (let t = 0; t <= 40_000; t += 1_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+			for (let i = held.length - 1; i >= 0; i--) {
+				if (held[i].file.entityGuid !== "note") continue;
+				const [note] = held.splice(i, 1);
+				note.resolve({ outcome: "unchanged", remoteText: t < 30_000 ? "old" : "edited" });
+				await flushPromises();
+			}
+		}
+		// Quick re-checks at ~2/7/17s, then the late one ~15s later.
+		expect(notePulls()).toBe(5);
+		expect(poller.stats().delivery.count).toBe(1);
+		poller.destroy();
+	});
+
+	test("a fresh edit takes the express slot back from a late re-check", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const bulk = makeFolder("bulk", 0, pull, 3);
+		const notes = makeFolder("notes", 0, pull, 3);
+		const other = makeFolder("other", 0, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([bulk, notes, other]) as never, 3_600_000);
+		poller.start();
+		for (let i = 0; i < 100; i++) {
+			bulk.trackedEntries.set(`bulk-${i}`, {
+				__isDocument: true,
+				isOnline: false,
+				entityGuid: `bulk-${i}`,
+				entryPath: `bulk/${i}.md`,
+			});
+			bulk.announce(`bulk-${i}`, textFingerprint(`created ${i}`));
+		}
+		notes.trackedEntries.set("note", { __isDocument: true, isOnline: false, entityGuid: "note", entryPath: "notes/note.md" });
+		other.trackedEntries.set("edit", { __isDocument: true, isOnline: false, entityGuid: "edit", entryPath: "other/edit.md" });
+		notes.announce("note", textFingerprint("edited"));
+		await flushPromises();
+		const notePulls = () => startedGuids(pull).filter((guid) => guid === "note").length;
+		// Settle the note's quick re-checks; its late one (the 5th pull) stays held.
+		for (let t = 0; t <= 40_000 && notePulls() < 5; t += 1_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+			for (let i = held.length - 1; i >= 0; i--) {
+				if (held[i].file.entityGuid !== "note" || notePulls() >= 5) continue;
+				const [note] = held.splice(i, 1);
+				note.resolve({ outcome: "unchanged", remoteText: "old" });
+				await flushPromises();
+			}
+		}
+		expect(notePulls()).toBe(5);
+		const lateNote = held.find((h) => h.file.entityGuid === "note");
+		expect(poller.stats().express).toBe(1);
+
+		other.announce("edit", textFingerprint("typed"));
+		await flushPromises();
+		expect(startedGuids(pull)).toContain("edit");
+		expect(lateNote?.control.signal?.aborted).toBe(true);
+		expect(poller.stats().preempted).toBe(1);
+		expect(poller.stats().inflight).toBe(4);
 		poller.destroy();
 	});
 

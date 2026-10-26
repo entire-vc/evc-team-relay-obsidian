@@ -61,6 +61,10 @@ export interface LaneStats {
 	importingShares: string[];
 	/** Run time of the lane's recent items, start to settle: priority and the rest. */
 	durationMs: Record<"priority" | "bulk", { count: number; p50: number; p95: number; max: number }>;
+	/** Uploads left unsynced (connect failure, sync timeout) and what became of their retries. */
+	retries: { failed: number; retried: number; gaveUp: number; pending: number };
+	/** Items re-run because a new edit arrived while they were running. */
+	reruns: number;
 }
 
 export interface TransferBatch {
@@ -122,6 +126,9 @@ interface QueueLaneState {
 	readonly lastServed: Map<VaultShare, number>;
 	/** How long the most recent items ran, start to settle (newest last). */
 	readonly durations: { ms: number; priority: boolean }[];
+	/** Running items asked for again meanwhile, and whether that ask was priority. */
+	readonly rerun: Map<string, boolean>;
+	reruns: number;
 }
 
 /** How many recent run durations `laneStats()` summarises per lane. */
@@ -195,6 +202,12 @@ const PRIORITY_RESERVED_SLOTS = 1;
  */
 const PRIORITY_IMPORT_BACKLOG = 8;
 const LANE_STATS_LOG_EVERY_MS = 60_000;
+/**
+ * Delays before re-trying an upload that came back unsynced (connect failure
+ * or sync timeout, both routine while the relay is under load). Without them
+ * the edit waited for the next full pass over the share, minutes later.
+ */
+const UPLOAD_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 30_000, 60_000];
 
 export class TransferQueue extends Loggable {
 	public activeUploads = new NotifierSet<TransferTask>();
@@ -207,6 +220,8 @@ export class TransferQueue extends Loggable {
 	private paused = true;
 	private serveSeq = 0;
 	private lastStatsLogAt = 0;
+	private uploadRetries = new Map<string, { attempt: number; timer?: number }>();
+	private uploadRetryStats = { failed: 0, retried: 0, gaveUp: 0 };
 
 	teardowns: Unsubscriber[] = [];
 
@@ -241,6 +256,8 @@ export class TransferQueue extends Loggable {
 			},
 			lastServed: new Map<VaultShare, number>(),
 			durations: [],
+			rerun: new Map<string, boolean>(),
+			reruns: 0,
 		};
 		this.downloadLane = {
 			queue: [],
@@ -257,6 +274,8 @@ export class TransferQueue extends Loggable {
 			},
 			lastServed: new Map<VaultShare, number>(),
 			durations: [],
+			rerun: new Map<string, boolean>(),
+			reruns: 0,
 		};
 
 		this.clock.scheduleInterval(() => {
@@ -298,6 +317,11 @@ export class TransferQueue extends Loggable {
 				priority: summarise(lane.durations.filter((d) => d.priority).map((d) => d.ms)),
 				bulk: summarise(lane.durations.filter((d) => !d.priority).map((d) => d.ms)),
 			},
+			retries:
+				lane === this.syncLane
+					? { ...this.uploadRetryStats, pending: this.uploadRetries.size }
+					: { failed: 0, retried: 0, gaveUp: 0, pending: 0 },
+			reruns: lane.reruns,
 		};
 	}
 
@@ -446,6 +470,7 @@ export class TransferQueue extends Loggable {
 						if (lane.durations.length > DURATION_SAMPLES) lane.durations.shift();
 						lane.active.delete(item);
 						lane.inFlight.delete(item.entityGuid);
+						this.rerunIfAskedAgain(lane, item);
 
 						// Unwind the call stack before checking for more work
 						this.clock.scheduleTimeout(() => {
@@ -462,6 +487,31 @@ export class TransferQueue extends Loggable {
 		}
 
 		lane.processing = false;
+	}
+
+	/**
+	 * An item asked for again while it ran may have missed what prompted the
+	 * ask (an edit saved after the upload read the file), so it runs once more.
+	 */
+	private rerunIfAskedAgain(lane: QueueLaneState, item: TransferTask): void {
+		const priority = lane.rerun.get(item.entityGuid);
+		if (priority === undefined) return;
+		lane.rerun.delete(item.entityGuid);
+		if (!this.clock) return;
+		lane.reruns++;
+		const again =
+			lane === this.syncLane
+				? this.enqueueUpload(item.syncEntry, { priority })
+				: this.enqueueFetch(item.syncEntry, { priority });
+		void again.catch((error: unknown) => this.warn("[rerun] failed for", item.entityGuid, error));
+	}
+
+	private isRunning(lane: QueueLaneState, entityGuid: string): boolean {
+		let running = false;
+		lane.active.each((item) => {
+			if (item.entityGuid === entityGuid) running = true;
+		});
+		return running;
 	}
 
 	private hasActivePriority(lane: QueueLaneState, vaultShare: VaultShare): boolean {
@@ -519,7 +569,7 @@ export class TransferQueue extends Loggable {
 		if (item.syncEntry instanceof AttachmentFile) {
 			return this.uploadAttachment(item.syncEntry);
 		}
-		return this.uploadDocument(item.syncEntry);
+		return this.uploadDocument(item.syncEntry, item.priority);
 	}
 
 	private runDownloadItem(item: TransferTask): Promise<unknown> {
@@ -597,6 +647,10 @@ export class TransferQueue extends Loggable {
 	): Promise<void> {
 		if (this.syncLane.inFlight.has(item.entityGuid)) {
 			this.debug(`[enqueueUpload] Item ${item.entityGuid} already in progress, skipping`);
+			if (this.isRunning(this.syncLane, item.entityGuid)) {
+				const priority = (this.syncLane.rerun.get(item.entityGuid) ?? false) || !!options.priority;
+				this.syncLane.rerun.set(item.entityGuid, priority);
+			}
 			if (options.priority) this.promote(this.syncLane, item.entityGuid);
 			const existing = this.syncLane.waiters.get(item.entityGuid);
 			if (existing) {
@@ -1732,15 +1786,60 @@ export class TransferQueue extends Loggable {
 		await file.pullFromRemote();
 	}
 
-	private async uploadDocument(doc: Document | CanvasDocument) {
+	private async uploadDocument(doc: Document | CanvasDocument, priority: boolean) {
 		try {
 			if (isDocument(doc) || isCanvasDocument(doc)) {
-				await this.uploadDocumentViaSocket(doc);
+				const synced = await this.uploadDocumentViaSocket(doc);
+				if (synced) this.clearUploadRetry(doc.entityGuid);
+				else if (this.isRelayLinked(doc)) this.scheduleUploadRetry(doc, priority);
 			}
 		} catch (e: unknown) {
 			console.error(e);
+			this.clearUploadRetry(doc.entityGuid);
 			return;
 		}
+	}
+
+	/**
+	 * Re-queues an upload that came back unsynced, with backoff. After the
+	 * last delay the share's periodic pass is what picks it up again.
+	 */
+	private scheduleUploadRetry(doc: Document | CanvasDocument, priority: boolean): void {
+		if (!this.clock) return;
+		const retry = this.uploadRetries.get(doc.entityGuid) ?? { attempt: 0 };
+		if (retry.timer !== undefined) return;
+		this.uploadRetryStats.failed++;
+		const delay = UPLOAD_RETRY_DELAYS_MS[retry.attempt];
+		if (delay === undefined) {
+			this.uploadRetries.delete(doc.entityGuid);
+			this.uploadRetryStats.gaveUp++;
+			this.warn("[uploadRetry] giving up for now on", doc.entryPath);
+			return;
+		}
+		retry.attempt++;
+		retry.timer = this.clock.scheduleTimeout(() => {
+			retry.timer = undefined;
+			if (!this.clock) return;
+			// Deleted, renamed away or its share went offline meanwhile: the
+			// share's own reconnect or next pass covers what is still there.
+			const share = doc.vaultShare;
+			if (share.trackedEntries?.get(doc.entityGuid) !== doc || !share.isOnline) {
+				this.uploadRetries.delete(doc.entityGuid);
+				return;
+			}
+			this.uploadRetryStats.retried++;
+			void this.enqueueUpload(doc, { priority }).catch((error: unknown) =>
+				this.warn("[uploadRetry] failed for", doc.entryPath, error),
+			);
+		}, delay);
+		this.uploadRetries.set(doc.entityGuid, retry);
+	}
+
+	private clearUploadRetry(entityGuid: string): void {
+		const retry = this.uploadRetries.get(entityGuid);
+		if (!retry) return;
+		if (retry.timer !== undefined) this.clock?.cancelTimeout(retry.timer);
+		this.uploadRetries.delete(entityGuid);
 	}
 
 	onUploadChange(
@@ -1851,6 +1950,13 @@ export class TransferQueue extends Loggable {
 			waiter.reject(new Error("TransferQueue destroyed"));
 			this.downloadLane.waiters.delete(guid);
 		}
+
+		for (const retry of this.uploadRetries.values()) {
+			if (retry.timer !== undefined) this.clock?.cancelTimeout(retry.timer);
+		}
+		this.uploadRetries.clear();
+		this.syncLane.rerun.clear();
+		this.downloadLane.rerun.clear();
 
 		// Destroy observable collections
 		this.activeUploads.destroy();

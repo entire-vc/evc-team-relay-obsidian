@@ -83,7 +83,8 @@
  *    0.1.9: closed-note edits in one share took up to ~100s to arrive while
  *    an 800+ document bulk sync kept every regular slot in `connect` on
  *    another share). It only takes announced work from a share that has no
- *    announced pull in flight yet, so a single edit starts at once instead
+ *    announced pull in flight yet (or a late re-check from a share with
+ *    nothing in flight), so a single edit starts at once instead
  *    of waiting up to PULL_DEADLINE_MS for a regular slot, while a share
  *    with a large announced backlog (the bulk itself) can't occupy it. Bulk
  *    throughput is unchanged: the regular slots stay at `laneLimit`.
@@ -116,7 +117,8 @@ export const PULL_DEADLINE_MS = 25_000;
  * fingerprint yet (the marker can beat the content to this client) is
  * pulled again after these delays, then after the backed-off
  * LATE_RECHECK_DELAYS_MS until RECHECK_WINDOW_MS after the announcement,
- * then left to the sweep. The marker travels on the live folder connection
+ * then once a minute from the front of the share's sweep until
+ * RECHECK_LIMIT_MS, and only then left to the regular sweep. The marker travels on the live folder connection
  * while the sender's upload opens the document's own: under an 800+
  * document import that upload took up to ~60s, and three re-checks
  * (~40-57s) gave up on 18 of 80 edits.
@@ -131,6 +133,13 @@ const RECHECK_DELAYS_MS = [2_000, 5_000, 10_000];
  */
 const LATE_RECHECK_DELAYS_MS = [15_000, 30_000, 60_000];
 const RECHECK_WINDOW_MS = 180_000;
+/**
+ * A change still not visible after the window keeps being re-checked, at the
+ * capped delay and behind every fresh edit, for this long. On the stand a
+ * note given up at 180s stayed diverged until the end of the run.
+ */
+const RECHECK_LIMIT_MS = 600_000;
+const GIVEN_UP_SAMPLES = 20;
 const STATS_LOG_EVERY_MS = 60_000;
 const LATENCY_SAMPLES = 200;
 
@@ -163,6 +172,8 @@ interface InFlight {
 	late: boolean;
 	/** Runs in the express slot, outside the `laneLimit` regular slots. */
 	express: boolean;
+	/** Aborts the pull and frees its slot (set once it has started). */
+	release?: () => void;
 }
 
 export interface PollerStats {
@@ -175,8 +186,17 @@ export interface PollerStats {
 	completed: number;
 	failed: number;
 	delivery: { count: number; p50Ms: number; p95Ms: number; maxMs: number };
-	/** Re-checks of announced changes scheduled so far, and those given up to the sweep. */
-	recheck: { scheduled: number; givenUp: number };
+	/**
+	 * Re-checks of announced changes: scheduled so far, moved to the front of
+	 * the sweep after RECHECK_WINDOW_MS, and given up after RECHECK_LIMIT_MS.
+	 */
+	recheck: { scheduled: number; swept: number; givenUp: number };
+	/** Late re-checks that gave the express slot up to a fresh edit. */
+	preempted: number;
+	/** How the pulls so far ended. */
+	outcomes: Partial<Record<PullResult["outcome"] | "deadline", number>>;
+	/** The most recent given-up documents and how their last pull ended. */
+	givenUp: { path: string; outcome: string; attempts: number }[];
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -210,6 +230,10 @@ export class CrdtBackgroundSyncPoller {
 	private failed = 0;
 	private recheckScheduled = 0;
 	private recheckGivenUp = 0;
+	private recheckSwept = 0;
+	private preempted = 0;
+	private readonly outcomes: PollerStats["outcomes"] = {};
+	private readonly givenUpDocs: PollerStats["givenUp"] = [];
 	private lastStatsLogAt = 0;
 	private destroyed = false;
 
@@ -360,15 +384,40 @@ export class CrdtBackgroundSyncPoller {
 	}
 
 	/**
-	 * Next document for the express slot: announced work only, from a share
-	 * none of whose announced pulls is already running.
+	 * Next document for the express slot: announced work from a share none
+	 * of whose announced pulls is already running; failing that, a late
+	 * re-check from a share with nothing in flight at all (one starved by
+	 * another share's backlog, not the share producing it).
 	 */
-	private takeExpress(): PendingPull | undefined {
-		const busy = new Set<VaultShare>();
+	private takeExpress(): { pull: PendingPull; lane: keyof ShareQueues } | undefined {
+		const announcing = new Set<VaultShare>();
+		const active = new Set<VaultShare>();
 		for (const inFlight of this.pulling.values()) {
-			if (inFlight.announced) busy.add(inFlight.pull.folder);
+			active.add(inFlight.pull.folder);
+			if (inFlight.announced) announcing.add(inFlight.pull.folder);
 		}
-		return this.takeFrom("priority", (share) => !busy.has(share));
+		const announced = this.takeFrom("priority", (share) => !announcing.has(share));
+		if (announced) return { pull: announced, lane: "priority" };
+		const late = this.takeFrom("late", (share) => !active.has(share));
+		return late ? { pull: late, lane: "late" } : undefined;
+	}
+
+	/**
+	 * A late re-check holding the express slot gives it up to a fresh edit
+	 * (it is re-checked again later); one already writing is left to finish.
+	 */
+	private preemptLateExpress(): PendingPull | undefined {
+		const holder = [...this.pulling.values()].find((inFlight) => inFlight.express);
+		if (!holder?.late || holder.phase === "write" || !holder.release) return undefined;
+		const announcing = new Set<VaultShare>();
+		for (const inFlight of this.pulling.values()) {
+			if (inFlight.announced) announcing.add(inFlight.pull.folder);
+		}
+		const pull = this.takeFrom("priority", (share) => !announcing.has(share));
+		if (!pull) return undefined;
+		this.preempted++;
+		holder.release();
+		return pull;
 	}
 
 	private takeFrom(lane: keyof ShareQueues, eligible: (share: VaultShare) => boolean): PendingPull | undefined {
@@ -408,7 +457,10 @@ export class CrdtBackgroundSyncPoller {
 				const taken = this.takeNext(limit);
 				if (taken) next = { ...taken, express: false };
 			} else if (!expressBusy) {
-				const pull = this.takeExpress();
+				const taken = this.takeExpress();
+				if (taken) next = { ...taken, express: true };
+			} else {
+				const pull = this.preemptLateExpress();
 				if (pull) next = { pull, lane: "priority", express: true };
 			}
 			if (!next) return;
@@ -446,14 +498,14 @@ export class CrdtBackgroundSyncPoller {
 		});
 
 		let settled = false;
-		const finish = (result: PullResult | undefined) => {
+		const finish = (result: PullResult | undefined, redrain = true) => {
 			if (settled) return;
 			settled = true;
 			if (inFlight.deadline !== undefined) this.timeProvider.cancelTimeout(inFlight.deadline);
 			this.pulling.delete(guid);
 			if (!this.destroyed) {
 				this.afterPull(pull, result);
-				this.drain();
+				if (redrain) this.drain();
 			}
 		};
 		inFlight.deadline = this.timeProvider.scheduleTimeout(() => {
@@ -475,6 +527,13 @@ export class CrdtBackgroundSyncPoller {
 			}
 			finish(undefined);
 		}, this.pullDeadlineMs);
+
+		inFlight.release = () => {
+			if (settled) return;
+			controller.abort();
+			// Called from drain(), which hands the slot on itself.
+			finish({ outcome: "aborted" }, false);
+		};
 
 		void folder.transfers
 			.pullIfUnchanged(file, {
@@ -502,6 +561,8 @@ export class CrdtBackgroundSyncPoller {
 		const ok = result !== undefined && result.outcome !== "connect-failed" && result.outcome !== "aborted";
 		if (ok) this.completed++;
 		else this.failed++;
+		const outcome = result?.outcome ?? "deadline";
+		this.outcomes[outcome] = (this.outcomes[outcome] ?? 0) + 1;
 
 		const lateAnnouncement = this.announcedWhilePulling.get(guid);
 		this.announcedWhilePulling.delete(guid);
@@ -521,11 +582,14 @@ export class CrdtBackgroundSyncPoller {
 		const delay =
 			RECHECK_DELAYS_MS[attempt] ??
 			LATE_RECHECK_DELAYS_MS[Math.min(attempt - RECHECK_DELAYS_MS.length, LATE_RECHECK_DELAYS_MS.length - 1)];
-		if (this.timeProvider.now() + delay - announcedAt > RECHECK_WINDOW_MS) {
+		if (this.timeProvider.now() + delay - announcedAt > RECHECK_LIMIT_MS) {
 			this.recheckGivenUp++;
+			this.givenUpDocs.push({ path: pull.file.entryPath, outcome, attempts: attempt + 1 });
+			if (this.givenUpDocs.length > GIVEN_UP_SAMPLES) this.givenUpDocs.shift();
 			log("announced change still not visible after re-checks; leaving it to the sweep", {
 				path: pull.file.entryPath,
 				attempts: attempt + 1,
+				outcome,
 			});
 			return;
 		}
@@ -553,8 +617,17 @@ export class CrdtBackgroundSyncPoller {
 				const queues = this.queuesFor(pull.folder);
 				// A fresh announcement already queued for it covers this re-check.
 				if (queues.priority.has(guid)) return;
-				queues.sweep.delete(guid);
-				queues.late.set(guid, next);
+				if (this.timeProvider.now() - announcedAt <= RECHECK_WINDOW_MS) {
+					queues.sweep.delete(guid);
+					queues.late.set(guid, next);
+				} else {
+					// Past the window: first in line of the sweep, so it
+					// doesn't take a slot from re-checks still in theirs.
+					this.recheckSwept++;
+					queues.late.delete(guid);
+					queues.sweep.delete(guid);
+					queues.sweep = new Map([[guid, next], ...queues.sweep]);
+				}
 			}
 			this.drain();
 		}, delay);
@@ -593,7 +666,10 @@ export class CrdtBackgroundSyncPoller {
 			timeouts: { ...this.timeouts },
 			completed: this.completed,
 			failed: this.failed,
-			recheck: { scheduled: this.recheckScheduled, givenUp: this.recheckGivenUp },
+			recheck: { scheduled: this.recheckScheduled, swept: this.recheckSwept, givenUp: this.recheckGivenUp },
+			preempted: this.preempted,
+			outcomes: { ...this.outcomes },
+			givenUp: [...this.givenUpDocs],
 			delivery: {
 				count: sorted.length,
 				p50Ms: percentile(sorted, 50),
