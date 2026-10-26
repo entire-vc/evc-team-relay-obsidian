@@ -114,9 +114,15 @@ export const PULL_DEADLINE_MS = 25_000;
 /**
  * An announced change whose pulled text doesn't match the announced
  * fingerprint yet (the marker can beat the content to this client) is
- * pulled again after these delays, then left to the sweep.
+ * pulled again after these delays, then every RECHECK_REPEAT_MS until
+ * RECHECK_WINDOW_MS after the announcement, then left to the sweep. The
+ * marker travels on the live folder connection while the sender's upload
+ * opens the document's own: under an 800+ document import that upload took
+ * up to ~60s, and three re-checks (~40-57s) gave up on 18 of 80 edits.
  */
 const RECHECK_DELAYS_MS = [2_000, 5_000, 10_000];
+const RECHECK_REPEAT_MS = 15_000;
+const RECHECK_WINDOW_MS = 180_000;
 const STATS_LOG_EVERY_MS = 60_000;
 const LATENCY_SAMPLES = 200;
 
@@ -158,6 +164,8 @@ export interface PollerStats {
 	completed: number;
 	failed: number;
 	delivery: { count: number; p50Ms: number; p95Ms: number; maxMs: number };
+	/** Re-checks of announced changes scheduled so far, and those given up to the sweep. */
+	recheck: { scheduled: number; givenUp: number };
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -188,6 +196,8 @@ export class CrdtBackgroundSyncPoller {
 	private readonly deliveries: number[] = [];
 	private completed = 0;
 	private failed = 0;
+	private recheckScheduled = 0;
+	private recheckGivenUp = 0;
 	private lastStatsLogAt = 0;
 	private destroyed = false;
 
@@ -462,13 +472,16 @@ export class CrdtBackgroundSyncPoller {
 		// Not there yet (marker arrived ahead of the content, or the pull
 		// failed): try again shortly, a bounded number of times.
 		const attempt = lateAnnouncement ? 0 : pull.attempt;
-		const delay = RECHECK_DELAYS_MS[attempt];
-		if (delay === undefined) {
+		const delay = RECHECK_DELAYS_MS[attempt] ?? RECHECK_REPEAT_MS;
+		if (this.timeProvider.now() + delay - announcedAt > RECHECK_WINDOW_MS) {
+			this.recheckGivenUp++;
 			log("announced change still not visible after re-checks; leaving it to the sweep", {
 				path: pull.file.entryPath,
+				attempts: attempt + 1,
 			});
 			return;
 		}
+		this.recheckScheduled++;
 		const timer = this.timeProvider.scheduleTimeout(() => {
 			this.recheckTimers.delete(timer);
 			if (this.destroyed || !this.canQueue(pull.file)) return;
@@ -509,6 +522,7 @@ export class CrdtBackgroundSyncPoller {
 			timeouts: { ...this.timeouts },
 			completed: this.completed,
 			failed: this.failed,
+			recheck: { scheduled: this.recheckScheduled, givenUp: this.recheckGivenUp },
 			delivery: {
 				count: sorted.length,
 				p50Ms: percentile(sorted, 50),

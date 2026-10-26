@@ -59,6 +59,8 @@ export interface LaneStats {
 	queuedByShare: Record<string, number>;
 	/** Shares whose priority backlog is large enough to rank as bulk (an import). */
 	importingShares: string[];
+	/** Run time of the lane's recent items, start to settle: priority and the rest. */
+	durationMs: Record<"priority" | "bulk", { count: number; p50: number; p95: number; max: number }>;
 }
 
 export interface TransferBatch {
@@ -118,6 +120,17 @@ interface QueueLaneState {
 	readonly onItemCompleted: (group: TransferBatch) => void;
 	/** Per share, the sequence number of the last item this lane started. */
 	readonly lastServed: Map<VaultShare, number>;
+	/** How long the most recent items ran, start to settle (newest last). */
+	readonly durations: { ms: number; priority: boolean }[];
+}
+
+/** How many recent run durations `laneStats()` summarises per lane. */
+const DURATION_SAMPLES = 200;
+
+function summarise(samples: number[]): { count: number; p50: number; p95: number; max: number } {
+	const sorted = [...samples].sort((a, b) => a - b);
+	const at = (p: number) => (sorted.length === 0 ? 0 : sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)]);
+	return { count: sorted.length, p50: at(0.5), p95: at(0.95), max: sorted.length === 0 ? 0 : sorted[sorted.length - 1] };
 }
 
 /** `Math.round((part / whole) * 100)`, treating a zero-sized whole as 0% rather than NaN. */
@@ -227,6 +240,7 @@ export class TransferQueue extends Loggable {
 				group.finishedTotal++;
 			},
 			lastServed: new Map<VaultShare, number>(),
+			durations: [],
 		};
 		this.downloadLane = {
 			queue: [],
@@ -242,6 +256,7 @@ export class TransferQueue extends Loggable {
 				group.finishedTotal++;
 			},
 			lastServed: new Map<VaultShare, number>(),
+			durations: [],
 		};
 
 		this.clock.scheduleInterval(() => {
@@ -279,6 +294,10 @@ export class TransferQueue extends Loggable {
 			oldestWaitMs: now - oldest,
 			queuedByShare,
 			importingShares: [...this.importingShares(lane)].map((share) => share.path),
+			durationMs: {
+				priority: summarise(lane.durations.filter((d) => d.priority).map((d) => d.ms)),
+				bulk: summarise(lane.durations.filter((d) => !d.priority).map((d) => d.ms)),
+			},
 		};
 	}
 
@@ -408,6 +427,8 @@ export class TransferQueue extends Loggable {
 			lane.queue = lane.queue.filter((queued) => queued.entityGuid !== item.entityGuid);
 
 			item.taskStatus = "running";
+			const startedAt = this.clock.now();
+			const ranAsPriority = urgent(item);
 			lane.active.include(item);
 			lane.lastServed.set(item.vaultShare, ++this.serveSeq);
 
@@ -421,6 +442,8 @@ export class TransferQueue extends Loggable {
 						this.failQueueItem(lane, item, error);
 					})
 					.finally(() => {
+						lane.durations.push({ ms: this.clock.now() - startedAt, priority: ranAsPriority });
+						if (lane.durations.length > DURATION_SAMPLES) lane.durations.shift();
 						lane.active.delete(item);
 						lane.inFlight.delete(item.entityGuid);
 

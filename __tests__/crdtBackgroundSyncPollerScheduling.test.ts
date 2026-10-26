@@ -268,6 +268,62 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("announced text that reaches the relay a minute late is still delivered, not left to the sweep", async () => {
+		// Live under an 800+ document import: the sender's own upload took up
+		// to ~60s, the receiver gave up after three re-checks (~40-57s) and the
+		// edit waited for a sweep 650 documents long -- 18 of 80 edits never
+		// arrived within 120s.
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("s", 1, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 600_000);
+		poller.start();
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+
+		folder.announce("s-0", textFingerprint("new"));
+		for (let t = 0; t <= 90_000; t += 1_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+			while (held.length > 0) {
+				held.shift()?.resolve({ outcome: "unchanged", remoteText: t >= 60_000 ? "new" : "old" });
+				await flushPromises();
+			}
+		}
+		const { delivery } = poller.stats();
+		expect(delivery.count).toBe(1);
+		expect(delivery.maxMs).toBeGreaterThanOrEqual(60_000);
+		expect(delivery.maxMs).toBeLessThanOrEqual(75_000);
+		poller.destroy();
+	});
+
+	test("an announced change that never shows up is re-checked for a bounded window, then given up", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("s", 1, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+
+		folder.announce("s-0", textFingerprint("new"));
+		for (let t = 0; t <= 400_000; t += 1_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+			while (held.length > 0) {
+				held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+				await flushPromises();
+			}
+		}
+		const calls = pull.mock.calls.length;
+		expect(poller.stats().recheck.givenUp).toBe(1);
+		expect(poller.stats().recheck.scheduled).toBeGreaterThan(3);
+		clock.setTime(t0 + 500_000);
+		await flushPromises();
+		expect(pull.mock.calls.length).toBe(calls);
+		poller.destroy();
+	});
+
 	test("an announcement for a document already being pulled is checked against that pull's result", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
