@@ -195,6 +195,18 @@ describe("settleLostClaim", () => {
 		expect(preserved).toEqual([]);
 	});
 
+	test("started after the doc was destroyed: ends at once, no listeners", async () => {
+		const w = winnerDoc();
+		w.doc.destroy();
+		const preserved: string[] = [];
+		const result = settleLostClaim(
+			settleDeps(w, { text: "ours" }, preserved, undefined, () => !w.doc.isDestroyed),
+		);
+		await expect(result).resolves.toBe("gone");
+		expect(w.listenerCount()).toBe(0);
+		expect(preserved).toEqual([]);
+	});
+
 	test("nothing is written when the entry dies as the text lands", async () => {
 		const w = winnerDoc();
 		let alive = true;
@@ -288,6 +300,19 @@ describe("LostClaimSettler", () => {
 		await expect(Promise.all(results)).resolves.toEqual(["gone", "gone"]);
 		expect(winners.map((w) => w.listenerCount())).toEqual([0, 0]);
 		expect(settler.isPending("f0.md")).toBe(false);
+	});
+
+	test("refuses settles started after cancelAll", () => {
+		const settler = new LostClaimSettler(() => {});
+		settler.cancelAll();
+		let ran = false;
+		expect(
+			settler.start("a.md", async () => {
+				ran = true;
+			}),
+		).toBe(false);
+		expect(ran).toBe(false);
+		expect(settler.isPending("a.md")).toBe(false);
 	});
 
 	test("runs at most one settle per file", () => {

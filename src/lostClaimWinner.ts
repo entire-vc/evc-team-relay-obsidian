@@ -105,6 +105,9 @@ export interface LostClaimSettle<S> extends WinnerContentWait<S> {
 export async function settleLostClaim<S>(
 	settle: LostClaimSettle<S>,
 ): Promise<LostClaimAction | "gone"> {
+	// Started after the doc or share went away: subscribing to a destroyed
+	// doc would wait forever, its "destroy" has already fired.
+	if (!settle.isAlive()) return "gone";
 	const winner = await awaitWinnerContent(settle);
 	if (winner === undefined || !settle.isAlive()) return "gone";
 	const local = await settle.readLocal();
@@ -141,12 +144,16 @@ export async function preserveThenAdopt(steps: {
  */
 export class LostClaimSettler {
 	private readonly pending = new Map<string, AbortController>();
+	private closed = false;
 
 	constructor(private readonly onError: (key: string, e: unknown) => void) {}
 
-	/** Starts a settle for `key` unless one is running; never waits for it. */
+	/**
+	 * Starts a settle for `key` unless one is running or the settler was
+	 * cancelled; never waits for it.
+	 */
 	start(key: string, run: (signal: AbortSignal) => Promise<unknown>): boolean {
-		if (this.pending.has(key)) return false;
+		if (this.closed || this.pending.has(key)) return false;
 		const controller = new AbortController();
 		this.pending.set(key, controller);
 		void run(controller.signal)
@@ -161,8 +168,12 @@ export class LostClaimSettler {
 		return this.pending.has(key);
 	}
 
-	/** Ends every waiting settle; none of them writes anything afterwards. */
+	/**
+	 * Ends every waiting settle and refuses new ones (the share is being torn
+	 * down); none of them writes anything afterwards.
+	 */
 	cancelAll(): void {
+		this.closed = true;
 		for (const controller of this.pending.values()) controller.abort();
 		this.pending.clear();
 	}
