@@ -655,6 +655,26 @@ export class WebSyncManager {
 		}, Math.max(0, fireAt - now));
 	}
 
+	/** After a 429/5xx: hold every push for this share until Retry-After or the backoff delay, then retry. */
+	private backOffFolderItemsPush(folderPath: string, state: FolderItemsPushState, error: unknown): void {
+		state.failures++;
+		const retryAfterMs = error instanceof RelayHttpError ? error.retryAfterMs : undefined;
+		// A server-sent Retry-After is honoured as is; the cap only
+		// bounds our own exponential fallback.
+		const delay = retryAfterMs ?? Math.min(
+			FOLDER_ITEMS_BACKOFF_BASE_MS * 2 ** (state.failures - 1),
+			FOLDER_ITEMS_BACKOFF_MAX_MS,
+		);
+		state.notBefore = Date.now() + delay;
+		state.dirty = true;
+		if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+		log("Transient failure updating web_folder_items, backing off", {
+			folderPath,
+			delayMs: delay,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+
 	private async flushFolderItemsPush(folderPath: string, state: FolderItemsPushState): Promise<void> {
 		// Unregistered (or re-registered as another share) since scheduling.
 		if (this.folderItemsPush.get(folderPath) !== state) return;
@@ -676,22 +696,7 @@ export class WebSyncManager {
 			log("Updated web_folder_items", { folderPath, itemCount: items.length });
 		} catch (error: unknown) {
 			if (isTransientRelayFailure(error)) {
-				state.failures++;
-				const retryAfterMs = error instanceof RelayHttpError ? error.retryAfterMs : undefined;
-				// A server-sent Retry-After is honoured as is; the cap only
-				// bounds our own exponential fallback.
-				const delay = retryAfterMs ?? Math.min(
-					FOLDER_ITEMS_BACKOFF_BASE_MS * 2 ** (state.failures - 1),
-					FOLDER_ITEMS_BACKOFF_MAX_MS,
-				);
-				state.notBefore = Date.now() + delay;
-				state.dirty = true;
-				if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
-				log("Transient failure updating web_folder_items, backing off", {
-					folderPath,
-					delayMs: delay,
-					error: error instanceof Error ? error.message : String(error),
-				});
+				this.backOffFolderItemsPush(folderPath, state, error);
 			} else {
 				// Not retried; the next change in the folder pushes again.
 				log("Failed to update web_folder_items", {
@@ -736,6 +741,20 @@ export class WebSyncManager {
 				log("Folder structure already up to date on web", { folderPath });
 				return null;
 			}
+			const backoffLeft = state.notBefore - Date.now();
+			if (backoffLeft > 0) {
+				// The server asked us to back off. Don't wait it out here (callers
+				// hold the outbound echo-guard, which pauses inbound sync); leave
+				// the retry to the scheduler and fail this call without a PATCH.
+				state.dirty = true;
+				if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+				if (state.timer === null) this.armFolderItemsTimer(folderPath, state);
+				throw new RelayHttpError(
+					429,
+					`Folder structure push deferred: server asked to retry in ${Math.ceil(backoffLeft / 1000)}s`,
+					backoffLeft,
+				);
+			}
 			const wait = this.folderItemsReadyAt(state) - Date.now();
 			if (wait <= 0) break;
 			await new Promise<void>((resolve) => window.setTimeout(resolve, wait));
@@ -743,6 +762,11 @@ export class WebSyncManager {
 		let share: RelayOnPremShare;
 		try {
 			share = await this.sendFolderItems(state, serverId, items, JSON.stringify(items));
+		} catch (error: unknown) {
+			// Same backoff as scheduled pushes, so neither this caller nor the
+			// scheduler sends again before Retry-After; the error still surfaces.
+			if (isTransientRelayFailure(error)) this.backOffFolderItemsPush(folderPath, state, error);
+			throw error;
 		} finally {
 			if (state.dirty && this.folderItemsPush.get(folderPath) === state) {
 				this.armFolderItemsTimer(folderPath, state);

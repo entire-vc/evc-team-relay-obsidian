@@ -221,6 +221,31 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(updateShare).toHaveBeenCalledTimes(2);
 	});
 
+	test("a 429 on a manual sync holds every later push until Retry-After", async () => {
+		addFile(folder, "a.md");
+		updateShare.mockRejectedValueOnce(
+			new RelayHttpError(429, "Failed to update share: 429 Too Many Requests", 120_000),
+		);
+		await expect(manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1")).rejects.toThrow("429");
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		// Inside the backoff a manual sync fails at once (callers hold the
+		// echo-guard, so it must not sit out a long Retry-After) and sends nothing.
+		await jest.advanceTimersByTimeAsync(40_000);
+		manager.onFileCreated(addFile(folder, "b.md"));
+		await expect(manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1")).rejects.toThrow("retry in 80s");
+		await jest.advanceTimersByTimeAsync(60_000);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		// The scheduler retries once the Retry-After has passed.
+		await jest.advanceTimersByTimeAsync(25_000);
+		expect(updateShare).toHaveBeenCalledTimes(2);
+		expect(lastItems(updateShare)).toHaveLength(2);
+
+		await jest.advanceTimersByTimeAsync(60_000);
+		expect(updateShare).toHaveBeenCalledTimes(2);
+	});
+
 	test("a manual structure sync waits for an in-flight push and counts as the last push", async () => {
 		let release!: () => void;
 		updateShare.mockImplementationOnce(
