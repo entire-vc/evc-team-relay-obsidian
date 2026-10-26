@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.10
+- Fixed: an edit to a closed note in one shared folder now reaches other devices within seconds even while another shared folder is syncing hundreds of notes in the background. Background sync speed is unchanged.
+
 ## 0.1.9
 - Fixed: a note created or edited while closed is sent within seconds even right after Obsidian starts, when large shared folders still have hundreds of notes queued. Busy folders no longer hold up notes in other folders.
 - Fixed: a new note from another device that arrived on the server a little late is now written to disk without restarting Obsidian.
