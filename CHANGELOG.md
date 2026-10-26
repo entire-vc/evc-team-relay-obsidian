@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.6
+- Fixed: deleting the last note (or every note at once) in a shared folder on one device now removes it on the other devices too. A newly shared, still-empty folder still keeps your existing local notes.
+
 ## 0.1.5
 - Web-published folders: updates to the folder's page list are now batched instead of sent on every file event. Syncing many notes into a published folder at once no longer floods the server with requests. Failed updates back off and respect the server's `Retry-After`.
 
