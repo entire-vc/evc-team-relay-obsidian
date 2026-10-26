@@ -57,6 +57,8 @@ export interface LaneStats {
 	active: number;
 	oldestWaitMs: number;
 	queuedByShare: Record<string, number>;
+	/** Shares whose priority backlog is large enough to rank as bulk (an import). */
+	importingShares: string[];
 }
 
 export interface TransferBatch {
@@ -171,6 +173,14 @@ const SLOW_REFETCH_MS = 5 * 60 * 1000;
  * behind ~50 of them for minutes after a restart.
  */
 const PRIORITY_RESERVED_SLOTS = 1;
+/**
+ * A share with more priority items than this queued or running in a lane is
+ * importing (notes written while their docs were offline are all queued as
+ * priority), and its items rank as bulk. Measured live on 0.1.11: an import of
+ * 700 such notes shared every slot with another share's edits on equal terms,
+ * and those edits queued for minutes.
+ */
+const PRIORITY_IMPORT_BACKLOG = 8;
 const LANE_STATS_LOG_EVERY_MS = 60_000;
 
 export class TransferQueue extends Loggable {
@@ -268,7 +278,21 @@ export class TransferQueue extends Loggable {
 			active: lane.active.count,
 			oldestWaitMs: now - oldest,
 			queuedByShare,
+			importingShares: [...this.importingShares(lane)].map((share) => share.path),
 		};
+	}
+
+	/** Shares whose priority backlog in `lane` exceeds PRIORITY_IMPORT_BACKLOG. */
+	private importingShares(lane: QueueLaneState): Set<VaultShare> {
+		const counts = new Map<VaultShare, number>();
+		const count = (item: TransferTask) => {
+			if (item.priority) counts.set(item.vaultShare, (counts.get(item.vaultShare) ?? 0) + 1);
+		};
+		lane.queue.forEach(count);
+		lane.active.each(count);
+		const importing = new Set<VaultShare>();
+		for (const [share, n] of counts) if (n > PRIORITY_IMPORT_BACKLOG) importing.add(share);
+		return importing;
 	}
 
 	private maybeLogLaneStats(): void {
@@ -365,6 +389,8 @@ export class TransferQueue extends Loggable {
 		const runnable = lane.queue.filter((item) => item.vaultShare.isOnline);
 
 		while (runnable.length > 0) {
+			const importing = this.importingShares(lane);
+			const urgent = (queued: TransferTask) => queued.priority && !importing.has(queued.vaultShare);
 			let candidates = runnable;
 			if (lane.active.count >= this.laneLimit) {
 				// Reserved slots: priority work from a share with no priority item
@@ -373,10 +399,10 @@ export class TransferQueue extends Loggable {
 				// hold them too, and an edit in another share would wait for one of
 				// its uploads to finish.
 				if (lane.active.count >= this.laneLimit + PRIORITY_RESERVED_SLOTS) break;
-				candidates = runnable.filter((queued) => queued.priority && !this.hasActivePriority(lane, queued.vaultShare));
+				candidates = runnable.filter((queued) => urgent(queued) && !this.hasActivePriority(lane, queued.vaultShare));
 				if (candidates.length === 0) break;
 			}
-			const item = this.nextRunnable(lane, candidates);
+			const item = this.nextRunnable(lane, candidates, urgent);
 
 			runnable.splice(runnable.indexOf(item), 1);
 			lane.queue = lane.queue.filter((queued) => queued.entityGuid !== item.entityGuid);
@@ -424,21 +450,26 @@ export class TransferQueue extends Loggable {
 	}
 
 	/**
-	 * Picks the next item to start: priority items before bulk ones; within
+	 * Picks the next item to start: urgent items (priority, outside an import)
+	 * before the rest; within
 	 * that class the share with the fewest running items in this lane, then
 	 * the one served longest ago; within the share, the oldest item. A plain
 	 * path-sorted FIFO let one large share hold every slot while a small
 	 * share's single note waited for the whole backlog.
 	 */
-	private nextRunnable(lane: QueueLaneState, runnable: TransferTask[]): TransferTask {
-		const urgent = runnable.some((item) => item.priority);
+	private nextRunnable(
+		lane: QueueLaneState,
+		runnable: TransferTask[],
+		isUrgent: (item: TransferTask) => boolean,
+	): TransferTask {
+		const urgent = runnable.some(isUrgent);
 		const activeByShare = new Map<VaultShare, number>();
 		lane.active.each((item) => {
 			activeByShare.set(item.vaultShare, (activeByShare.get(item.vaultShare) ?? 0) + 1);
 		});
 		let best: TransferTask | undefined;
 		for (const item of runnable) {
-			if (urgent && !item.priority) continue;
+			if (urgent && !isUrgent(item)) continue;
 			if (!best) {
 				best = item;
 				continue;

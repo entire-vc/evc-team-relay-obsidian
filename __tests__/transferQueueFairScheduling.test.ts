@@ -179,6 +179,54 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		expect(started).toHaveLength(3);
 	});
 
+	test("an edit trickle isn't held behind an import that is also priority", async () => {
+		// Live on 0.1.11: an import queued all its uploads as priority, so it
+		// shared every regular slot with another share's edits on equal terms;
+		// with each upload taking ~20s under that load, the edits (one every
+		// few seconds) queued up for minutes behind their own share's single
+		// slot. A share with a large priority backlog now ranks as bulk.
+		const big = makeShare("Big");
+		const small = makeShare("Small");
+		queue.suspend();
+		for (let i = 0; i < 20; i++) void queue.enqueueUpload(makeDoc(big, `doc-${i}.md`), { priority: true });
+		clock.time += 10;
+		for (let i = 0; i < 3; i++) void queue.enqueueUpload(makeDoc(small, `edit-${i}.md`), { priority: true });
+		queue.wake();
+		await flushMacrotasks();
+		expect(started.filter((guid) => guid.startsWith("Small:"))).toEqual([
+			"Small:edit-0.md",
+			"Small:edit-1.md",
+			"Small:edit-2.md",
+		]);
+		// The import doesn't take the reserved slot either.
+		expect(started).toHaveLength(3);
+	});
+
+	test("an importing share gets slots back once its backlog is small", async () => {
+		const big = makeShare("Big");
+		for (let i = 0; i < 12; i++) void queue.enqueueUpload(makeDoc(big, `doc-${i}.md`), { priority: true });
+		await flushMacrotasks();
+		expect(started).toHaveLength(3);
+		for (let round = 0; round < 6; round++) {
+			for (const guid of [...finish.keys()]) {
+				const done = finish.get(guid);
+				finish.delete(guid);
+				done?.();
+			}
+			await flushMacrotasks();
+		}
+		expect(started).toHaveLength(12);
+	});
+
+	test("laneStats() names shares whose priority backlog ranks as an import", async () => {
+		const big = makeShare("Big");
+		const small = makeShare("Small");
+		for (let i = 0; i < 12; i++) void queue.enqueueUpload(makeDoc(big, `doc-${i}.md`), { priority: true });
+		void queue.enqueueUpload(makeDoc(small, "edit.md"), { priority: true });
+		await flushMacrotasks();
+		expect(queue.laneStats().uploads.importingShares).toEqual(["Big"]);
+	});
+
 	test("priority items run before bulk ones of the same share", async () => {
 		const share = makeShare("S");
 		queue.suspend();
