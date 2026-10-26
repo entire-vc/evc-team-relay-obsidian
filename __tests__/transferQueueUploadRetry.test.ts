@@ -68,6 +68,7 @@ function makeShare(path: string): VaultShare {
 		path,
 		isOnline: true,
 		workspaceId: "ws",
+		trackedEntries: new Map(),
 		absolutePath: (vpath: string) => `${path}/${vpath}`,
 	} as unknown as VaultShare;
 }
@@ -77,6 +78,7 @@ function makeDoc(share: VaultShare, name: string): Document {
 	Object.defineProperty(doc, "entryPath", { value: name });
 	Object.defineProperty(doc, "entityGuid", { value: `${share.path}:${name}` });
 	Object.defineProperty(doc, "vaultShare", { value: share });
+	share.trackedEntries.set(doc.entityGuid, doc);
 	return doc;
 }
 
@@ -167,6 +169,31 @@ describe("TransferQueue — uploads that didn't land are sent again", () => {
 			await flushMacrotasks();
 		}
 		expect(started.filter((guid) => guid === docs[4].entityGuid)).toHaveLength(1);
+	});
+
+	test("a note deleted before its retry is due isn't uploaded again", async () => {
+		const share = makeShare("A");
+		const doc = makeDoc(share, "note.md");
+		void queue.enqueueUpload(doc);
+		await flushMacrotasks();
+		finish.get(doc.entityGuid)?.(false);
+		await flushMacrotasks();
+		share.trackedEntries.delete(doc.entityGuid);
+		await clock.advance(2_000);
+		expect(started).toHaveLength(1);
+		expect(queue.laneStats().uploads.retries).toMatchObject({ retried: 0, pending: 0 });
+	});
+
+	test("an upload that throws doesn't leave a retry behind", async () => {
+		const doc = makeDoc(makeShare("A"), "note.md");
+		void queue.enqueueUpload(doc);
+		await flushMacrotasks();
+		finish.get(doc.entityGuid)?.(false);
+		await flushMacrotasks();
+		jest.spyOn(queue, "uploadDocumentViaSocket").mockRejectedValueOnce(new Error("boom"));
+		jest.spyOn(console, "error").mockImplementation(() => {});
+		await clock.advance(2_000);
+		expect(queue.laneStats().uploads.retries.pending).toBe(0);
 	});
 
 	test("shutdown() cancels pending retries", async () => {

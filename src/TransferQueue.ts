@@ -1795,6 +1795,7 @@ export class TransferQueue extends Loggable {
 			}
 		} catch (e: unknown) {
 			console.error(e);
+			this.clearUploadRetry(doc.entityGuid);
 			return;
 		}
 	}
@@ -1805,9 +1806,9 @@ export class TransferQueue extends Loggable {
 	 */
 	private scheduleUploadRetry(doc: Document | CanvasDocument, priority: boolean): void {
 		if (!this.clock) return;
-		this.uploadRetryStats.failed++;
 		const retry = this.uploadRetries.get(doc.entityGuid) ?? { attempt: 0 };
 		if (retry.timer !== undefined) return;
+		this.uploadRetryStats.failed++;
 		const delay = UPLOAD_RETRY_DELAYS_MS[retry.attempt];
 		if (delay === undefined) {
 			this.uploadRetries.delete(doc.entityGuid);
@@ -1819,6 +1820,13 @@ export class TransferQueue extends Loggable {
 		retry.timer = this.clock.scheduleTimeout(() => {
 			retry.timer = undefined;
 			if (!this.clock) return;
+			// Deleted, renamed away or its share went offline meanwhile: the
+			// share's own reconnect or next pass covers what is still there.
+			const share = doc.vaultShare;
+			if (share.trackedEntries?.get(doc.entityGuid) !== doc || !share.isOnline) {
+				this.uploadRetries.delete(doc.entityGuid);
+				return;
+			}
 			this.uploadRetryStats.retried++;
 			void this.enqueueUpload(doc, { priority }).catch((error: unknown) =>
 				this.warn("[uploadRetry] failed for", doc.entryPath, error),

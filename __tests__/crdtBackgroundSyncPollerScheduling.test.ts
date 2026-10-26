@@ -665,6 +665,52 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("a fresh edit takes the express slot back from a late re-check", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const bulk = makeFolder("bulk", 0, pull, 3);
+		const notes = makeFolder("notes", 0, pull, 3);
+		const other = makeFolder("other", 0, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([bulk, notes, other]) as never, 3_600_000);
+		poller.start();
+		for (let i = 0; i < 100; i++) {
+			bulk.trackedEntries.set(`bulk-${i}`, {
+				__isDocument: true,
+				isOnline: false,
+				entityGuid: `bulk-${i}`,
+				entryPath: `bulk/${i}.md`,
+			});
+			bulk.announce(`bulk-${i}`, textFingerprint(`created ${i}`));
+		}
+		notes.trackedEntries.set("note", { __isDocument: true, isOnline: false, entityGuid: "note", entryPath: "notes/note.md" });
+		other.trackedEntries.set("edit", { __isDocument: true, isOnline: false, entityGuid: "edit", entryPath: "other/edit.md" });
+		notes.announce("note", textFingerprint("edited"));
+		await flushPromises();
+		const notePulls = () => startedGuids(pull).filter((guid) => guid === "note").length;
+		// Settle the note's quick re-checks; its late one (the 5th pull) stays held.
+		for (let t = 0; t <= 40_000 && notePulls() < 5; t += 1_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+			for (let i = held.length - 1; i >= 0; i--) {
+				if (held[i].file.entityGuid !== "note" || notePulls() >= 5) continue;
+				const [note] = held.splice(i, 1);
+				note.resolve({ outcome: "unchanged", remoteText: "old" });
+				await flushPromises();
+			}
+		}
+		expect(notePulls()).toBe(5);
+		const lateNote = held.find((h) => h.file.entityGuid === "note");
+		expect(poller.stats().express).toBe(1);
+
+		other.announce("edit", textFingerprint("typed"));
+		await flushPromises();
+		expect(startedGuids(pull)).toContain("edit");
+		expect(lateNote?.control.signal?.aborted).toBe(true);
+		expect(poller.stats().preempted).toBe(1);
+		expect(poller.stats().inflight).toBe(4);
+		poller.destroy();
+	});
+
 	test("one express pull at a time; regular slots stay at laneLimit", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
