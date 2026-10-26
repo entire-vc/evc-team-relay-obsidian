@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9
+- Fixed: a note created or edited while closed is sent within seconds even right after Obsidian starts, when large shared folders still have hundreds of notes queued. Busy folders no longer hold up notes in other folders.
+- Fixed: a new note from another device that arrived on the server a little late is now written to disk without restarting Obsidian.
+
 ## 0.1.8
 - Fixed: a published folder that receives many new or changed notes at once (for example a large first sync) no longer floods the server with updates. Its web index is now refreshed at most once every 30 seconds, always with the latest list, and the plugin backs off when the server asks it to slow down.
 - Fixed: a background retry or reconnect that fires after a note has been removed from a shared folder no longer throws an error.
