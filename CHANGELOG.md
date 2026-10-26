@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.7
+- Fixed: edits to notes that are closed on another device now arrive within seconds even in large vaults with several shared folders. A stalled background check can no longer block the others, and busy folders no longer delay updates in small ones.
+
 ## 0.1.6
 - Fixed: deleting the last note (or every note at once) in a shared folder on one device now removes it on the other devices too. A newly shared, still-empty folder still keeps your existing local notes.
 
