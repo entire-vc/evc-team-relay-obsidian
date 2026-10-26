@@ -8,6 +8,7 @@ import { Notice, TFile, Vault, debounce } from "obsidian";
 import { RelayOnPremShareClientManager } from "./RelayOnPremShareClientManager";
 import type { WebFolderEntry } from "./RelayOnPremShareClient";
 import { namedLogger } from "./logging";
+import { RelayHttpError, isTransientRelayFailure } from "./relayRequestErrors";
 import {
 	collectWebFolderItems,
 	isPathWithinFolder,
@@ -23,6 +24,35 @@ const log = namedLogger("[WebSyncManager]");
 // them instead. Matches the extension set getFolderItems() already tracks
 // in the folder's web index below.
 const SYNCABLE_FOLDER_FILE_EXTENSIONS = new Set(["md", "canvas"]);
+
+// web_folder_items pushes (PATCH /v1/shares/{id} with the folder's full item
+// list) are coalesced per folder share: a background pull of N
+// documents fires N create events, and pushing on each one sent N PATCHes
+// with an O(N) body, enough to overload the server. Pushes
+// now wait for a quiet period (capped by a max wait so a long pull still
+// publishes progress), run at most one at a time per share with the latest
+// state winning, skip lists identical to the last one the server accepted,
+// and back off on 429/5xx instead of retrying in a loop.
+const FOLDER_ITEMS_DEBOUNCE_MS = 3000;
+const FOLDER_ITEMS_MAX_WAIT_MS = 30_000;
+const FOLDER_ITEMS_BACKOFF_BASE_MS = 5000;
+const FOLDER_ITEMS_BACKOFF_MAX_MS = 300_000;
+
+interface FolderItemsPushState {
+	shareId: string;
+	timer: number | null;
+	// When the oldest unsent change arrived; bounds how long a steady stream
+	// of events can keep postponing the push.
+	firstPendingAt: number | null;
+	// The PATCH currently running for this share (scheduled or manual), if any.
+	inFlight: Promise<void> | null;
+	dirty: boolean;
+	// JSON of the last item list the server accepted for this share.
+	lastSentFingerprint: string | null;
+	// Backoff gate after a 429/5xx: no push before this time.
+	notBefore: number;
+	failures: number;
+}
 
 interface ShareInfo {
 	shareId: string;
@@ -88,6 +118,9 @@ export class WebSyncManager {
 	// TFolder, which syncFile() rejects — the rate-limited edit is silently lost).
 	private debouncedFolderFileSyncMap: Map<string, () => void> = new Map();
 
+	// Coalesced web_folder_items push state per folder share, keyed by folder path.
+	private folderItemsPush: Map<string, FolderItemsPushState> = new Map();
+
 	constructor(
 		vault: Vault,
 		clientManager: RelayOnPremShareClientManager
@@ -115,6 +148,11 @@ export class WebSyncManager {
 			webSlug,
 		});
 
+		const pushState = this.folderItemsPush.get(filePath);
+		if (pushState && (kind !== "folder" || pushState.shareId !== shareId)) {
+			this.dropFolderItemsPush(filePath);
+		}
+
 		// Create debounced sync function for this file/folder
 		if (!this.debouncedSyncMap.has(filePath)) {
 			this.debouncedSyncMap.set(
@@ -135,6 +173,7 @@ export class WebSyncManager {
 		log("Unregistering auto-sync share", { filePath });
 		this.autoSyncShares.delete(filePath);
 		this.debouncedSyncMap.delete(filePath);
+		this.dropFolderItemsPush(filePath);
 		for (const key of Array.from(this.debouncedFolderFileSyncMap.keys())) {
 			if (key === filePath || isPathWithinFolder(key, filePath)) {
 				this.debouncedFolderFileSyncMap.delete(key);
@@ -383,34 +422,20 @@ export class WebSyncManager {
 	/**
 	 * Handle file creation — update web_folder_items for affected folder shares
 	 */
-	async onFileCreated(file: TFile): Promise<void> {
+	onFileCreated(file: TFile): void {
 		for (const [folderPath, shareInfo] of this.autoSyncShares.entries()) {
 			if (shareInfo.kind !== "folder") continue;
 			if (!isPathWithinFolder(file.path, folderPath)) continue;
 
-			log("File created in auto-sync folder, updating web_folder_items", {
+			// Only md/canvas files appear in web_folder_items.
+			if (!SYNCABLE_FOLDER_FILE_EXTENSIONS.has(file.extension)) return;
+
+			log("File created in auto-sync folder, scheduling web_folder_items update", {
 				filePath: file.path,
 				folderPath,
 				shareId: shareInfo.shareId,
 			});
-
-			try {
-				const items = this.getFolderItems(folderPath);
-				await this.clientManager.updateShare(
-					shareInfo.serverId,
-					shareInfo.shareId,
-					{ web_folder_items: items }
-				);
-				log("Updated web_folder_items after creation", {
-					folderPath,
-					itemCount: items.length,
-				});
-			} catch (error: unknown) {
-				log("Failed to update web_folder_items after creation", {
-					filePath: file.path,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
+			this.scheduleFolderItemsPush(folderPath, shareInfo);
 			return;
 		}
 	}
@@ -418,7 +443,7 @@ export class WebSyncManager {
 	/**
 	 * Handle file rename — update web_folder_items for affected folder shares
 	 */
-	async onFileRenamed(newPath: string, oldPath: string): Promise<void> {
+	onFileRenamed(newPath: string, oldPath: string): void {
 		for (const [folderPath, shareInfo] of this.autoSyncShares.entries()) {
 			if (shareInfo.kind !== "folder") continue;
 			// File moved into, out of, or within this folder
@@ -427,31 +452,13 @@ export class WebSyncManager {
 				!isPathWithinFolder(oldPath, folderPath)
 			) continue;
 
-			log("File renamed in auto-sync folder, updating web_folder_items", {
+			log("File renamed in auto-sync folder, scheduling web_folder_items update", {
 				oldPath,
 				newPath,
 				folderPath,
 				shareId: shareInfo.shareId,
 			});
-
-			try {
-				const items = this.getFolderItems(folderPath);
-				await this.clientManager.updateShare(
-					shareInfo.serverId,
-					shareInfo.shareId,
-					{ web_folder_items: items }
-				);
-				log("Updated web_folder_items after rename", {
-					folderPath,
-					itemCount: items.length,
-				});
-			} catch (error: unknown) {
-				log("Failed to update web_folder_items after rename", {
-					oldPath,
-					newPath,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
+			this.scheduleFolderItemsPush(folderPath, shareInfo);
 			// Don't return early — file could affect multiple folder shares (moved between)
 		}
 
@@ -480,34 +487,17 @@ export class WebSyncManager {
 	/**
 	 * Handle file deletion — update web_folder_items for affected folder shares
 	 */
-	async onFileDeleted(filePath: string): Promise<void> {
+	onFileDeleted(filePath: string): void {
 		for (const [folderPath, shareInfo] of this.autoSyncShares.entries()) {
 			if (shareInfo.kind !== "folder") continue;
 			if (!isPathWithinFolder(filePath, folderPath)) continue;
 
-			log("File deleted from auto-sync folder, updating web_folder_items", {
+			log("File deleted from auto-sync folder, scheduling web_folder_items update", {
 				filePath,
 				folderPath,
 				shareId: shareInfo.shareId,
 			});
-
-			try {
-				const items = this.getFolderItems(folderPath);
-				await this.clientManager.updateShare(
-					shareInfo.serverId,
-					shareInfo.shareId,
-					{ web_folder_items: items }
-				);
-				log("Updated web_folder_items after deletion", {
-					folderPath,
-					itemCount: items.length,
-				});
-			} catch (error: unknown) {
-				log("Failed to update web_folder_items after deletion", {
-					filePath,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
+			this.scheduleFolderItemsPush(folderPath, shareInfo);
 			return;
 		}
 
@@ -575,6 +565,140 @@ export class WebSyncManager {
 	}
 
 	/**
+	 * Mark a folder share's web_folder_items as changed and (re)arm its push
+	 * timer. The push itself happens in flushFolderItemsPush().
+	 */
+	private scheduleFolderItemsPush(folderPath: string, shareInfo: ShareInfo): void {
+		const state = this.getFolderItemsPushState(folderPath, shareInfo.shareId);
+		state.dirty = true;
+		if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+		// An in-flight push re-arms the timer when it settles.
+		if (state.inFlight !== null) return;
+		this.armFolderItemsTimer(folderPath, state);
+	}
+
+	private getFolderItemsPushState(folderPath: string, shareId: string): FolderItemsPushState {
+		let state = this.folderItemsPush.get(folderPath);
+		if (state && state.shareId !== shareId) {
+			this.dropFolderItemsPush(folderPath);
+			state = undefined;
+		}
+		if (!state) {
+			state = {
+				shareId,
+				timer: null,
+				firstPendingAt: null,
+				inFlight: null,
+				dirty: false,
+				lastSentFingerprint: null,
+				notBefore: 0,
+				failures: 0,
+			};
+			this.folderItemsPush.set(folderPath, state);
+		}
+		return state;
+	}
+
+	/**
+	 * Run one web_folder_items PATCH as this share's single in-flight request,
+	 * recording the accepted list on success. Callers must check
+	 * state.inFlight first.
+	 */
+	private async sendFolderItems(
+		state: FolderItemsPushState,
+		serverId: string,
+		items: WebFolderEntry[],
+		fingerprint: string,
+	): Promise<void> {
+		const request = this.clientManager.updateShare(serverId, state.shareId, {
+			web_folder_items: items,
+		});
+		state.inFlight = request.then(
+			() => undefined,
+			() => undefined,
+		);
+		try {
+			await request;
+			state.lastSentFingerprint = fingerprint;
+			state.failures = 0;
+		} finally {
+			state.inFlight = null;
+		}
+	}
+
+	private armFolderItemsTimer(folderPath: string, state: FolderItemsPushState): void {
+		const now = Date.now();
+		const trailing = Math.min(
+			now + FOLDER_ITEMS_DEBOUNCE_MS,
+			(state.firstPendingAt ?? now) + FOLDER_ITEMS_MAX_WAIT_MS,
+		);
+		const fireAt = Math.max(trailing, state.notBefore);
+		if (state.timer !== null) window.clearTimeout(state.timer);
+		state.timer = window.setTimeout(() => {
+			state.timer = null;
+			void this.flushFolderItemsPush(folderPath, state);
+		}, Math.max(0, fireAt - now));
+	}
+
+	private async flushFolderItemsPush(folderPath: string, state: FolderItemsPushState): Promise<void> {
+		// Unregistered (or re-registered as another share) since scheduling.
+		if (this.folderItemsPush.get(folderPath) !== state) return;
+		const shareInfo = this.autoSyncShares.get(folderPath);
+		if (!shareInfo || shareInfo.kind !== "folder") return;
+		if (state.inFlight !== null || !state.dirty) return;
+
+		const items = this.getFolderItems(folderPath);
+		const fingerprint = JSON.stringify(items);
+		state.dirty = false;
+		state.firstPendingAt = null;
+		if (fingerprint === state.lastSentFingerprint) {
+			log("web_folder_items unchanged since last push, skipping", { folderPath });
+			return;
+		}
+
+		try {
+			await this.sendFolderItems(state, shareInfo.serverId, items, fingerprint);
+			log("Updated web_folder_items", { folderPath, itemCount: items.length });
+		} catch (error: unknown) {
+			if (isTransientRelayFailure(error)) {
+				state.failures++;
+				const retryAfterMs = error instanceof RelayHttpError ? error.retryAfterMs : undefined;
+				// A server-sent Retry-After is honoured as is; the cap only
+				// bounds our own exponential fallback.
+				const delay = retryAfterMs ?? Math.min(
+					FOLDER_ITEMS_BACKOFF_BASE_MS * 2 ** (state.failures - 1),
+					FOLDER_ITEMS_BACKOFF_MAX_MS,
+				);
+				state.notBefore = Date.now() + delay;
+				state.dirty = true;
+				if (state.firstPendingAt === null) state.firstPendingAt = Date.now();
+				log("Transient failure updating web_folder_items, backing off", {
+					folderPath,
+					delayMs: delay,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			} else {
+				// Not retried; the next change in the folder pushes again.
+				log("Failed to update web_folder_items", {
+					folderPath,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		} finally {
+			if (state.dirty && this.folderItemsPush.get(folderPath) === state) {
+				this.armFolderItemsTimer(folderPath, state);
+			}
+		}
+	}
+
+	private dropFolderItemsPush(folderPath: string): void {
+		const state = this.folderItemsPush.get(folderPath);
+		if (!state) return;
+		if (state.timer !== null) window.clearTimeout(state.timer);
+		this.folderItemsPush.delete(folderPath);
+	}
+
+	/**
 	 * Sync folder structure (web_folder_items) to web for a specific share.
 	 * Called from context menu "Sync" to ensure deleted files are reflected on web-publish.
 	 */
@@ -583,10 +707,18 @@ export class WebSyncManager {
 		serverId: string,
 		shareId: string,
 	): Promise<void> {
+		// Shares the scheduler's state so a manual sync never overlaps an
+		// event-driven PATCH and later unchanged events see what it sent.
+		const state = this.getFolderItemsPushState(folderPath, shareId);
+		while (state.inFlight !== null) await state.inFlight;
 		const items = this.getFolderItems(folderPath);
-		await this.clientManager.updateShare(serverId, shareId, {
-			web_folder_items: items,
-		});
+		try {
+			await this.sendFolderItems(state, serverId, items, JSON.stringify(items));
+		} finally {
+			if (state.dirty && this.folderItemsPush.get(folderPath) === state) {
+				this.armFolderItemsTimer(folderPath, state);
+			}
+		}
 		log("Synced folder structure to web", { folderPath, itemCount: items.length });
 	}
 
@@ -611,6 +743,9 @@ export class WebSyncManager {
 		log("Destroying WebSyncManager");
 		this.autoSyncShares.clear();
 		this.debouncedSyncMap.clear();
+		for (const folderPath of Array.from(this.folderItemsPush.keys())) {
+			this.dropFolderItemsPush(folderPath);
+		}
 		this.debouncedFolderFileSyncMap.clear();
 	}
 }

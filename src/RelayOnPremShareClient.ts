@@ -6,7 +6,7 @@
 
 import { namedLogger } from "./logging";
 import { platformFetch } from "./platformFetch";
-import { RelayHttpError } from "./relayRequestErrors";
+import { RelayHttpError, parseRetryAfterMs } from "./relayRequestErrors";
 
 const log = namedLogger("[RelayOnPremShareClient]");
 
@@ -477,7 +477,11 @@ export class RelayOnPremShareClient {
 					const visError = RelayOnPremShareClient.parseVisibilityNotAllowedError(errorText);
 					if (visError) throw new VisibilityNotAllowedApiError(visError);
 				}
-				throw new Error(`Failed to update share: ${response.status} ${errorText}`);
+				throw new RelayHttpError(
+					response.status,
+					`Failed to update share: ${response.status} ${errorText}`,
+					parseRetryAfterMs(response.headers.get("Retry-After")),
+				);
 			}
 
 			const share = await response.json() as RelayOnPremShare;

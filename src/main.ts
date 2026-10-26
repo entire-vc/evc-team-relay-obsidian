@@ -1245,7 +1245,7 @@ export default class TeamRelayPlugin extends Plugin {
 			movedVaultShare.relocate(file.path);
 			this.shareRegistry.notifyDebounced();
 			// Update web_folder_items for auto-sync folder shares
-			void this.webSyncManager?.onFileRenamed(file.path, oldPath);
+			this.webSyncManager?.onFileRenamed(file.path, oldPath);
 			return;
 		}
 
@@ -1267,7 +1267,7 @@ export default class TeamRelayPlugin extends Plugin {
 			}
 		}
 		// Update web_folder_items for auto-sync folder shares
-		void this.webSyncManager?.onFileRenamed(file.path, oldPath);
+		this.webSyncManager?.onFileRenamed(file.path, oldPath);
 	}
 
 	private async loadRelayOnPremShares() {
@@ -1926,7 +1926,7 @@ export default class TeamRelayPlugin extends Plugin {
 				}
 				// Update web_folder_items for auto-sync folder shares
 				if (this.webSyncManager && tfile instanceof TFile) {
-					void this.webSyncManager.onFileCreated(tfile);
+					this.webSyncManager.onFileCreated(tfile);
 				}
 			}),
 		);
@@ -1954,7 +1954,7 @@ export default class TeamRelayPlugin extends Plugin {
 					});
 				}
 				// Update web_folder_items for auto-sync folder shares
-				void this.webSyncManager?.onFileDeleted(file.path);
+				this.webSyncManager?.onFileDeleted(file.path);
 			}),
 		);
 
