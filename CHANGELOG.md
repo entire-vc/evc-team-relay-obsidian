@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.12
+- Fixed: while one shared folder imports a large batch of notes, edits to closed notes in other shared folders are sent first instead of waiting their turn behind the import.
+
 ## 0.1.11
 - Fixed: an edit to a closed note in one shared folder is no longer held up while another shared folder uploads a large batch of notes (for example an import of hundreds of notes).
 - Fixed: when two members add the same note to a shared folder at the same time, no identical "(upload race …)" copy is created anymore.
