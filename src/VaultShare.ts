@@ -78,11 +78,7 @@ import {
 	hasUnsyncedEdit,
 	hasUnsyncedCanvasEdit,
 } from "./preserveBeforeTrash";
-import {
-	LOST_CLAIM_WINNER_WAIT_MS,
-	LostClaimSettler,
-	settleLostClaim,
-} from "./lostClaimWinner";
+import { LostClaimSettler, preserveThenAdopt, settleLostClaim } from "./lostClaimWinner";
 import type { CanvasData } from "./HostCanvasView";
 import {
 	claimVpathIfUnclaimed,
@@ -840,31 +836,28 @@ export class VaultShare extends ProviderBacked {
 		// to land -- detached, so the files after this one in adoptLocalFiles
 		// don't queue behind it, and on CRDT updates of the doc, which stays
 		// online until then (the background pull skips online docs).
-		this.lostClaimSettler.start(vpath, async () => {
-			const action = await settleLostClaim<S>({
+		const isAlive = () =>
+			!this.isTornDown && !this.deletedEntries.has(item) && !item.crdtDoc.isDestroyed;
+		this.lostClaimSettler.start(vpath, (signal) =>
+			settleLostClaim<S>({
 				read: () => winnerContent(item),
 				isEmpty: winnerEmpty,
-				subscribe: (onChange) => {
+				subscribe: (onChange, onGone) => {
 					item.crdtDoc.on("update", onChange);
-					return () => item.crdtDoc.off("update", onChange);
+					item.crdtDoc.on("destroy", onGone);
+					return () => {
+						item.crdtDoc.off("update", onChange);
+						item.crdtDoc.off("destroy", onGone);
+					};
 				},
-				maxWaitMs: LOST_CLAIM_WINNER_WAIT_MS,
+				signal,
 				readLocal: () => this.readContents(item),
 				diverged,
-				preserveAndAdopt: (local) => this._preserveAndAdoptWinner(item, local, flushContent),
-				isAlive: () => !this.isTornDown && !this.deletedEntries.has(item),
-			});
-			if (action === "await-winner") {
-				// Not a conflict: the winner's text never reached the relay in
-				// time. Copying ours out would duplicate the note for every
-				// member, and writing the empty placeholder over ours would
-				// blank it. Leave the file as it is.
-				this.log(
-					`[${item.entryPath}] Lost the upload-claim race; winner's content still not on the relay ` +
-						`after ${LOST_CLAIM_WINNER_WAIT_MS / 1000}s -- keeping the local file as is`,
-				);
-			}
-		});
+				preserveAndAdopt: (local) =>
+					this._preserveAndAdoptWinner(item, local, flushContent, isAlive),
+				isAlive,
+			}),
+		);
 		return item;
 	}
 
@@ -872,15 +865,17 @@ export class VaultShare extends ProviderBacked {
 		item: T,
 		localContent: string,
 		flushContent: (item: T) => string,
+		isAlive: () => boolean,
 	): Promise<void> {
 		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 		try {
-			const conflictPath = await this.writeConflictCopy(
-				item,
-				localContent,
-				`upload race ${timestamp}`,
-			);
-			await this.writeContents(item, flushContent(item));
+			const conflictPath = await preserveThenAdopt({
+				writeCopy: () =>
+					this.writeConflictCopy(item, localContent, `upload race ${timestamp}`),
+				writeOriginal: () => this.writeContents(item, flushContent(item)),
+				isAlive,
+			});
+			if (conflictPath === undefined) return;
 			this.log(
 				`[${item.entryPath}] Lost the upload-claim race and had different local content -- ` +
 					`adopted the winner's content, preserved ours at ${conflictPath}`,
@@ -2926,6 +2921,7 @@ export class VaultShare extends ProviderBacked {
 
 	dismantle() {
 		this.isTornDown = true;
+		this.lostClaimSettler.cancelAll();
 		this.cancelInitialFolderSync?.();
 		this.cancelInitialFolderSync = null;
 		this.teardowns.forEach((unsub) => {

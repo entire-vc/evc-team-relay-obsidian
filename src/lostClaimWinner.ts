@@ -40,55 +40,50 @@ export function lostClaimAction<S>(
 	return "preserve-and-adopt";
 }
 
-/**
- * How long a loser waits for the winner's text. Long on purpose: an initial
- * sync of a large folder puts hundreds of uploads ahead of it in the winner's
- * lane, and giving up early only means the file is never reconciled.
- */
-export const LOST_CLAIM_WINNER_WAIT_MS = 15 * 60_000;
-
 export interface WinnerContentWait<S> {
 	/** Current winner content, read from the synced CRDT. */
 	read: () => S;
 	isEmpty: (winner: S) => boolean;
-	/** Calls `onChange` on every CRDT update; returns the unsubscribe. */
-	subscribe: (onChange: () => void) => () => void;
-	maxWaitMs: number;
-	scheduleTimeout?: (fn: () => void, ms: number) => unknown;
-	cancelTimeout?: (handle: unknown) => void;
+	/**
+	 * Calls `onChange` on every CRDT update and `onGone` when the doc is
+	 * destroyed; returns the unsubscribe.
+	 */
+	subscribe: (onChange: () => void, onGone: () => void) => () => void;
+	/** Aborted when the share is torn down. */
+	signal: AbortSignal;
 }
 
 /**
- * Resolves with the winner's content as soon as it is non-empty, or with the
- * last (empty) read once `maxWaitMs` elapses. Event-driven rather than
- * polled: the winner's upload lane can be hundreds of files deep, so the
- * wait has to be long, and many lost claims can be waiting at once.
+ * Resolves with the winner's content as soon as it is non-empty, or with
+ * `undefined` once the doc or its share is torn down. No deadline: the
+ * winner's upload lane can be hundreds of files deep, and the background
+ * pull never settles this file instead (the doc is online, and it has no
+ * sync base), so giving up would leave it unreconciled for good. Event-driven
+ * rather than polled, so many waiting claims cost nothing between updates.
  */
-export function awaitWinnerContent<S>(wait: WinnerContentWait<S>): Promise<S> {
-	const {
-		read,
-		isEmpty,
-		subscribe,
-		maxWaitMs,
-		scheduleTimeout = (fn, ms) => window.setTimeout(fn, ms),
-		cancelTimeout = (handle) => window.clearTimeout(handle as number),
-	} = wait;
+export function awaitWinnerContent<S>(wait: WinnerContentWait<S>): Promise<S | undefined> {
+	const { read, isEmpty, subscribe, signal } = wait;
+	if (signal.aborted) return Promise.resolve(undefined);
 	const first = read();
 	if (!isEmpty(first)) return Promise.resolve(first);
-	return new Promise<S>((resolve) => {
+	return new Promise<S | undefined>((resolve) => {
 		let done = false;
-		const finish = (winner: S) => {
+		const finish = (winner: S | undefined) => {
 			if (done) return;
 			done = true;
-			cancelTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
 			unsubscribe();
 			resolve(winner);
 		};
-		const unsubscribe = subscribe(() => {
-			const winner = read();
-			if (!isEmpty(winner)) finish(winner);
-		});
-		const timer = scheduleTimeout(() => finish(read()), maxWaitMs);
+		const onAbort = () => finish(undefined);
+		const unsubscribe = subscribe(
+			() => {
+				const winner = read();
+				if (!isEmpty(winner)) finish(winner);
+			},
+			onAbort,
+		);
+		signal.addEventListener("abort", onAbort);
 	});
 }
 
@@ -111,7 +106,7 @@ export async function settleLostClaim<S>(
 	settle: LostClaimSettle<S>,
 ): Promise<LostClaimAction | "gone"> {
 	const winner = await awaitWinnerContent(settle);
-	if (!settle.isAlive()) return "gone";
+	if (winner === undefined || !settle.isAlive()) return "gone";
 	const local = await settle.readLocal();
 	if (!settle.isAlive()) return "gone";
 	const action = lostClaimAction(local, winner, settle.diverged, settle.isEmpty);
@@ -122,27 +117,53 @@ export async function settleLostClaim<S>(
 }
 
 /**
+ * Preserves the loser's text as a conflict copy, then overwrites the original
+ * with the winner's. Returns the copy's path, or `undefined` when the share
+ * was torn down while the copy was being written: ours is safe in the copy,
+ * and a gone share must not write the original any more.
+ */
+export async function preserveThenAdopt(steps: {
+	writeCopy: () => Promise<string>;
+	writeOriginal: () => Promise<void>;
+	isAlive: () => boolean;
+}): Promise<string | undefined> {
+	const copyPath = await steps.writeCopy();
+	if (!steps.isAlive()) return undefined;
+	await steps.writeOriginal();
+	return copyPath;
+}
+
+/**
  * Runs lost-claim settles detached from the caller, at most one per key.
  * VaultShare.adoptLocalFiles resolves files one after another, so a settle
  * awaited inline would hold every following file for as long as the
  * winner's text takes to arrive.
  */
 export class LostClaimSettler {
-	private readonly pending = new Set<string>();
+	private readonly pending = new Map<string, AbortController>();
 
 	constructor(private readonly onError: (key: string, e: unknown) => void) {}
 
 	/** Starts a settle for `key` unless one is running; never waits for it. */
-	start(key: string, run: () => Promise<unknown>): boolean {
+	start(key: string, run: (signal: AbortSignal) => Promise<unknown>): boolean {
 		if (this.pending.has(key)) return false;
-		this.pending.add(key);
-		void run()
+		const controller = new AbortController();
+		this.pending.set(key, controller);
+		void run(controller.signal)
 			.catch((e: unknown) => this.onError(key, e))
-			.finally(() => this.pending.delete(key));
+			.finally(() => {
+				if (this.pending.get(key) === controller) this.pending.delete(key);
+			});
 		return true;
 	}
 
 	isPending(key: string): boolean {
 		return this.pending.has(key);
+	}
+
+	/** Ends every waiting settle; none of them writes anything afterwards. */
+	cancelAll(): void {
+		for (const controller of this.pending.values()) controller.abort();
+		this.pending.clear();
 	}
 }
