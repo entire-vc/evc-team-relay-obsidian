@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.8
+- Fixed: a published folder that receives many new or changed notes at once (for example a large first sync) no longer floods the server with updates. Its web index is now refreshed at most once every 30 seconds, always with the latest list, and the plugin backs off when the server asks it to slow down.
+- Fixed: a background retry or reconnect that fires after a note has been removed from a shared folder no longer throws an error.
+
 ## 0.1.7
 - Fixed: edits to notes that are closed on another device now arrive within seconds even in large vaults with several shared folders. A stalled background check can no longer block the others, and busy folders no longer delay updates in small ones.
 
