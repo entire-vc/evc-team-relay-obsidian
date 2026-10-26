@@ -78,6 +78,7 @@ import {
 	hasUnsyncedEdit,
 	hasUnsyncedCanvasEdit,
 } from "./preserveBeforeTrash";
+import { awaitWinnerContent, lostClaimAction } from "./lostClaimWinner";
 import type { CanvasData } from "./HostCanvasView";
 import {
 	claimVpathIfUnclaimed,
@@ -809,7 +810,9 @@ export class VaultShare extends ProviderBacked {
 	 * code compared against `CanvasDocument.exportData` but flushed
 	 * `canvas.json` -- preserved here rather than "simplified" away);
 	 * `diverged` is the type-appropriate comparison (plain-text equality
-	 * for Documents, deep-object equality for CanvasDocument JSON).
+	 * for Documents, deep-object equality for CanvasDocument JSON);
+	 * `winnerEmpty` tells a winner whose text hasn't been uploaded yet apart
+	 * from real content (see lostClaimWinner.ts).
 	 */
 	private async _reconcileLostUploadClaim<T extends Document | CanvasDocument, S>(
 		vpath: string,
@@ -817,6 +820,7 @@ export class VaultShare extends ProviderBacked {
 		winnerContent: (item: T) => S,
 		flushContent: (item: T) => string,
 		diverged: (local: string, winner: S) => boolean,
+		winnerEmpty: (winner: S) => boolean,
 	): Promise<T> {
 		this.folderIndex.clearPendingUpload(vpath);
 		await this.awaitVpathResolved(vpath);
@@ -835,8 +839,23 @@ export class VaultShare extends ProviderBacked {
 			return item;
 		}
 
-		const winner = winnerContent(item);
-		if (!diverged(localContent, winner)) {
+		// The winner's guid can arrive well before its text (its upload lane
+		// may be hundreds of files deep), so give the text a moment to land
+		// before comparing against what may only be an empty placeholder.
+		const winner = await awaitWinnerContent(() => winnerContent(item), winnerEmpty);
+		const action = lostClaimAction(localContent, winner, diverged, winnerEmpty);
+		if (action === "keep") {
+			return item;
+		}
+		if (action === "await-winner") {
+			// Not a conflict: the winner's text simply isn't on the relay yet.
+			// Copying ours out would duplicate the note for every member, and
+			// writing the empty placeholder over ours would blank it. Leave the
+			// file as it is; the background pull settles it once the text lands.
+			this.log(
+				`[${item.entryPath}] Lost the upload-claim race; winner's content not on the relay yet -- ` +
+					`keeping the local file as is`,
+			);
 			return item;
 		}
 
@@ -869,6 +888,7 @@ export class VaultShare extends ProviderBacked {
 			(doc) => doc.content,
 			(doc) => doc.content,
 			hasUnsyncedEdit,
+			(text) => text === "",
 		);
 	}
 
@@ -880,6 +900,7 @@ export class VaultShare extends ProviderBacked {
 			(canvas) => CanvasDocument.exportData(canvas.crdtDoc),
 			(canvas) => canvas.canvasJson,
 			hasUnsyncedCanvasEdit,
+			(data) => (data.nodes?.length ?? 0) === 0 && (data.edges?.length ?? 0) === 0,
 		);
 	}
 
