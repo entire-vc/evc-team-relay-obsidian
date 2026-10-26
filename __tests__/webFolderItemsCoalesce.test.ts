@@ -238,6 +238,10 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		expect(manualDone).toBe(false);
 
 		release();
+		// Then it waits out the 30s minimum interval from the first PATCH.
+		await jest.advanceTimersByTimeAsync(20_000);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+		await jest.advanceTimersByTimeAsync(10_000);
 		await manual;
 		expect(updateShare).toHaveBeenCalledTimes(2);
 		expect(lastItems(updateShare).map((i) => i.path)).toEqual(["a.md", "b.md"]);
@@ -246,6 +250,34 @@ describe("WebSyncManager — coalesced web_folder_items pushes", () => {
 		manager.onFileDeleted(`${FOLDER}/missing.md`);
 		await jest.advanceTimersByTimeAsync(10_000);
 		expect(updateShare).toHaveBeenCalledTimes(2);
+	});
+
+	test("a manual sync right after a scheduled push waits out the 30s interval", async () => {
+		const sentAt: number[] = [];
+		updateShare.mockImplementation(async () => {
+			sentAt.push(Date.now());
+			return {};
+		});
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(sentAt).toHaveLength(1);
+
+		addFile(folder, "b.md");
+		const manual = manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1");
+		await jest.advanceTimersByTimeAsync(30_000);
+		await manual;
+
+		expect(sentAt).toHaveLength(2);
+		expect(sentAt[1] - sentAt[0]).toBeGreaterThanOrEqual(30_000);
+	});
+
+	test("a manual sync with nothing new sends no PATCH and does not wait", async () => {
+		manager.onFileCreated(addFile(folder, "a.md"));
+		await jest.advanceTimersByTimeAsync(3500);
+		expect(updateShare).toHaveBeenCalledTimes(1);
+
+		await manager.syncFolderStructureToWeb(FOLDER, "srv1", "share1");
+		expect(updateShare).toHaveBeenCalledTimes(1);
 	});
 
 	test("a manual sync for a share with no prior events records its list", async () => {

@@ -634,14 +634,19 @@ export class WebSyncManager {
 		}
 	}
 
+	/** Earliest time the next PATCH for this share may start (throttle and backoff). */
+	private folderItemsReadyAt(state: FolderItemsPushState): number {
+		const throttle = state.lastPushAt > 0 ? state.lastPushAt + FOLDER_ITEMS_MIN_INTERVAL_MS : 0;
+		return Math.max(throttle, state.notBefore);
+	}
+
 	private armFolderItemsTimer(folderPath: string, state: FolderItemsPushState): void {
 		const now = Date.now();
 		const trailing = Math.min(
 			now + FOLDER_ITEMS_DEBOUNCE_MS,
 			(state.firstPendingAt ?? now) + FOLDER_ITEMS_MAX_WAIT_MS,
 		);
-		const throttle = state.lastPushAt > 0 ? state.lastPushAt + FOLDER_ITEMS_MIN_INTERVAL_MS : 0;
-		const fireAt = Math.max(trailing, throttle, state.notBefore);
+		const fireAt = Math.max(trailing, this.folderItemsReadyAt(state));
 		if (state.timer !== null) window.clearTimeout(state.timer);
 		state.timer = window.setTimeout(() => {
 			state.timer = null;
@@ -717,10 +722,21 @@ export class WebSyncManager {
 		shareId: string,
 	): Promise<void> {
 		// Shares the scheduler's state so a manual sync never overlaps an
-		// event-driven PATCH and later unchanged events see what it sent.
+		// event-driven PATCH, obeys the same minimum interval and backoff, and
+		// later unchanged events see what it sent.
 		const state = this.getFolderItemsPushState(folderPath, shareId);
-		while (state.inFlight !== null) await state.inFlight;
-		const items = this.getFolderItems(folderPath);
+		let items: WebFolderEntry[];
+		for (;;) {
+			while (state.inFlight !== null) await state.inFlight;
+			items = this.getFolderItems(folderPath);
+			if (JSON.stringify(items) === state.lastSentFingerprint) {
+				log("Folder structure already up to date on web", { folderPath });
+				return;
+			}
+			const wait = this.folderItemsReadyAt(state) - Date.now();
+			if (wait <= 0) break;
+			await new Promise<void>((resolve) => window.setTimeout(resolve, wait));
+		}
 		try {
 			await this.sendFolderItems(state, serverId, items, JSON.stringify(items));
 		} finally {
