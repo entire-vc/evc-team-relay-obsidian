@@ -343,7 +343,7 @@ describe("WebSyncManager — doc share rename/delete", () => {
 
 		manager.registerAutoSyncShare("notes/old-name.md", "share1", "srv1", "doc");
 
-		await manager.onFileRenamed("notes/new-name.md", "notes/old-name.md");
+		manager.onFileRenamed("notes/new-name.md", "notes/old-name.md");
 
 		// Registration follows the file — old key gone, new key present.
 		expect(manager.isAutoSync("notes/old-name.md")).toBe(false);
@@ -382,7 +382,7 @@ describe("WebSyncManager — doc share rename/delete", () => {
 		// scheduled above is still ticking (deleting a map entry doesn't
 		// cancel its pending timer) and will fire independently, still bound
 		// to syncFile(oldPath) via its closure.
-		await manager.onFileRenamed("notes/new-name.md", "notes/old-name.md");
+		manager.onFileRenamed("notes/new-name.md", "notes/old-name.md");
 
 		await jest.advanceTimersByTimeAsync(2100);
 
@@ -401,7 +401,7 @@ describe("WebSyncManager — doc share rename/delete", () => {
 		manager.registerAutoSyncShare("notes/note.md", "share1", "srv1", "doc");
 		expect(manager.isAutoSync("notes/note.md")).toBe(true);
 
-		await manager.onFileDeleted("notes/note.md");
+		manager.onFileDeleted("notes/note.md");
 
 		expect(manager.isAutoSync("notes/note.md")).toBe(false);
 		expect(noticeMock).toHaveBeenCalledTimes(1);
@@ -422,7 +422,7 @@ describe("WebSyncManager — doc share rename/delete", () => {
 		const clickManager = makeClientManagerWithClient(client);
 		const clickWebManager = new WebSyncManager(vault, clickManager);
 		clickWebManager.registerAutoSyncShare("notes/note.md", "share1", "srv1", "doc");
-		await clickWebManager.onFileDeleted("notes/note.md");
+		clickWebManager.onFileDeleted("notes/note.md");
 		const [clickMessage] = noticeMock.mock.calls[noticeMock.mock.calls.length - 1];
 		const clickFragment = clickMessage as DocumentFragment;
 		const clickBtn = clickFragment.querySelector("button") as HTMLButtonElement;
@@ -444,7 +444,7 @@ describe("WebSyncManager — doc share rename/delete", () => {
 		const clientManager = makeClientManagerWithClient(makeDocClient());
 		const manager = new WebSyncManager(vault, clientManager);
 
-		await manager.onFileDeleted("notes/unrelated.md");
+		manager.onFileDeleted("notes/unrelated.md");
 
 		expect(noticeMock).not.toHaveBeenCalled();
 	});
