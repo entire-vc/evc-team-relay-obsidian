@@ -297,7 +297,7 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
-	test("an announced change that never shows up is re-checked for a bounded window, then given up", async () => {
+	test("an announced change that never shows up keeps being re-checked past the window, then is given up", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
 		const folder = makeFolder("s", 1, pull, 1);
@@ -307,18 +307,28 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		await flushPromises();
 
 		folder.announce("s-0", textFingerprint("new"));
-		for (let t = 0; t <= 400_000; t += 1_000) {
+		let callsAt200s = 0;
+		for (let t = 0; t <= 800_000; t += 1_000) {
 			clock.setTime(t0 + t);
 			await flushPromises();
 			while (held.length > 0) {
 				held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
 				await flushPromises();
 			}
+			if (t === 200_000) {
+				callsAt200s = pull.mock.calls.length;
+				expect(poller.stats().recheck.givenUp).toBe(0);
+			}
 		}
 		const calls = pull.mock.calls.length;
-		expect(poller.stats().recheck.givenUp).toBe(1);
-		expect(poller.stats().recheck.scheduled).toBeGreaterThan(3);
-		clock.setTime(t0 + 500_000);
+		const stats = poller.stats();
+		// Once a minute from the front of the sweep between 180s and 600s.
+		expect(calls - callsAt200s).toBeGreaterThanOrEqual(5);
+		expect(stats.recheck.swept).toBeGreaterThanOrEqual(5);
+		expect(stats.recheck.givenUp).toBe(1);
+		expect(stats.givenUp).toEqual([{ path: "s/0.md", outcome: "unchanged", attempts: expect.any(Number) }]);
+		expect(stats.outcomes.unchanged).toBe(calls);
+		clock.setTime(t0 + 900_000);
 		await flushPromises();
 		expect(pull.mock.calls.length).toBe(calls);
 		poller.destroy();
@@ -340,16 +350,17 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 
 		for (let i = 0; i < 300; i++) folder.announce(`imp-${i}`, textFingerprint(`created ${i}`));
 		let callsAt40s = 0;
-		for (let t = 0; t <= 200_000; t += 1_000) {
+		let callsAt175s = 0;
+		for (let t = 0; t <= 175_000; t += 1_000) {
 			clock.setTime(t0 + t);
 			await flushPromises();
 			await settleAll();
 			if (t === 40_000) callsAt40s = pull.mock.calls.length;
+			if (t === 175_000) callsAt175s = pull.mock.calls.length;
 		}
 		// Past the three quick re-checks each document is pulled at most
-		// twice more (~62s, ~122s), instead of every 15s until 180s.
-		expect(pull.mock.calls.length - callsAt40s).toBeLessThanOrEqual(2 * 300);
-		expect(poller.stats().recheck.givenUp).toBe(300);
+		// twice more (~62s, ~122s) within the window, instead of every 15s.
+		expect(callsAt175s - callsAt40s).toBeLessThanOrEqual(2 * 300);
 		poller.destroy();
 	});
 

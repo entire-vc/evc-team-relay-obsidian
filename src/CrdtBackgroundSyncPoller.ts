@@ -116,7 +116,8 @@ export const PULL_DEADLINE_MS = 25_000;
  * fingerprint yet (the marker can beat the content to this client) is
  * pulled again after these delays, then after the backed-off
  * LATE_RECHECK_DELAYS_MS until RECHECK_WINDOW_MS after the announcement,
- * then left to the sweep. The marker travels on the live folder connection
+ * then once a minute from the front of the share's sweep until
+ * RECHECK_LIMIT_MS, and only then left to the regular sweep. The marker travels on the live folder connection
  * while the sender's upload opens the document's own: under an 800+
  * document import that upload took up to ~60s, and three re-checks
  * (~40-57s) gave up on 18 of 80 edits.
@@ -131,6 +132,13 @@ const RECHECK_DELAYS_MS = [2_000, 5_000, 10_000];
  */
 const LATE_RECHECK_DELAYS_MS = [15_000, 30_000, 60_000];
 const RECHECK_WINDOW_MS = 180_000;
+/**
+ * A change still not visible after the window keeps being re-checked, at the
+ * capped delay and behind every fresh edit, for this long. On the stand a
+ * note given up at 180s stayed diverged until the end of the run.
+ */
+const RECHECK_LIMIT_MS = 600_000;
+const GIVEN_UP_SAMPLES = 20;
 const STATS_LOG_EVERY_MS = 60_000;
 const LATENCY_SAMPLES = 200;
 
@@ -175,8 +183,15 @@ export interface PollerStats {
 	completed: number;
 	failed: number;
 	delivery: { count: number; p50Ms: number; p95Ms: number; maxMs: number };
-	/** Re-checks of announced changes scheduled so far, and those given up to the sweep. */
-	recheck: { scheduled: number; givenUp: number };
+	/**
+	 * Re-checks of announced changes: scheduled so far, moved to the front of
+	 * the sweep after RECHECK_WINDOW_MS, and given up after RECHECK_LIMIT_MS.
+	 */
+	recheck: { scheduled: number; swept: number; givenUp: number };
+	/** How the pulls so far ended. */
+	outcomes: Partial<Record<PullResult["outcome"] | "deadline", number>>;
+	/** The most recent given-up documents and how their last pull ended. */
+	givenUp: { path: string; outcome: string; attempts: number }[];
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -210,6 +225,9 @@ export class CrdtBackgroundSyncPoller {
 	private failed = 0;
 	private recheckScheduled = 0;
 	private recheckGivenUp = 0;
+	private recheckSwept = 0;
+	private readonly outcomes: PollerStats["outcomes"] = {};
+	private readonly givenUpDocs: PollerStats["givenUp"] = [];
 	private lastStatsLogAt = 0;
 	private destroyed = false;
 
@@ -502,6 +520,8 @@ export class CrdtBackgroundSyncPoller {
 		const ok = result !== undefined && result.outcome !== "connect-failed" && result.outcome !== "aborted";
 		if (ok) this.completed++;
 		else this.failed++;
+		const outcome = result?.outcome ?? "deadline";
+		this.outcomes[outcome] = (this.outcomes[outcome] ?? 0) + 1;
 
 		const lateAnnouncement = this.announcedWhilePulling.get(guid);
 		this.announcedWhilePulling.delete(guid);
@@ -521,11 +541,14 @@ export class CrdtBackgroundSyncPoller {
 		const delay =
 			RECHECK_DELAYS_MS[attempt] ??
 			LATE_RECHECK_DELAYS_MS[Math.min(attempt - RECHECK_DELAYS_MS.length, LATE_RECHECK_DELAYS_MS.length - 1)];
-		if (this.timeProvider.now() + delay - announcedAt > RECHECK_WINDOW_MS) {
+		if (this.timeProvider.now() + delay - announcedAt > RECHECK_LIMIT_MS) {
 			this.recheckGivenUp++;
+			this.givenUpDocs.push({ path: pull.file.entryPath, outcome, attempts: attempt + 1 });
+			if (this.givenUpDocs.length > GIVEN_UP_SAMPLES) this.givenUpDocs.shift();
 			log("announced change still not visible after re-checks; leaving it to the sweep", {
 				path: pull.file.entryPath,
 				attempts: attempt + 1,
+				outcome,
 			});
 			return;
 		}
@@ -553,8 +576,17 @@ export class CrdtBackgroundSyncPoller {
 				const queues = this.queuesFor(pull.folder);
 				// A fresh announcement already queued for it covers this re-check.
 				if (queues.priority.has(guid)) return;
-				queues.sweep.delete(guid);
-				queues.late.set(guid, next);
+				if (this.timeProvider.now() - announcedAt <= RECHECK_WINDOW_MS) {
+					queues.sweep.delete(guid);
+					queues.late.set(guid, next);
+				} else {
+					// Past the window: first in line of the sweep, so it
+					// doesn't take a slot from re-checks still in theirs.
+					this.recheckSwept++;
+					queues.late.delete(guid);
+					queues.sweep.delete(guid);
+					queues.sweep = new Map([[guid, next], ...queues.sweep]);
+				}
 			}
 			this.drain();
 		}, delay);
@@ -593,7 +625,9 @@ export class CrdtBackgroundSyncPoller {
 			timeouts: { ...this.timeouts },
 			completed: this.completed,
 			failed: this.failed,
-			recheck: { scheduled: this.recheckScheduled, givenUp: this.recheckGivenUp },
+			recheck: { scheduled: this.recheckScheduled, swept: this.recheckSwept, givenUp: this.recheckGivenUp },
+			outcomes: { ...this.outcomes },
+			givenUp: [...this.givenUpDocs],
 			delivery: {
 				count: sorted.length,
 				p50Ms: percentile(sorted, 50),
