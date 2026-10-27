@@ -811,6 +811,16 @@ export default class TeamRelayPlugin extends Plugin {
 				undefined,
 				lastUpdatedAtStore,
 			);
+			// Every way a shared folder goes away (deleted, unshared from the
+			// menu, the share view or the management modal) leaves the
+			// registry; stop polling a share the registry no longer has.
+			this.register(
+				this.shareRegistry.on(() =>
+					this.inboundSyncPoller?.retainOnly(
+						(shareId) => !!this.shareRegistry.locate((sf) => sf.entityGuid === shareId),
+					),
+				),
+			);
 		}
 
 		// Add status bar item for Relay On-Prem (v1.8.2)
@@ -1085,7 +1095,6 @@ export default class TeamRelayPlugin extends Plugin {
 													);
 												}
 												// Remove local shared folder
-												if (folder.entityGuid) this.inboundSyncPoller?.unregisterShare(folder.entityGuid);
 												this.shareRegistry.delete(folder);
 												this.explorerDecorations?.refreshExistingRows();
 												new Notice(`Folder "${folder.path}" unshared`);
@@ -1972,8 +1981,6 @@ export default class TeamRelayPlugin extends Plugin {
 						(folder) => folder.path === file.path,
 					);
 					if (folder) {
-						// The folder left the vault: stop polling its share.
-						if (folder.entityGuid) this.inboundSyncPoller?.unregisterShare(folder.entityGuid);
 						this.shareRegistry.delete(folder);
 						return;
 					}

@@ -24,6 +24,7 @@ interface WatchedShare {
 
 export class InboundSyncPoller {
 	private watchedShares: Map<string, WatchedShare> = new Map();
+	private listedChecks = new Map<string, Promise<void>>();
 	private intervalId: number | null = null;
 	private polling = false;
 	private serverBackoff = new Map<string, { failures: number; retryAt: number }>();
@@ -71,13 +72,36 @@ export class InboundSyncPoller {
 		void this.checkListedShare(shareId, serverId, listedUpdatedAt ?? null);
 	}
 
-	/** Download a share not in the poll set if its listed timestamp moved past the watermark. */
-	async checkListedShare(
+	/**
+	 * Download a share not in the poll set if its listed timestamp moved past
+	 * the watermark. Checks of one share run one after another, so two list
+	 * loads close together download it once and the watermark only moves
+	 * forward.
+	 */
+	checkListedShare(
 		shareId: string,
 		serverId: string,
 		listedUpdatedAt: string | null,
 	): Promise<void> {
-		if (!listedUpdatedAt || listedUpdatedAt === (this.persistedUpdatedAt.get(shareId) ?? null)) {
+		const previous = this.listedChecks.get(shareId) ?? Promise.resolve();
+		const check = previous.then(() => this.runListedCheck(shareId, serverId, listedUpdatedAt));
+		this.listedChecks.set(shareId, check);
+		void check.then(() => {
+			if (this.listedChecks.get(shareId) === check) this.listedChecks.delete(shareId);
+		});
+		return check;
+	}
+
+	private async runListedCheck(
+		shareId: string,
+		serverId: string,
+		listedUpdatedAt: string | null,
+	): Promise<void> {
+		const watermark = this.persistedUpdatedAt.get(shareId) ?? null;
+		if (!listedUpdatedAt || listedUpdatedAt === watermark) {
+			return;
+		}
+		if (watermark && Date.parse(listedUpdatedAt) <= Date.parse(watermark)) {
 			return;
 		}
 		try {
@@ -90,6 +114,13 @@ export class InboundSyncPoller {
 				shareId,
 				error: err instanceof Error ? err.message : String(err),
 			});
+		}
+	}
+
+	/** Stop polling every watched share `keep` rejects. */
+	retainOnly(keep: (shareId: string) => boolean): void {
+		for (const shareId of [...this.watchedShares.keys()]) {
+			if (!keep(shareId)) this.unregisterShare(shareId);
 		}
 	}
 
