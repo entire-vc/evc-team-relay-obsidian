@@ -34,7 +34,7 @@ import { tokenRequestClass } from "../auth/tokenRequestClass";
 import {
 	type ConnectTicket,
 	enqueueConnect,
-	HANDSHAKE_TIMEOUT_MS,
+	handshakeTimeoutMs,
 	MAX_HANDSHAKE_TIMEOUT_MS,
 	recordHandshake,
 	recordHandshakeTimeout,
@@ -285,7 +285,7 @@ const openWS = (provider: YSweetProvider, ticket: ConnectTicket): void => {
 			releaseTicket(provider, ticket);
 			websocket.close();
 		},
-		math.min(HANDSHAKE_TIMEOUT_MS * math.pow(2, provider.handshakeTimeoutsInRow), MAX_HANDSHAKE_TIMEOUT_MS),
+		math.min(handshakeTimeoutMs() * math.pow(2, provider.handshakeTimeoutsInRow), MAX_HANDSHAKE_TIMEOUT_MS),
 	);
 
 	let awarenessResendTimer: number | null = null;

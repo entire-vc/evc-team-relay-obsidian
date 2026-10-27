@@ -10,7 +10,7 @@
  * creation took 0 ms, and the server saw the request only at the end of that
  * wait. Queueing here instead keeps that order in our hands.
  *
- * A handshake that has not finished within HANDSHAKE_TIMEOUT_MS gives up its
+ * A handshake that has not finished within handshakeTimeoutMs() gives up its
  * place; the caller closes the socket and retries through its usual backoff.
  */
 
@@ -19,6 +19,19 @@ import { summarise, type WaitSummary } from "../waitSummary";
 export type ConnectClass = "normal" | "background";
 
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
+/**
+ * Once this many handshakes have opened, the timeout follows them: a few times
+ * their p95, within MIN_HANDSHAKE_TIMEOUT_MS..HANDSHAKE_TIMEOUT_MS. On the
+ * 0.1.21 stand handshakes opened in at most 553 ms, but 30 that never reached
+ * the relay each held the queue for the full 10 s, which was the edits' wait.
+ */
+export const ADAPTIVE_HANDSHAKE_SAMPLES = 20;
+/**
+ * Only opened handshakes are sampled, so on a link that turns slow the timeout
+ * lags behind; this floor keeps one such first attempt from being cut short.
+ */
+export const MIN_HANDSHAKE_TIMEOUT_MS = 4_000;
+const HANDSHAKE_P95_FACTOR = 4;
 /** The timeout doubles after each timeout in a row, up to this, for slow links. */
 export const MAX_HANDSHAKE_TIMEOUT_MS = 60_000;
 
@@ -128,7 +141,14 @@ export function recordHandshake(ms: number): void {
 	record(handshakes, ms);
 }
 
-/** A handshake abandoned after HANDSHAKE_TIMEOUT_MS. */
+/** How long a handshake may take before it gives up its place. */
+export function handshakeTimeoutMs(): number {
+	if (handshakes.length < ADAPTIVE_HANDSHAKE_SAMPLES) return HANDSHAKE_TIMEOUT_MS;
+	const scaled = HANDSHAKE_P95_FACTOR * summarise(handshakes).p95;
+	return Math.min(HANDSHAKE_TIMEOUT_MS, Math.max(MIN_HANDSHAKE_TIMEOUT_MS, scaled));
+}
+
+/** A handshake abandoned after handshakeTimeoutMs(). */
 export function recordHandshakeTimeout(): void {
 	timeouts++;
 }
@@ -139,6 +159,8 @@ export interface ConnectGateStats {
 	/** Time from start to open. */
 	handshake: WaitSummary;
 	timeouts: number;
+	/** The current handshake timeout, before a provider's own doubling. */
+	timeoutMs: number;
 	/** Handshakes waiting for a turn right now, over all servers. */
 	waiting: number;
 }
@@ -150,6 +172,7 @@ export function connectGateStats(): ConnectGateStats {
 		wait: { normal: summarise(waits.normal), background: summarise(waits.background) },
 		handshake: summarise(handshakes),
 		timeouts,
+		timeoutMs: handshakeTimeoutMs(),
 		waiting,
 	};
 }

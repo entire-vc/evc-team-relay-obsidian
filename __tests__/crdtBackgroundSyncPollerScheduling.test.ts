@@ -757,6 +757,42 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("edits waiting connected for their text don't rank their share as importing", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const bulk = makeFolder("bulk", 0, pull, 3);
+		const notes = makeFolder("notes", 0, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([bulk, notes]) as never, 3_600_000);
+		poller.start();
+		for (let i = 0; i < 20; i++) {
+			bulk.trackedEntries.set(`bulk-${i}`, {
+				__isDocument: true,
+				isOnline: false,
+				entityGuid: `bulk-${i}`,
+				entryPath: `bulk/${i}.md`,
+			});
+			bulk.announce(`bulk-${i}`, textFingerprint(`created ${i}`));
+		}
+		await flushPromises();
+		for (let i = 0; i < 7; i++) {
+			const guid = `note-${i}`;
+			notes.trackedEntries.set(guid, { __isDocument: true, isOnline: false, entityGuid: guid, entryPath: `notes/${i}.md` });
+			notes.announce(guid, textFingerprint(`edited ${i}`));
+			await flushPromises();
+			held.find((h) => h.file.entityGuid === guid)?.control.onPhase?.("await-content");
+			await flushPromises();
+			// Bulk pulls finishing hand their slots to the queued notes.
+			const index = held.findIndex((h) => h.file.entityGuid.startsWith("bulk-"));
+			if (index !== -1) held.splice(index, 1)[0].resolve({ outcome: "unchanged", remoteText: "x" });
+			await flushPromises();
+			for (const h of held) if (h.file.entityGuid.startsWith("note-")) h.control.onPhase?.("await-content");
+			await flushPromises();
+		}
+		expect(poller.stats().awaiting).toBeGreaterThanOrEqual(6);
+		expect(poller.stats().importing).toEqual(["bulk"]);
+		poller.destroy();
+	});
+
 	test("an announced pull waits connected for the text, without holding a slot or hitting the deadline", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
