@@ -33,6 +33,8 @@ export function shareIdOf(documentId: string): string {
 	}
 }
 
+const GRANT_FALLBACK_MS = 10 * 60_000;
+
 export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// Multi-server: one RelayOnPremTokenProvider per configured on-prem
 	// server, each bound to that server's own controlPlaneUrl + auth
@@ -59,9 +61,11 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// until their backoff runs out, whichever path asks (reconnect gate,
 	// background poller, editor open).
 	private accessDenied = new AccessDeniedBackoff();
-	// Shares that granted a token since their last refusal, and the one
-	// token request in flight for each share that has not.
-	private grantedShares = new Set<string>();
+	// Shares that granted a token since their last refusal, until that
+	// token's expiry, and the one token request in flight for each share
+	// that has none. An expired grant says nothing about access now: after a
+	// sleep the share may have been revoked, so it is probed again first.
+	private grantedShares = new Map<string, number>();
 	private shareProbes = new Map<string, Promise<void>>();
 	private accessListeners = new Set<(shareId: string) => void>();
 
@@ -189,7 +193,8 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		// time: nothing waits on them, and a share refused mid-session must
 		// not cost one request per renewal running at once.
 		const renewing = !!this.tokenEntries?.get(documentId)?.token;
-		const serialized = () => renewing || !this.grantedShares.has(shareId);
+		const serialized = () =>
+			renewing || !((this.grantedShares.get(shareId) ?? 0) > Date.now());
 		for (;;) {
 			const probe = serialized() ? this.shareProbes.get(shareId) : undefined;
 			if (!probe) break;
@@ -221,7 +226,10 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 				documentId,
 				(grant) => {
 					const wasDenied = this.accessDenied.isDenied(shareId);
-					this.grantedShares.add(shareId);
+					// No expiry on the grant: count it good for the token
+					// lifetime the sweep assumes when it cannot read one.
+					const expiry = getJwtExpiryFromDocumentGrant(grant) || Date.now() + GRANT_FALLBACK_MS;
+					this.grantedShares.set(shareId, Math.max(expiry, this.grantedShares.get(shareId) ?? 0));
 					this.accessDenied.clear(shareId);
 					done();
 					if (wasDenied) this.notifyAccessChange(shareId);
@@ -249,14 +257,18 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		return this.accessDenied.isDenied(shareIdOf(documentId));
 	}
 
-	/** Forget every refusal: after a sign-in/token refresh or a manual reconnect. */
-	clearAccessDenied(): void {
-		const denied = this.accessDenied.deniedShares();
-		this.accessDenied.clear();
+	/**
+	 * Forget refusals: every share after a sign-in or token refresh, one
+	 * share on its manual reconnect.
+	 */
+	clearAccessDenied(documentId?: string): void {
+		const shareId = documentId === undefined ? undefined : shareIdOf(documentId);
+		const denied = this.accessDenied.deniedShares().filter((id) => shareId === undefined || id === shareId);
+		this.accessDenied.clear(shareId);
 		for (const provider of this.relayOnPremProviders.values()) {
-			provider.clearRefused();
+			provider.clearRefused(shareId);
 		}
-		for (const shareId of denied) this.notifyAccessChange(shareId);
+		for (const id of denied) this.notifyAccessChange(id);
 	}
 
 	/** Called with a share id whenever that share becomes refused or stops being refused. */

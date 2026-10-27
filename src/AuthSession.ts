@@ -33,6 +33,7 @@ export class AuthSession extends Notifier<AuthSession> {
 	private multiServerAuthManager?: MultiServerAuthManager;
 	private activeServerId?: string;
 	private _restorePromise?: Promise<void>;
+	private refreshListeners = new Set<(serverId: string) => void>();
 
 	constructor(
 		// Obsidian's stable per-vault-instance id — survives vault rename.
@@ -62,6 +63,9 @@ export class AuthSession extends Notifier<AuthSession> {
 					appId,
 					relayOnPremSettings.servers,
 					(serverId) => this.handleSessionExpired(serverId),
+					(serverId) => {
+						for (const listener of this.refreshListeners) listener(serverId);
+					},
 				);
 
 				// Set active server to default
@@ -450,6 +454,12 @@ export class AuthSession extends Notifier<AuthSession> {
 	 * `this.currentUser`/`isAuthenticated` state is scoped to the active server, since
 	 * that's the single-user surface the rest of the plugin reads.
 	 */
+	/** Called with a server id whenever that server's session is refreshed in the background. */
+	onTokenRefreshed(listener: (serverId: string) => void): () => void {
+		this.refreshListeners.add(listener);
+		return () => this.refreshListeners.delete(listener);
+	}
+
 	private handleSessionExpired(serverId: string): void {
 		this.log(`Session expired for server ${serverId}`);
 

@@ -1335,6 +1335,30 @@ describe("InboundSyncPoller: shares checked from the share list", () => {
 		expect(store.get("s")).toBe("2026-06-08T11:00:00Z");
 	});
 
+	test("a poll answering an older timestamp than a listed download does not pull the watermark back", async () => {
+		const store = new Map<string, string>();
+		const downloadShare = jest.fn<() => Promise<"ran" | "skipped">>().mockResolvedValue("ran");
+		(clientManager.getShare as unknown as jest.Mock<() => Promise<unknown>>).mockResolvedValue(makeShare("2026-06-08T10:00:00Z"));
+		const poller = new InboundSyncPoller(
+			timeProvider,
+			clientManager as any,
+			webSyncManager as any,
+			{ downloadShare, isInboundWriting: () => false } as any,
+			30_000,
+			store,
+		);
+
+		poller.registerShare("s", SERVER_ID);
+		await poller.checkListedShare("s", SERVER_ID, "2026-06-08T11:00:00Z");
+		expect(downloadShare).toHaveBeenCalledTimes(1);
+		poller.start();
+		timeProvider.setTime(timeProvider.now() + 30_000);
+		await flushPromises();
+
+		expect(downloadShare).toHaveBeenCalledTimes(1);
+		expect(store.get("s")).toBe("2026-06-08T11:00:00Z");
+	});
+
 	test("retainOnly stops polling the shares it rejects", async () => {
 		const poller = new InboundSyncPoller(
 			timeProvider,

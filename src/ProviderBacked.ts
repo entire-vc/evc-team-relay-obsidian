@@ -180,7 +180,16 @@ export class ProviderBacked extends Loggable {
 		// Optional call: stand-in caches in tests may not implement it.
 		this.detachAccess =
 			credentialCache.onAccessDeniedChange?.((changed) => {
-				if (changed === shareId) this.broadcastState();
+				if (changed !== shareId) return;
+				// A cleared refusal leaves a retry waiting out the old backoff:
+				// bring it forward to the ordinary reconnect floor.
+				if (!this.accessDenied && this.reconnectGate.pending) {
+					this.reconnectGate.cancel();
+					this.reconnectGate.schedule(this._liveProvider.maxBackoffTime, () => {
+						void this.bringOnline();
+					});
+				}
+				this.broadcastState();
 			}) ?? (() => {});
 		// Belt-and-braces against any remaining startup-ordering race (this
 		// provider built before its server's own restore/login resolved):
@@ -392,6 +401,8 @@ export class ProviderBacked extends Loggable {
 			this.lastTokenMs = Date.now() - tokenFrom;
 			this.applyRefreshedToken(clientToken); // re-check: token may already be current at this point
 			this._liveProvider.connect();
+			// A retry left by an earlier failure is not needed any more.
+			this.reconnectGate.cancel();
 			this.broadcastState();
 			return true;
 		} catch (e) {
@@ -421,6 +432,11 @@ export class ProviderBacked extends Loggable {
 			this.broadcastState();
 			return false;
 		}
+	}
+
+	/** Ask for this share's token on the next connect instead of after its backoff. */
+	clearAccessDenied(): void {
+		this.credentialCache.clearAccessDenied(ResourceAddress.serialize(this.resourceAddress));
 	}
 
 	/** The control plane refuses this share's token (401/403); retries are backed off. */

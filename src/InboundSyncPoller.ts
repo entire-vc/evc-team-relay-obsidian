@@ -103,22 +103,12 @@ export class InboundSyncPoller {
 		listedUpdatedAt: string | null,
 		isLocalNow?: () => boolean,
 	): Promise<void> {
-		const watermark = this.persistedUpdatedAt.get(shareId) ?? null;
-		if (!listedUpdatedAt || listedUpdatedAt === watermark) {
-			return;
-		}
-		if (watermark && Date.parse(listedUpdatedAt) <= Date.parse(watermark)) {
+		if (!this.isPastWatermark(shareId, listedUpdatedAt)) {
 			return;
 		}
 		try {
 			const result = await this.fileDownloader.downloadShare(shareId, serverId);
-			// A poll of this share may have moved the watermark meanwhile.
-			const current = this.persistedUpdatedAt.get(shareId);
-			if (result !== "skipped" && (!current || Date.parse(listedUpdatedAt) > Date.parse(current))) {
-				this.persistedUpdatedAt.set(shareId, listedUpdatedAt);
-				const watched = this.watchedShares.get(shareId);
-				if (watched) watched.lastUpdatedAt = listedUpdatedAt;
-			}
+			if (result !== "skipped") this.advanceWatermark(shareId, listedUpdatedAt);
 			if (result !== "skipped" && isLocalNow?.()) this.registerShare(shareId, serverId);
 		} catch (err: unknown) {
 			log("Failed to download listed share", {
@@ -126,6 +116,29 @@ export class InboundSyncPoller {
 				error: err instanceof Error ? err.message : String(err),
 			});
 		}
+	}
+
+	/** True when `updatedAt` is later than the share's persisted watermark. */
+	private isPastWatermark(shareId: string, updatedAt: string | null): updatedAt is string {
+		if (!updatedAt) return false;
+		const watermark = this.persistedUpdatedAt.get(shareId);
+		if (!watermark || updatedAt === watermark) return !watermark;
+		const next = Date.parse(updatedAt);
+		const last = Date.parse(watermark);
+		// Timestamps that do not parse can only be told apart, not ordered.
+		return Number.isNaN(next) || Number.isNaN(last) || next > last;
+	}
+
+	/**
+	 * Record a downloaded `updatedAt`, persisted as well as in memory so a
+	 * restart does not start from null. A check of this share may have moved
+	 * the watermark further meanwhile; it never moves back.
+	 */
+	private advanceWatermark(shareId: string, updatedAt: string): void {
+		if (!this.isPastWatermark(shareId, updatedAt)) return;
+		this.persistedUpdatedAt.set(shareId, updatedAt);
+		const watched = this.watchedShares.get(shareId);
+		if (watched) watched.lastUpdatedAt = updatedAt;
 	}
 
 	/** Stop polling every watched share `keep` rejects. */
@@ -195,7 +208,9 @@ export class InboundSyncPoller {
 			if (!newUpdatedAt) {
 				return true;
 			}
-			if (newUpdatedAt === lastUpdatedAt) {
+			// The watermark only moves forward: an older timestamp than one a
+			// listed check already downloaded is not new content.
+			if (newUpdatedAt === lastUpdatedAt || !this.isPastWatermark(shareId, newUpdatedAt)) {
 				log("web_content_updated_at unchanged, skipping", { shareId });
 				return true;
 			}
@@ -209,10 +224,7 @@ export class InboundSyncPoller {
 			if (result !== "skipped") {
 				// unregister/destroy may run while a network request is in flight.
 				if (!this.watchedShares.has(shareId)) return true;
-				this.watchedShares.set(shareId, { serverId, lastUpdatedAt: newUpdatedAt });
-				// Persist the watermark too, not just the in-memory copy —
-				// otherwise the very next restart is back to lastUpdatedAt=null.
-				this.persistedUpdatedAt.set(shareId, newUpdatedAt);
+				this.advanceWatermark(shareId, newUpdatedAt);
 			}
 			return result !== "skipped";
 		} catch (err: unknown) {

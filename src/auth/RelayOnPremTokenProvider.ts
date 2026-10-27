@@ -265,9 +265,13 @@ export class RelayOnPremTokenProvider {
 	 */
 	private refusedShares = new Set<string>();
 
-	/** Forget which shares refused a write token, so the next request asks for write again. */
-	clearRefused(): void {
-		this.refusedShares.clear();
+	/** Forget which shares (or this one share) refused a write token, so the next request asks for write again. */
+	clearRefused(folderId?: string): void {
+		if (folderId === undefined) {
+			this.refusedShares.clear();
+		} else {
+			this.refusedShares.delete(folderId);
+		}
 	}
 
 	constructor(private config: RelayOnPremTokenConfig) {

@@ -264,6 +264,71 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(docIn(docs[0]).accessDenied).toBe(true);
 	});
 
+	test.each([401, 403])("%i: documents whose tokens lapsed while asleep ask one at a time once the share is revoked", async (status) => {
+		mockFetch.mockImplementation(() => respond(200));
+		const { cache, clock, docIn } = build();
+		const docs = [1, 2, 3, 4, 5, 6, 7].map((n) => `88888888-8888-4888-8888-88888888888${n}`);
+		const ids = docs.map((d) => ResourceAddress.serialize(new RemoteDocumentAddress("relay-onprem", G, d)));
+		for (const p of docs.map(docIn)) void p.bringOnline();
+		await jest.advanceTimersByTimeAsync(10_000);
+		expect(tokenCalls()).toBeGreaterThanOrEqual(7);
+
+		// Asleep past every token's expiry; access was revoked meanwhile.
+		jest.setSystemTime(Date.now() + 30 * MINUTE);
+		clock.setTime(clock.now() + 30 * MINUTE);
+		mockFetch.mockImplementation(() => respondSlowly(status, 5_000));
+		maxInFlight = 0;
+		for (const id of ids) void cache.getToken(id, id, () => {}, "server-a").catch(() => undefined);
+		await jest.advanceTimersByTimeAsync(30_000);
+
+		expect(maxInFlight).toBe(1);
+	});
+
+	test("a successful connect drops the retry an earlier refusal left waiting", async () => {
+		mockFetch.mockImplementation(() => respond(401));
+		const { cache, pb } = build();
+		await online(pb);
+		const gate = (pb as unknown as { reconnectGate: { pending: boolean } }).reconnectGate;
+		expect(gate.pending).toBe(true);
+
+		mockFetch.mockImplementation(() => respond(200));
+		cache.clearAccessDenied();
+		expect(await online(pb)).toBe(true);
+
+		expect(gate.pending).toBe(false);
+	});
+
+	test("a cleared refusal brings the waiting retry forward instead of waiting out the old backoff", async () => {
+		mockFetch.mockImplementation(() => respond(401));
+		const { cache, pb } = build();
+		void pb.bringOnline();
+		// 2 + 4 + 8 minutes: the next automatic retry is now 16 minutes out.
+		await jest.advanceTimersByTimeAsync(15 * MINUTE);
+		const before = tokenCalls();
+
+		mockFetch.mockImplementation(() => respond(200));
+		cache.clearAccessDenied();
+		await jest.advanceTimersByTimeAsync(2 * MINUTE);
+
+		expect(tokenCalls()).toBe(before + 1);
+	});
+
+	test("a manual connect of one folder clears that share only", async () => {
+		mockFetch.mockImplementation(() => respond(401));
+		const { cache, pb } = build();
+		await online(pb);
+		const other = "99999999-9999-4999-8999-999999999999";
+		const otherId = ResourceAddress.serialize(new RemoteFolderAddress("relay-onprem", other));
+		await cache.getToken(otherId, otherId, () => {}, "server-a").catch(() => undefined);
+		await jest.advanceTimersByTimeAsync(3_000);
+		expect(cache.isAccessDenied(otherId)).toBe(true);
+
+		pb.clearAccessDenied();
+
+		expect(pb.accessDenied).toBe(false);
+		expect(cache.isAccessDenied(otherId)).toBe(true);
+	});
+
 	test("a refusal found by the renewal sweep reaches the folder badge", async () => {
 		mockFetch.mockImplementation(() => respond(200));
 		const { cache, clock, pb } = build();

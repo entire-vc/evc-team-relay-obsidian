@@ -31,6 +31,7 @@ export class MultiServerAuthManager {
 		// owner (AuthSession) learns exactly which server's session died
 		// instead of the death staying invisible outside this class's map.
 		private onSessionExpired?: (serverId: string) => void,
+		private onTokenRefreshed?: (serverId: string) => void,
 	) {
 		this.appId = appId;
 		// Use the shared singleton (not `new RelayOnPremAuthStore(...)`) — it's the
@@ -63,6 +64,7 @@ export class MultiServerAuthManager {
 			appId: this.appId,
 			serverId: server.id,
 			onSessionExpired: () => this.onSessionExpired?.(server.id),
+			onTokenRefreshed: () => this.onTokenRefreshed?.(server.id),
 		});
 
 		this.providers.set(server.id, provider);

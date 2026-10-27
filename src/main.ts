@@ -898,6 +898,8 @@ export default class TeamRelayPlugin extends Plugin {
 				}
 			};
 			this.register(this.authSession.on(handleLoginStateChange));
+			// A refreshed session may carry access a refused share lacked.
+			this.register(this.authSession.onTokenRefreshed(() => this.credentialCache.clearAccessDenied()));
 
 			// Auth can finish restoring before onLayoutReady fires, in which case
 			// the listener registered above misses that first state-change event —
@@ -1061,6 +1063,8 @@ export default class TeamRelayPlugin extends Plugin {
 											folder.goOffline();
 										} else {
 											folder.wantsConnection = true;
+											// A manual connect retries a refused share now.
+											folder.clearAccessDenied();
 											void folder.bringOnline();
 										}
 										void this._viewRegistry.refreshViews("folder connection toggle");

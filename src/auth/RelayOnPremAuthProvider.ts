@@ -51,6 +51,8 @@ export interface RelayOnPremAuthConfig {
 	 * surface a re-login prompt instead of silently going stale.
 	 */
 	onSessionExpired?: () => void;
+	/** Called after a background refresh renewed this server's session. */
+	onTokenRefreshed?: () => void;
 }
 
 export class RelayOnPremAuthProvider implements IAuthProvider {
@@ -501,6 +503,7 @@ export class RelayOnPremAuthProvider implements IAuthProvider {
 				this.persistAuth();
 
 				this.log("Token refreshed successfully with refresh token");
+				this.config.onTokenRefreshed?.();
 
 				return {
 					user: this.user,
@@ -536,6 +539,7 @@ export class RelayOnPremAuthProvider implements IAuthProvider {
 				this.persistAuth();
 
 				this.log("Token verified successfully");
+				this.config.onTokenRefreshed?.();
 
 				return {
 					user: this.user,

@@ -593,6 +593,34 @@ describe("RelayOnPremAuthProvider", () => {
 			expect(provider.getCurrentUser()).toBeDefined();
 		});
 
+		test.each([[200, 1], [500, 0]])("a refresh answered %i calls onTokenRefreshed %i time(s), so refused shares are retried", async (status, calls) => {
+			mockStorage.set(
+				`evc-team-relay_onprem_auth_${APP_ID}_${SERVER_ID}`,
+				JSON.stringify({
+					user: { id: "user-123", email: "test@example.com" },
+					token: "token",
+					expiresAt: Date.now() + 3600000,
+					refreshToken: "refresh_token",
+				}),
+			);
+
+			const onTokenRefreshed = jest.fn();
+			provider = new RelayOnPremAuthProvider({
+				controlPlaneUrl: CONTROL_PLANE_URL,
+				appId: APP_ID,
+				serverId: SERVER_ID,
+				onTokenRefreshed,
+			});
+			await provider.waitForRestore();
+
+			mockFetch.mockResolvedValueOnce(await mockFetchResponse(status, { access_token: "new", refresh_token: "r2", expires_in: 3600 }, status === 200));
+			if (status === 200) mockFetch.mockResolvedValueOnce(await mockFetchResponse(200, { id: "user-123", email: "test@example.com" }));
+
+			await provider.refreshToken().catch(() => undefined);
+
+			expect(onTokenRefreshed).toHaveBeenCalledTimes(calls);
+		});
+
 		test("Throws if no active session", async () => {
 			await expect(provider.refreshToken()).rejects.toThrow(
 				"No active session to refresh",
