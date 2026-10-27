@@ -10,7 +10,7 @@ export type { ConnectionState, ConnectionIntent, ConnectionStatus };
 import { Account } from "./Account";
 import { Loggable } from "./logging";
 import { AuthSession } from "./AuthSession";
-import { RelayCredentialCache } from "./RelayCredentialCache";
+import { RelayCredentialCache, shareIdOf } from "./RelayCredentialCache";
 import type { DocumentGrant } from "./relay/TokenShapes";
 import { ResourceAddress, type ResourceAddressType } from "./ResourceAddress";
 import { currentToggles } from "./featureToggleState";
@@ -123,6 +123,7 @@ export class ProviderBacked extends Loggable {
 	private detachConnectionError: () => void;
 	private detachConnectionClose: () => void;
 	private detachState: () => void;
+	private detachAccess: () => void;
 	private detachAuthSession?: () => void;
 	// accountId last used to seed awareness/doc-identity, so a later auth
 	// notification can tell "still nothing to seed" apart from "the right
@@ -173,6 +174,14 @@ export class ProviderBacked extends Loggable {
 		this.detachConnectionError = this.attachConnectionErrorHandler();
 		this.detachConnectionClose = this.attachConnectionCloseHandler();
 		this.detachState = this.attachStateHandler();
+		// The folder badge reads accessDenied; a refusal found by the renewal
+		// sweep changes it without any connection event.
+		const shareId = shareIdOf(ResourceAddress.serialize(this.resourceAddress));
+		// Optional call: stand-in caches in tests may not implement it.
+		this.detachAccess =
+			credentialCache.onAccessDeniedChange?.((changed) => {
+				if (changed === shareId) this.broadcastState();
+			}) ?? (() => {});
 		// Belt-and-braces against any remaining startup-ordering race (this
 		// provider built before its server's own restore/login resolved):
 		// re-seed once the identity for THIS server actually changes, rather
@@ -402,6 +411,9 @@ export class ProviderBacked extends Loggable {
 			// A refused share (401/403) is not retried on the reconnect floor:
 			// wait out its backoff, which RelayCredentialCache keeps per share.
 			const retryAt = e instanceof RelayAccessDeniedError ? e.retryAt : undefined;
+			// A retry that was already waiting may belong to a window a reset
+			// has since cleared; the window this refusal returned decides.
+			if (retryAt !== undefined) this.reconnectGate.cancel();
 			const floor = Math.max(this._liveProvider.maxBackoffTime, (retryAt ?? 0) - Date.now());
 			this.reconnectGate.schedule(floor, () => {
 				void this.bringOnline();
@@ -537,6 +549,7 @@ export class ProviderBacked extends Loggable {
 
 	dismantle(): void {
 		this.reconnectGate.cancel();
+		this.detachAccess();
 		this.detachConnectionError?.();
 		this.detachConnectionClose?.();
 		this.detachState?.();

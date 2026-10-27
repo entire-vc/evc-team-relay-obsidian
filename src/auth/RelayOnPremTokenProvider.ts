@@ -265,6 +265,11 @@ export class RelayOnPremTokenProvider {
 	 */
 	private refusedShares = new Set<string>();
 
+	/** Forget which shares refused a write token, so the next request asks for write again. */
+	clearRefused(): void {
+		this.refusedShares.clear();
+	}
+
 	constructor(private config: RelayOnPremTokenConfig) {
 		// Normalize URL - remove trailing slashes to prevent double-slash issues
 		this.normalizedUrl = config.controlPlaneUrl.replace(/\/+$/, "");

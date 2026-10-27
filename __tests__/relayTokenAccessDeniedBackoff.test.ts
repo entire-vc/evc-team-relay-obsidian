@@ -2,7 +2,7 @@
  * A share the signed-in account cannot open (POST /v1/tokens/relay answers
  * 401, or 403 even for read) used to be retried on a fixed short floor
  * forever: bringOnline() failed, rescheduled itself through ReconnectGate,
- * and asked the control plane again (prod log 27.10: one client, 60 x 401
+ * and asked the control plane again (seen in production: one client, 60 x 401
  * per hour, 0 successes). Drives the REAL ProviderBacked + RelayCredentialCache
  * + RelayOnPremTokenProvider; only the network (platformFetch) is faked.
  */
@@ -28,7 +28,7 @@ const mockFetch = platformFetch as jest.MockedFunction<typeof platformFetch>;
 import { ProviderBacked } from "../src/ProviderBacked";
 import { RelayCredentialCache } from "../src/RelayCredentialCache";
 import { RelayOnPremTokenProvider } from "../src/auth/RelayOnPremTokenProvider";
-import { RemoteDocumentAddress, RemoteFolderAddress } from "../src/ResourceAddress";
+import { ResourceAddress, RemoteDocumentAddress, RemoteFolderAddress } from "../src/ResourceAddress";
 import type { IAuthProvider } from "../src/auth/IAuthProvider";
 import type { AuthSession } from "../src/AuthSession";
 import { MockClock } from "./mocks/MockClock";
@@ -96,6 +96,13 @@ function respondSlowly(status: number, latencyMs: number): Promise<Response> {
 	});
 }
 
+/** The `mode` each token request asked for, in order. */
+function tokenModes(): string[] {
+	return mockFetch.mock.calls
+		.filter(([url]) => String(url).endsWith("/v1/tokens/relay"))
+		.map(([, init]) => (JSON.parse(String((init as RequestInit).body)) as { mode: string }).mode);
+}
+
 function tokenCalls(): number {
 	return mockFetch.mock.calls.filter(([url]) => String(url).endsWith("/v1/tokens/relay")).length;
 }
@@ -108,9 +115,10 @@ async function online(pb: ProviderBacked): Promise<boolean> {
 }
 
 function build() {
+	const clock = new MockClock();
 	const cache = new RelayCredentialCache(
 		{ isAuthenticated: false } as unknown as AuthSession,
-		new MockClock(),
+		clock,
 		"vault",
 		3,
 		new Map([["server-a", new RelayOnPremTokenProvider({ controlPlaneUrl: "https://cp.example.com", authProvider })]]),
@@ -124,7 +132,7 @@ function build() {
 		{ getCurrentUserForServer: () => undefined, on: () => (() => {}) } as unknown as AuthSession,
 		"server-a",
 	);
-	return { cache, pb, docIn: (docGuid: string) => new ProviderBacked(
+	return { cache, clock, pb, docIn: (docGuid: string) => new ProviderBacked(
 		docGuid,
 		new RemoteDocumentAddress("relay-onprem", G, docGuid),
 		cache,
@@ -226,5 +234,96 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 
 		await online(pb);
 		expect(pb.accessDenied).toBe(false);
+	});
+
+	test.each([401, 403])("%i: the renewal sweep backs off too once a granted share is refused", async (status) => {
+		mockFetch.mockImplementation(() => respond(200));
+		const { cache, clock, docIn } = build();
+		const docs = [1, 2, 3, 4, 5, 6, 7].map((n) => `77777777-7777-4777-8777-77777777777${n}`);
+		for (const p of docs.map(docIn)) void p.bringOnline();
+		await jest.advanceTimersByTimeAsync(10_000);
+		const granted = tokenCalls();
+		expect(granted).toBeGreaterThanOrEqual(7);
+
+		// Access is revoked; tokens come up for renewal and the sweep runs every minute.
+		mockFetch.mockImplementation(() => respondSlowly(status, 5_000));
+		maxInFlight = 0;
+		// Off the sweep's minute grid, so a renewal comes up before the token lapses.
+		clock.setTime(clock.now() + 30_000);
+		cache.startSweeping();
+		for (let minute = 0; minute < 10; minute++) {
+			clock.setTime(clock.now() + MINUTE);
+			await jest.advanceTimersByTimeAsync(MINUTE);
+		}
+		cache.stopSweeping();
+
+		// The sweep refreshes up to maxConnections (3 here) at once, so the
+		// refusal can cost that many requests before the share is backed off.
+		expect(tokenCalls() - granted).toBeLessThanOrEqual(3 + 3);
+		expect(docIn(docs[0]).accessDenied).toBe(true);
+	});
+
+	test("a refusal found by the renewal sweep reaches the folder badge", async () => {
+		mockFetch.mockImplementation(() => respond(200));
+		const { cache, clock, pb } = build();
+		expect(await online(pb)).toBe(true);
+		const states: string[] = [];
+		pb.subscribe({}, () => states.push(pb.accessDenied ? "no access" : "ok"));
+		states.length = 0;
+
+		mockFetch.mockImplementation(() => respond(401));
+		clock.setTime(clock.now() + 30_000);
+		cache.startSweeping();
+		for (let minute = 0; minute < 5; minute++) {
+			clock.setTime(clock.now() + MINUTE);
+			await jest.advanceTimersByTimeAsync(MINUTE);
+		}
+		cache.stopSweeping();
+
+		expect(states).toContain("no access");
+	});
+
+	test("a backed-off refresh reports its refusal asynchronously, so the renewal queue cannot recurse", async () => {
+		mockFetch.mockImplementation(() => respond(401));
+		const { cache, pb } = build();
+		await online(pb);
+		expect(pb.accessDenied).toBe(true);
+
+		const gated = (cache as unknown as { gatedRefresh: (id: string, ok: () => void, err: (e: Error) => void) => Promise<void> }).gatedRefresh;
+		const err = jest.fn();
+		void gated.call(cache, ResourceAddress.serialize(new RemoteFolderAddress("relay-onprem", G)), () => {}, err);
+		expect(err).not.toHaveBeenCalled();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(err).toHaveBeenCalledTimes(1);
+	});
+
+	test("a reset asks for write again after a share refused write", async () => {
+		mockFetch.mockImplementation(() => respond(403));
+		const { cache, pb } = build();
+		await online(pb);
+		expect(tokenModes()).toEqual(["write", "read"]);
+
+		mockFetch.mockImplementation(() => respond(200));
+		cache.clearAccessDenied();
+		await online(pb);
+
+		expect(tokenModes().slice(2)).toEqual(["write"]);
+	});
+
+	test("after a reset, a refusal is retried on the new window, not on the old long one", async () => {
+		mockFetch.mockImplementation(() => respond(401));
+		const { cache, pb } = build();
+		void pb.bringOnline();
+		// 2 + 4 + 8 minutes: the next automatic retry is now 16 minutes out.
+		await jest.advanceTimersByTimeAsync(15 * MINUTE);
+		const before = tokenCalls();
+
+		cache.clearAccessDenied();
+		await online(pb);
+		expect(tokenCalls()).toBe(before + 1);
+		// The share is refused again on a fresh window: 2 minutes, not 16.
+		await jest.advanceTimersByTimeAsync(3 * MINUTE);
+		expect(tokenCalls()).toBe(before + 2);
 	});
 });
