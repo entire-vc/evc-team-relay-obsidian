@@ -139,6 +139,8 @@ interface QueueLaneState {
  */
 export interface PriorityUploadTrace {
 	path: string;
+	/** Wall-clock ms the upload was queued. */
+	enqueuedAt: number;
 	endedAt: number;
 	waitMs: number;
 	runMs: number;
@@ -536,9 +538,11 @@ export class TransferQueue extends Loggable {
 					.finally(() => {
 						releaseTokens?.();
 						if (lane === this.syncLane && item.priority) {
+							const endedAt = Date.now();
 							this.uploadTrace.push({
 								path: item.absolutePath,
-								endedAt: Date.now(),
+								enqueuedAt: endedAt - (this.clock.now() - item.queuedAt),
+								endedAt,
 								waitMs: startedAt - item.queuedAt,
 								runMs: this.clock.now() - startedAt,
 								ok,
