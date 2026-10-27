@@ -2469,8 +2469,8 @@ export class VaultShare extends ProviderBacked {
 			// Use enqueueUpload (WebSocket path) which properly reconciles:
 			// if the relay is empty and local file has content, it uploads;
 			// if the relay has content, it merges via applyDiffToYText.
-			// enqueueFetch would try HTTP first (always 401 for CWT)
-			// then fall back to WS, but with worse timing guarantees.
+			// enqueueFetch also syncs over WS for relay-linked docs,
+			// but with worse timing guarantees.
 			void this.transfers.enqueueUpload(doc);
 		}
 	}

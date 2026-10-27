@@ -928,7 +928,13 @@ export class TransferQueue extends Loggable {
 		urlObj.protocol = "https:";
 		const parts = urlObj.pathname.split("/");
 		parts.pop();
-		parts.push(clientToken.docId);
+		// Control-plane relay tokens carry `wss://<host>/d/<docId>/ws`: the doc
+		// id is already in the path, so dropping `ws` leaves the doc base.
+		// Appending the id again produced `/d/<docId>/<docId>/as-update`, which
+		// the relay 404s.
+		if (parts[parts.length - 1] !== clientToken.docId) {
+			parts.push(clientToken.docId);
+		}
 		urlObj.pathname = parts.join("/");
 
 		return clientToken.baseUrl?.replace(/\/$/, "") || urlObj.toString();
@@ -1697,6 +1703,14 @@ export class TransferQueue extends Loggable {
 	}
 
 	async fetchCanvas(canvas: CanvasDocument, retry = 3, wait = 3000) {
+		// Relay-linked canvases sync over the WebSocket; see fetchDocument().
+		if (this.isRelayLinked(canvas)) {
+			await this.fallbackToWebsocketSync(canvas, "fetchCanvas", () =>
+				canvas.vaultShare.writeContents(canvas, canvas.canvasJson),
+			);
+			return;
+		}
+
 		try {
 			// Get the current contents before applying the update
 			const currentJson = CanvasDocument.exportData(canvas.crdtDoc);
@@ -1749,6 +1763,15 @@ export class TransferQueue extends Loggable {
 	 * is permanent -- it looks "present" to every later pass (#266).
 	 */
 	private async fetchDocument(doc: Document, retry = 3, wait = 3000, slowRounds = 3) {
+		// Relay-linked docs sync over the WebSocket: skip the HTTP
+		// `as-update` round trip that would only fall back to it anyway.
+		// Under bulk syncs it used to fire once per fetched doc and log an
+		// error each time.
+		if (this.isRelayLinked(doc)) {
+			await this.fetchDocumentViaWebsocket(doc, retry, wait, slowRounds);
+			return;
+		}
+
 		try {
 			// Get the current contents before applying the update
 			const currentText = doc.content;
@@ -1816,67 +1839,79 @@ export class TransferQueue extends Loggable {
 				"[getDocument] HTTP download failed, falling back to WS sync:",
 				(e as Error).message,
 			);
-			// Hold back the flush when the WS sync reports success but leaves
-			// doc.content empty and retries remain: this call only ever runs
-			// for a path the folder index's OWN metadata says exists on the
-			// relay (see _onServerCreate/applyServerRecord's "create" op) --
-			// there is no such thing as a legitimately-empty result here on
-			// the very first attempt. A relay room the server hasn't loaded
-			// into memory yet in this process's lifetime can answer
-			// sync-step-2 (and flip `synced`) off a still-loading, effectively
-			// empty placeholder before the persisted snapshot has actually
-			// landed, and by the time it does this client has already
-			// disconnected and lost it for good -- live-confirmed against the
-			// self-hosted stand's own "Loading doc" timing racing the
-			// connect/disconnect round trip. Same shape as the
-			// "uninitialized doc" HTTP-path retry above, applied to the WS
-			// path that's actually load-bearing for relay-onprem (the HTTP
-			// path here always 401s/SSL-errors for CWT tokens, so this catch
-			// block runs on effectively every relay-onprem doc).
-			const flushed = await this.fallbackToWebsocketSync(
-				doc,
-				"getDocument",
-				() => doc.vaultShare.writeContents(doc, doc.content),
-				() => !(doc.content === "" && (retry > 0 || slowRounds > 0)),
+			await this.fetchDocumentViaWebsocket(doc, retry, wait, slowRounds);
+		}
+	}
+
+	/**
+	 * WebSocket leg of `fetchDocument()`: the only path for relay-linked docs,
+	 * and the fallback when the HTTP download fails for any other doc.
+	 */
+	private async fetchDocumentViaWebsocket(
+		doc: Document,
+		retry: number,
+		wait: number,
+		slowRounds: number,
+	): Promise<void> {
+		// Hold back the flush when the WS sync reports success but leaves
+		// doc.content empty and retries remain: this call only ever runs
+		// for a path the folder index's OWN metadata says exists on the
+		// relay (see _onServerCreate/applyServerRecord's "create" op) --
+		// there is no such thing as a legitimately-empty result here on
+		// the very first attempt. A relay room the server hasn't loaded
+		// into memory yet in this process's lifetime can answer
+		// sync-step-2 (and flip `synced`) off a still-loading, effectively
+		// empty placeholder before the persisted snapshot has actually
+		// landed, and by the time it does this client has already
+		// disconnected and lost it for good -- live-confirmed against the
+		// self-hosted stand's own "Loading doc" timing racing the
+		// connect/disconnect round trip. Same shape as the
+		// "uninitialized doc" HTTP-path retry above, applied to the WS
+		// path that's actually load-bearing for relay-linked docs (they
+		// never take the HTTP path, see fetchDocument()).
+		const flushed = await this.fallbackToWebsocketSync(
+			doc,
+			"getDocument",
+			() => doc.vaultShare.writeContents(doc, doc.content),
+			() => !(doc.content === "" && (retry > 0 || slowRounds > 0)),
+		);
+		if (!flushed && doc.content === "" && retry === 0 && slowRounds > 0) {
+			this.warn(
+				"[getDocument] still empty after fast retries -- deferring re-fetch instead of writing a 0-byte file",
+				doc.entryPath,
+				slowRounds,
 			);
-			if (!flushed && doc.content === "" && retry === 0 && slowRounds > 0) {
-				this.warn(
-					"[getDocument] still empty after fast retries -- deferring re-fetch instead of writing a 0-byte file",
-					doc.entryPath,
-					slowRounds,
-				);
-				if (!doc.editLock) {
-					doc.goOffline();
-				}
-				this.clock.scheduleTimeout(() => {
-					void this.fetchDocument(doc, 3, 3000, slowRounds - 1);
-				}, SLOW_REFETCH_MS);
-			} else if (!flushed && doc.content === "" && retry > 0) {
-				this.log(
-					"[getDocument] WS sync reported success but content is still empty for a known-remote doc — retrying",
-					retry,
-					wait,
-				);
-				// Force the connection down before scheduling the retry --
-				// live-confirmed that leaving this out makes
-				// the retry a no-op: uploadDocumentViaSocket() already calls
-				// doc.goOffline() at its own end for an `intent === "disconnected"`
-				// doc, which SHOULD leave the provider ready for a fresh connect
-				// next time -- but relying on that path alone was insufficient in
-				// practice (reproduced live: content still empty after all 3
-				// retries, ~25s). Calling it again here, unconditionally, before
-				// the retry is scheduled, removes any dependency on exactly which
-				// internal branch of that prior call actually ran, and guarantees
-				// ProviderBacked.bringOnline()'s own `if (this.isOnline) return
-				// true` guard can't short-circuit the next attempt into re-reading
-				// whatever the stalled first connection settled on.
-				if (!doc.editLock) {
-					doc.goOffline();
-				}
-				this.clock.scheduleTimeout(() => {
-					void this.fetchDocument(doc, retry - 1, wait * 2, slowRounds);
-				}, wait);
+			if (!doc.editLock) {
+				doc.goOffline();
 			}
+			this.clock.scheduleTimeout(() => {
+				void this.fetchDocument(doc, 3, 3000, slowRounds - 1);
+			}, SLOW_REFETCH_MS);
+		} else if (!flushed && doc.content === "" && retry > 0) {
+			this.log(
+				"[getDocument] WS sync reported success but content is still empty for a known-remote doc — retrying",
+				retry,
+				wait,
+			);
+			// Force the connection down before scheduling the retry --
+			// live-confirmed that leaving this out makes
+			// the retry a no-op: uploadDocumentViaSocket() already calls
+			// doc.goOffline() at its own end for an `intent === "disconnected"`
+			// doc, which SHOULD leave the provider ready for a fresh connect
+			// next time -- but relying on that path alone was insufficient in
+			// practice (reproduced live: content still empty after all 3
+			// retries, ~25s). Calling it again here, unconditionally, before
+			// the retry is scheduled, removes any dependency on exactly which
+			// internal branch of that prior call actually ran, and guarantees
+			// ProviderBacked.bringOnline()'s own `if (this.isOnline) return
+			// true` guard can't short-circuit the next attempt into re-reading
+			// whatever the stalled first connection settled on.
+			if (!doc.editLock) {
+				doc.goOffline();
+			}
+			this.clock.scheduleTimeout(() => {
+				void this.fetchDocument(doc, retry - 1, wait * 2, slowRounds);
+			}, wait);
 		}
 	}
 
