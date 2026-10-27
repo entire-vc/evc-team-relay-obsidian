@@ -55,20 +55,22 @@ export class InboundSyncPoller {
 	 * vault is polled; any other one is checked once against the
 	 * web_content_updated_at the list already carries, so folders that are
 	 * not here cost no GET /v1/shares/{id} per poll. Called again on each
-	 * list load and on "Sync all shares".
+	 * list load and on "Sync all shares". `isLocalNow` re-checks presence
+	 * after that download: once it has written the folder, the share is polled.
 	 */
 	track(
 		shareId: string,
 		serverId: string,
 		local: boolean,
 		listedUpdatedAt: string | null | undefined,
+		isLocalNow?: () => boolean,
 	): void {
 		if (local) {
 			this.registerShare(shareId, serverId);
 			return;
 		}
 		this.watchedShares.delete(shareId);
-		void this.checkListedShare(shareId, serverId, listedUpdatedAt ?? null);
+		void this.checkListedShare(shareId, serverId, listedUpdatedAt ?? null, isLocalNow);
 	}
 
 	/** Download a share not in the poll set if its listed timestamp moved past the watermark. */
@@ -76,6 +78,7 @@ export class InboundSyncPoller {
 		shareId: string,
 		serverId: string,
 		listedUpdatedAt: string | null,
+		isLocalNow?: () => boolean,
 	): Promise<void> {
 		if (!listedUpdatedAt || listedUpdatedAt === (this.persistedUpdatedAt.get(shareId) ?? null)) {
 			return;
@@ -84,6 +87,7 @@ export class InboundSyncPoller {
 			const result = await this.fileDownloader.downloadShare(shareId, serverId);
 			if (result !== "skipped") {
 				this.persistedUpdatedAt.set(shareId, listedUpdatedAt);
+				if (isLocalNow?.()) this.registerShare(shareId, serverId);
 			}
 		} catch (err: unknown) {
 			log("Failed to download listed share", {

@@ -1375,6 +1375,7 @@ export default class TeamRelayPlugin extends Plugin {
 							share.serverId,
 							this.isShareFolderLocal(share.id, share.path),
 							share.web_content_updated_at,
+							() => this.isShareFolderLocal(share.id, share.path),
 						);
 					}
 				}
@@ -1477,6 +1478,7 @@ export default class TeamRelayPlugin extends Plugin {
 							defaultServerId,
 							this.isShareFolderLocal(share.id, share.path),
 							share.web_content_updated_at,
+							() => this.isShareFolderLocal(share.id, share.path),
 						);
 					}
 				}
@@ -1603,7 +1605,13 @@ export default class TeamRelayPlugin extends Plugin {
 						void folder.bringOnline();
 						relaySynced++;
 					} else {
-						this.inboundSyncPoller?.track(share.id, share.serverId, this.isShareFolderLocal(share.id, share.path), share.web_content_updated_at);
+						this.inboundSyncPoller?.track(
+							share.id,
+							share.serverId,
+							this.isShareFolderLocal(share.id, share.path),
+							share.web_content_updated_at,
+							() => this.isShareFolderLocal(share.id, share.path),
+						);
 					}
 				}
 			}

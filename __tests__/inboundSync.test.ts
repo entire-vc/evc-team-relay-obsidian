@@ -176,6 +176,28 @@ describe("InboundSyncPoller", () => {
 		expect(clientManager.getShare).not.toHaveBeenCalled();
 	});
 
+	test("a non-local share whose download wrote its folder is polled from then on", async () => {
+		let local = false;
+		(fileDownloader.downloadShare as unknown as jest.Mock<() => Promise<string>>).mockImplementation(
+			async () => {
+				local = true;
+				return "ran";
+			},
+		);
+
+		poller.track("remote", SERVER_ID, false, "2026-06-08T10:00:00Z", () => local);
+		await flushPromises();
+		expect(fileDownloader.downloadShare).toHaveBeenCalledTimes(1);
+
+		(clientManager.getShare as unknown as jest.Mock<() => Promise<unknown>>).mockResolvedValue(
+			makeShare("2026-06-08T12:00:00Z"),
+		);
+		poller.start();
+		timeProvider.setTime(startTime + 30_000);
+		await flushPromises();
+		expect(clientManager.getShare).toHaveBeenCalledWith(SERVER_ID, "remote", true);
+	});
+
 	test("skips downloadShare when web_content_updated_at is unchanged", async () => {
 		const ts = "2026-06-08T10:00:00Z";
 		(clientManager.getShare as jest.Mock).mockResolvedValue(makeShare(ts));
