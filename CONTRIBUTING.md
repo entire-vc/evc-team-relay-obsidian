@@ -49,7 +49,7 @@ in `artifacts`, and an HTTPS `decision` link to Daedalus's release decision. The
 and evidence must identify the same SHA and artifact digests. The workflow validates
 receipt structure and SHA binding; independent reviewers verify the linked evidence.
 
-The release workflow is dispatch-only: provide `version`, `candidate_sha` (40 hex
+The release workflow is dispatch-only from main: provide `version`, `candidate_sha` (40 hex
 characters), and `qa_receipt`. It checks that the accepted commit is on main and that
 an existing version tag points to that exact commit. It then builds and attests the
 candidate, restores the committed manifest, checks that the built artifact digests equal the accepted digests, and publishes
@@ -61,9 +61,8 @@ after publication. Promoting the stored artifacts directly remains a future impr
 Critical production security, data-loss/corruption or outage fixes may get their own
 urgent hotfix batch with incident, urgency, narrow diff and rollback recorded. This
 accelerates scheduling; the candidate, independent review and four-cell gate remain.
-Never silently replace stable assets or move a published tag. Re-running an interrupted
-publication for an existing version still requires the same accepted SHA and receipt;
-`allow_overwrite` is only an explicit recovery operation authorized on that card.
+Never silently replace stable assets or move a published tag. An interrupted run may be retried for the same accepted SHA and receipt if no stable
+release exists yet. The workflow refuses to replace an existing stable release.
 
 ### Why hand-publishing is refused
 
