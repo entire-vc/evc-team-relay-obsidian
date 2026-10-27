@@ -1093,7 +1093,6 @@ export class TransferQueue extends Loggable {
 			// Documents permanently unsynced.
 		}
 
-		const providerSynced = doc.onceEverSynced();
 		// A connection a background pull opened is not someone else's to keep:
 		// wait for this upload's own sync, then close it once the pull is done.
 		const borrowed = this.pullHolds.has(doc.entityGuid) || this.handedToUpload.has(doc.entityGuid);
@@ -1105,9 +1104,17 @@ export class TransferQueue extends Loggable {
 		}
 
 		if (intent === "disconnected") {
+			// This connection's own sync, not doc.onceEverSynced(): that flag
+			// is sticky, so for a note synced before it resolved at once while
+			// bringOnline() had only started a socket that could still be
+			// queued for its turn. The edit below then went into a socket that
+			// was not open yet, its frame was dropped, and the goOffline() at
+			// the end closed the socket before it opened -- the upload reported
+			// success and the edit reached the relay only on this note's next
+			// connect (0.1.25 under an 800-note bulk load: 34-38s).
 			// Add timeout to prevent infinite hang if provider never syncs
 			// (e.g., document disconnected by parent during connection)
-			const ok = await this.awaitProviderSyncWithTimeout(doc, providerSynced);
+			const ok = await this.awaitProviderSyncWithTimeout(doc, doc.onceFreshlySynced());
 			if (!ok) {
 				return false;
 			}

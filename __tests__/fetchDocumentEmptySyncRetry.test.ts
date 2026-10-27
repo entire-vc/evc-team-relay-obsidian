@@ -85,6 +85,7 @@ function makeFakeDoc(opts: FakeDocOptions) {
 		},
 	});
 	Object.defineProperty(fakeDoc, "onceEverSynced", { value: async () => {} });
+	Object.defineProperty(fakeDoc, "onceFreshlySynced", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "goOffline", { value: () => {} });
 	Object.defineProperty(fakeDoc, "getSyncBase", { value: async () => undefined });
 	Object.defineProperty(fakeDoc, "setSyncBase", { value: async () => {} });
