@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.18
+- Fixed: while many notes sync at once, for example during a large import, connections to closed notes no longer wait up to a minute for access to the server. The plugin now requests access up to 120 times a minute instead of 25, and slows down on its own if a server answers that it is busy.
+
 ## 0.1.17
 - Fixed: while edits to closed notes are waiting to sync, a large background import or upload now uses at most one connection at a time, so the edits are no longer slowed down by it. The import speeds back up once the edits are through.
 - Fixed: when another device reports a change to a closed note before the server has its text, the plugin now stays connected and receives the text as soon as it arrives, instead of reconnecting for each check.
