@@ -149,13 +149,13 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 	});
 
 	test("the reserved slot goes to an eligible share even when another is picked first", async () => {
-		// Y has one priority upload running, X two bulk ones: the lane is full
-		// and Y has fewer running, but only X's edit may use the reserved slot.
+		// Y has two priority uploads running, X one bulk: the lane is full and
+		// Y is picked first, but only X's edit may use the reserved slot.
 		const x = makeShare("X");
 		const y = makeShare("Y");
 		void queue.enqueueUpload(makeDoc(y, "y0.md"), { priority: true });
+		void queue.enqueueUpload(makeDoc(y, "y0b.md"), { priority: true });
 		void queue.enqueueUpload(makeDoc(x, "x-bulk0.md"));
-		void queue.enqueueUpload(makeDoc(x, "x-bulk1.md"));
 		await flushMacrotasks();
 		expect(started).toHaveLength(3);
 
@@ -166,6 +166,22 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		await flushMacrotasks();
 		expect(started).toHaveLength(4);
 		expect(started[3]).toBe("X:x-edit.md");
+	});
+
+	test("while an edit is queued or running, background uploads keep one slot", async () => {
+		// Measured on 0.1.15: our own import slowed the relay to 16-19s per
+		// upload, and the edits waited on the same relay.
+		const x = makeShare("X");
+		const y = makeShare("Y");
+		void queue.enqueueUpload(makeDoc(y, "edit.md"), { priority: true });
+		for (let i = 0; i < 4; i++) void queue.enqueueUpload(makeDoc(x, `bulk${i}.md`));
+		await flushMacrotasks();
+		expect(started).toEqual(["Y:edit.md", "X:bulk0.md"]);
+
+		finish.get("Y:edit.md")?.();
+		await flushMacrotasks();
+		// No edit left: the import takes the lane back.
+		expect(started).toEqual(["Y:edit.md", "X:bulk0.md", "X:bulk1.md", "X:bulk2.md"]);
 	});
 
 	test("the reserved slot serves a share with no priority item running", async () => {

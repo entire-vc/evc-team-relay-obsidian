@@ -711,6 +711,124 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("while another share has an edit waiting, an import keeps at most one regular slot", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const bulk = makeFolder("bulk", 0, pull, 3);
+		const notes = makeFolder("notes", 0, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([bulk, notes]) as never, 3_600_000);
+		poller.start();
+		for (let i = 0; i < 20; i++) {
+			bulk.trackedEntries.set(`bulk-${i}`, {
+				__isDocument: true,
+				isOnline: false,
+				entityGuid: `bulk-${i}`,
+				entryPath: `bulk/${i}.md`,
+			});
+			bulk.announce(`bulk-${i}`, textFingerprint(`created ${i}`));
+		}
+		await flushPromises();
+		const bulkRunning = () => held.filter((h) => h.file.entityGuid.startsWith("bulk-")).length;
+		expect(bulkRunning()).toBe(3);
+
+		notes.trackedEntries.set("note", { __isDocument: true, isOnline: false, entityGuid: "note", entryPath: "notes/note.md" });
+		notes.announce("note", textFingerprint("edited"));
+		await flushPromises();
+		expect(startedGuids(pull)).toContain("note");
+
+		// Bulk pulls finishing don't hand their slots to more bulk while the
+		// note is in flight: they drain down to one.
+		for (let i = 0; i < 3; i++) {
+			const index = held.findIndex((h) => h.file.entityGuid.startsWith("bulk-"));
+			held.splice(index, 1)[0].resolve({ outcome: "unchanged", remoteText: "x" });
+			await flushPromises();
+		}
+		expect(bulkRunning()).toBe(1);
+		expect(poller.stats().importing).toEqual(["bulk"]);
+
+		// The note arrives: the import gets the lane back.
+		held.splice(held.findIndex((h) => h.file.entityGuid === "note"), 1)[0].resolve({
+			outcome: "unchanged",
+			remoteText: "edited",
+		});
+		await flushPromises();
+		expect(bulkRunning()).toBe(3);
+		poller.destroy();
+	});
+
+	test("an announced pull waits connected for the text, without holding a slot or hitting the deadline", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("a", 0, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		for (let i = 0; i < 2; i++) {
+			folder.trackedEntries.set(`a-${i}`, { __isDocument: true, isOnline: false, entityGuid: `a-${i}`, entryPath: `a/${i}.md` });
+		}
+		folder.announce("a-0", textFingerprint("first"));
+		await flushPromises();
+		const [first] = held;
+		expect(first.file.entityGuid).toBe("a-0");
+		expect(first.control.expected?.()).toBe(textFingerprint("first"));
+		expect(first.control.awaitContentMs).toBeGreaterThan(0);
+
+		// A newer announcement while it waits is what it waits for.
+		folder.announce("a-0", textFingerprint("second"));
+		expect(first.control.expected?.()).toBe(textFingerprint("second"));
+
+		first.control.onPhase?.("await-content");
+		folder.announce("a-1", textFingerprint("other"));
+		await flushPromises();
+		// The one slot went to a-1 while a-0 waits.
+		expect(startedGuids(pull)).toEqual(["a-0", "a-1"]);
+		expect(poller.stats().awaiting).toBe(1);
+
+		clock.setTime(t0 + PULL_DEADLINE_MS + 1_000);
+		await flushPromises();
+		expect(first.control.signal?.aborted).toBe(false);
+		poller.destroy();
+	});
+
+	test("the relay probe times one control document every interval and keeps it out of the sweep", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("a", 2, pull, 3);
+		let probes = 0;
+		let releaseFirst: () => void = () => undefined;
+		const firstHeld = new Promise<void>((resolve) => (releaseFirst = resolve));
+		const probeRelay = jest.fn(async () => {
+			probes++;
+			const n = probes;
+			if (n === 1) await firstHeld;
+			return { at: clock.now(), connectMs: 100 * n, syncMs: 50, ok: n !== 2 };
+		});
+		(folder.transfers as unknown as { probeRelay: typeof probeRelay }).probeRelay = probeRelay;
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.startRelayProbe("a/0.md", 10_000);
+		// The sweep doesn't pull the document while it is being probed.
+		poller.start();
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["a-1"]);
+		releaseFirst();
+		await flushPromises();
+		for (const t of [10_000, 20_000]) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+		}
+		expect(probeRelay).toHaveBeenCalledTimes(3);
+		expect(probeRelay.mock.calls[0]).toEqual([folder.trackedEntries.get("a-0")]);
+		const stats = poller.stats().relayProbe;
+		expect(stats.samples).toHaveLength(3);
+		expect(stats.failed).toBe(1);
+		expect(stats.connectMs.max).toBe(300);
+
+		poller.stopRelayProbe();
+		clock.setTime(t0 + 40_000);
+		await flushPromises();
+		expect(probeRelay).toHaveBeenCalledTimes(3);
+		poller.destroy();
+	});
+
 	test("one express pull at a time; regular slots stay at laneLimit", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
