@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.24
+- Fixed: an edit to a closed note made while the note was briefly syncing in the background no longer waits up to a minute and a half to reach other devices. It is now sent right away.
+
 ## 0.1.23
 - Improved: the sync health check now records, for each recent edit to a closed note, how long it took to upload and how long the other device took to fetch it, so slow deliveries can be traced to their cause.
 
