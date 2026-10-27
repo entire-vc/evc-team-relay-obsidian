@@ -284,6 +284,33 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(maxInFlight).toBe(1);
 	});
 
+	test("documents whose tokens lapsed ask one at a time even while another document's grant is still current", async () => {
+		mockFetch.mockImplementation(() => respond(200));
+		const { cache, clock, docIn } = build();
+		const docs = [1, 2, 3, 4, 5, 6, 7].map((n) => `88888888-8888-4888-8888-88888888889${n}`);
+		const ids = docs.map((d) => ResourceAddress.serialize(new RemoteDocumentAddress("relay-onprem", G, d)));
+		for (const p of docs.map(docIn)) void p.bringOnline();
+		await jest.advanceTimersByTimeAsync(10_000);
+
+		// One more document is granted later: the share's latest grant outlives the others.
+		jest.setSystemTime(Date.now() + 4 * MINUTE);
+		clock.setTime(clock.now() + 4 * MINUTE);
+		void docIn("88888888-8888-4888-8888-888888888899").bringOnline();
+		await jest.advanceTimersByTimeAsync(10_000);
+
+		// The first seven lapse; access was revoked meanwhile.
+		jest.setSystemTime(Date.now() + 2 * MINUTE);
+		clock.setTime(clock.now() + 2 * MINUTE);
+		mockFetch.mockImplementation(() => respondSlowly(401, 5_000));
+		maxInFlight = 0;
+		const before = tokenCalls();
+		for (const id of ids) void cache.getToken(id, id, () => {}, "server-a").catch(() => undefined);
+		await jest.advanceTimersByTimeAsync(10 * MINUTE);
+
+		expect(maxInFlight).toBe(1);
+		expect(tokenCalls() - before).toBeLessThanOrEqual(4);
+	});
+
 	test("a successful connect drops the retry an earlier refusal left waiting", async () => {
 		mockFetch.mockImplementation(() => respond(401));
 		const { cache, pb } = build();

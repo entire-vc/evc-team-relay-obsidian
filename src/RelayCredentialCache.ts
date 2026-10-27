@@ -67,6 +67,9 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// sleep the share may have been revoked, so it is probed again first.
 	private grantedShares = new Map<string, number>();
 	private shareProbes = new Map<string, Promise<void>>();
+	// Documents that have held a token: asking again is a renewal, even once
+	// the cache has dropped the lapsed token before asking.
+	private heldDocuments = new Set<string>();
 	private accessListeners = new Set<(shareId: string) => void>();
 
 	constructor(
@@ -192,7 +195,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		// Renewals of tokens a document already holds always ask one at a
 		// time: nothing waits on them, and a share refused mid-session must
 		// not cost one request per renewal running at once.
-		const renewing = !!this.tokenEntries?.get(documentId)?.token;
+		const renewing = this.heldDocuments.has(documentId) || !!this.tokenEntries?.get(documentId)?.token;
 		const serialized = () =>
 			renewing || !((this.grantedShares.get(shareId) ?? 0) > Date.now());
 		for (;;) {
@@ -226,6 +229,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 				documentId,
 				(grant) => {
 					const wasDenied = this.accessDenied.isDenied(shareId);
+					this.heldDocuments.add(documentId);
 					// No expiry on the grant: count it good for the token
 					// lifetime the sweep assumes when it cannot read one.
 					const expiry = getJwtExpiryFromDocumentGrant(grant) || Date.now() + GRANT_FALLBACK_MS;
@@ -283,6 +287,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 
 	clear(filter?: (token: CredentialEntry<DocumentGrant>) => boolean) {
 		if (!filter) {
+			this.heldDocuments.clear();
 			this.filePathMap.clear();
 			this.documentServerMap.clear();
 			super.purge(filter);
@@ -290,6 +295,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		}
 		this.tokenEntries?.forEach((value, key) => {
 			if (filter(value)) {
+				this.heldDocuments.delete(key);
 				this.filePathMap.delete(key);
 				this.documentServerMap.delete(key);
 			}
@@ -298,6 +304,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	}
 
 	destroy() {
+		this.heldDocuments.clear();
 		this.filePathMap.clear();
 		this.documentServerMap.clear();
 		for (const provider of this.relayOnPremProviders.values()) {
