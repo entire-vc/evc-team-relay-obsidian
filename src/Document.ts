@@ -298,8 +298,8 @@ export class Document extends ProviderBacked implements SyncableEntry, MimeTyped
 
 		// Relay-linked docs (relayId is set for ANY doc belonging to a Team
 		// Relay workspace — hosted or self-hosted on-prem, not just genuinely
-		// self-hosted installs; see ): the HTTP `as-update`
-		// endpoint always 401s for CWT tokens (TransferQueue.fetchItem) —
+		// self-hosted installs; see ): they never use the HTTP
+		// `as-update` endpoint (TransferQueue.fetchDocument skips it) —
 		// WebSocket sync is authoritative instead, so this.crdtDoc/this.content is
 		// already kept current by the live WS connection. Skip the doomed
 		// HTTP re-fetch, but still run the real staleness comparison below
