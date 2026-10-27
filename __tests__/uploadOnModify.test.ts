@@ -4,7 +4,7 @@
  */
 
 import { describe, test, expect } from "@jest/globals";
-import { uploadsOnModify } from "../src/uploadOnModify";
+import { holdsOnlySyncedText, uploadsOnModify } from "../src/uploadOnModify";
 
 describe("uploadsOnModify", () => {
 	test("a closed note that a background pull holds connected still uploads its edit", () => {
@@ -18,5 +18,19 @@ describe("uploadsOnModify", () => {
 
 	test("a connected note bound to an editor leaves the edit to the editor", () => {
 		expect(uploadsOnModify({ isOnline: true, editLock: true })).toBe(false);
+	});
+});
+
+describe("holdsOnlySyncedText", () => {
+	test("a file holding the Y.Doc's text (a pull's own write) has nothing to upload", async () => {
+		expect(await holdsOnlySyncedText({ content: "relay text" }, async () => "relay text")).toBe(true);
+	});
+
+	test("a file with an edit the Y.Doc lacks is uploaded", async () => {
+		expect(await holdsOnlySyncedText({ content: "relay text" }, async () => "relay text\nedit")).toBe(false);
+	});
+
+	test("a failed read uploads rather than risk dropping an edit", async () => {
+		expect(await holdsOnlySyncedText({ content: "x" }, () => Promise.reject(new Error("gone")))).toBe(false);
 	});
 });

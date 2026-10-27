@@ -1,3 +1,5 @@
+import { sameTextContent } from "./textEquivalence";
+
 /**
  * Whether a vault "modify" of a shared document must be pushed through the
  * upload lane. Only an editor bound to the document (editLock) writes its
@@ -9,4 +11,17 @@
  */
 export function uploadsOnModify(doc: { isOnline: boolean; editLock: boolean }): boolean {
 	return !doc.isOnline || !doc.editLock;
+}
+
+/**
+ * For a document connected without an editor: whether the file only holds
+ * what the Y.Doc already has -- typically a background pull's own write
+ * landing as a "modify" -- so there is nothing to upload.
+ */
+export async function holdsOnlySyncedText(doc: { content: string }, read: () => Promise<string>): Promise<boolean> {
+	try {
+		return sameTextContent(await read(), doc.content);
+	} catch {
+		return false;
+	}
 }
