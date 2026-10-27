@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.26
+- Fixed: an idle vault no longer re-checks every note with the server back to back. The background check of a shared folder now runs at most once every fifteen minutes, which sharply cuts the load one device puts on the server. Changes announced by other devices still arrive right away.
+
 ## 0.1.25
 - Fixed: during a large import, a change from another device that the server was slow to hand over no longer sits unseen for up to forty seconds. The plugin now asks the server again after a few seconds.
 
