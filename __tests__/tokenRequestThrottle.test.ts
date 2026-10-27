@@ -20,6 +20,7 @@ import {
 	TOKEN_REQUEST_BURST,
 	TOKEN_REQUESTS_PER_MINUTE,
 	TOKEN_REQUESTS_PER_MINUTE_LIMITED,
+	TOKEN_RATE_LIMITED_HOLD_MS,
 } from "../src/auth/RelayOnPremTokenProvider";
 
 const flush = async () => {
@@ -64,8 +65,8 @@ describe("TokenRequestThrottle", () => {
 
 	test("after a 429 it holds the old rate with no burst, then recovers", async () => {
 		const throttle = new TokenRequestThrottle();
-		throttle.slowDown(120_000);
-		const state = acquireMany(throttle, 20);
+		throttle.slowDown(0);
+		const state = acquireMany(throttle, 400);
 		await flush();
 		expect(state.done).toBe(0);
 
@@ -74,13 +75,78 @@ describe("TokenRequestThrottle", () => {
 		await flush();
 		expect(state.done).toBe(3);
 
-		// Past the hold: back to the steady rate.
-		jest.advanceTimersByTime(120_000);
+		// Through the whole hold: the old rate only.
+		jest.advanceTimersByTime(TOKEN_RATE_LIMITED_HOLD_MS - interval * 3 - 1_000);
 		await flush();
-		jest.advanceTimersByTime(10_000);
+		const held = state.done;
+		expect(held).toBeLessThanOrEqual(Math.ceil(TOKEN_RATE_LIMITED_HOLD_MS / interval));
+		// Past it: the rest at the steady rate.
+		const rest = 400 - held;
+		jest.advanceTimersByTime(1_000 + Math.ceil((rest * 60_000) / TOKEN_REQUESTS_PER_MINUTE) + 1_000);
 		await flush();
-		expect(state.done).toBe(20);
+		expect(state.done).toBe(400);
 		throttle.destroy();
+	});
+
+	test("time spent in a hold is credited at the old rate, not the steady one", async () => {
+		const throttle = new TokenRequestThrottle();
+		acquireMany(throttle, TOKEN_REQUEST_BURST);
+		await flush();
+		throttle.slowDown(0);
+		// Idle through the hold and one second past it.
+		jest.advanceTimersByTime(TOKEN_RATE_LIMITED_HOLD_MS + 1_000);
+		const state = acquireMany(throttle, 10);
+		await flush();
+		// At most 1 saved during the hold, plus 1s at 120/min = 2.
+		expect(state.done).toBe(3);
+		throttle.destroy();
+	});
+
+	test("429s that keep coming after each hold make the hold longer", async () => {
+		const throttle = new TokenRequestThrottle();
+		const interval = Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE_LIMITED);
+		throttle.slowDown(0);
+		jest.advanceTimersByTime(TOKEN_RATE_LIMITED_HOLD_MS + 1_000);
+		// Right after the first hold: another 429, so 20 min this time.
+		throttle.slowDown(0);
+		jest.advanceTimersByTime(TOKEN_RATE_LIMITED_HOLD_MS + 60_000);
+		const state = acquireMany(throttle, 10);
+		await flush();
+		jest.advanceTimersByTime(interval * 2);
+		await flush();
+		// Still on the old rate 11 minutes in.
+		expect(state.done).toBeLessThanOrEqual(3);
+		throttle.destroy();
+	});
+
+	test("a clock stepped back doesn't stall the queue", async () => {
+		const throttle = new TokenRequestThrottle();
+		acquireMany(throttle, TOKEN_REQUEST_BURST);
+		await flush();
+		jest.setSystemTime(Date.now() - 3_600_000);
+		const state = acquireMany(throttle, 3);
+		jest.advanceTimersByTime(5_000);
+		await flush();
+		expect(state.done).toBe(3);
+		throttle.destroy();
+	});
+
+	test("one timer for any number of waiters; destroy() releases them and leaves no timer", async () => {
+		const throttle = new TokenRequestThrottle(60, 1);
+		const state = acquireMany(throttle, 5);
+		await flush();
+		expect(state.done).toBe(1);
+		expect(jest.getTimerCount()).toBe(1);
+		throttle.slowDown();
+		void throttle.acquire().then(() => state.done++);
+		expect(jest.getTimerCount()).toBe(1);
+
+		throttle.destroy();
+		await flush();
+		expect(state.done).toBe(6);
+		expect(jest.getTimerCount()).toBe(0);
+		await throttle.acquire();
+		expect(jest.getTimerCount()).toBe(0);
 	});
 
 	test("FIFO order", async () => {

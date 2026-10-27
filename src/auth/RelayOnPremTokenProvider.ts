@@ -78,6 +78,8 @@ export const TOKEN_REQUEST_BURST = 10;
 export const TOKEN_REQUESTS_PER_MINUTE_LIMITED = 25;
 /** How long the slower rate holds after a 429 (at least the Retry-After). */
 export const TOKEN_RATE_LIMITED_HOLD_MS = 10 * 60_000;
+/** A 429 soon after a hold ended doubles the next hold, up to this. */
+export const TOKEN_RATE_LIMITED_MAX_HOLD_MS = 60 * 60_000;
 
 /**
  * Token bucket in front of POST /v1/tokens/relay: up to `burst` requests at
@@ -88,12 +90,14 @@ export const TOKEN_RATE_LIMITED_HOLD_MS = 10 * 60_000;
  * it became the bottleneck: measured on a two-client stand, both clients sat
  * at the ceiling and each new connection queued ~47s for its token. A server
  * that still has the old limit answers 429; `slowDown()` then drops to the
- * old rate for a while.
+ * old rate for a while, longer each time the server keeps answering 429.
  */
 export class TokenRequestThrottle {
 	private tokens: number;
 	private refilledAt = Date.now();
 	private limitedUntil = 0;
+	private holdMs = TOKEN_RATE_LIMITED_HOLD_MS;
+	private destroyed = false;
 	private queue: Array<() => void> = [];
 	private timer: number | null = null;
 	private log = namedLogger("[TokenRequestThrottle]", "debug");
@@ -107,32 +111,56 @@ export class TokenRequestThrottle {
 
 	/** Resolves when it is this caller's turn to make a network request (FIFO). */
 	acquire(): Promise<void> {
+		if (this.destroyed) return Promise.resolve();
 		return new Promise((resolve) => {
 			this.queue.push(resolve);
 			if (this.timer === null) this.dispatch();
 		});
 	}
 
-	/** The server answered 429: hold the old rate for `holdMs`, with no burst. */
-	slowDown(holdMs = TOKEN_RATE_LIMITED_HOLD_MS): void {
+	/**
+	 * The server answered 429: hold the old rate, with no burst, for at least
+	 * `minHoldMs`. A 429 within one hold of the previous hold ending means the
+	 * server really has the old limit, so the hold doubles (up to an hour).
+	 */
+	slowDown(minHoldMs = TOKEN_RATE_LIMITED_HOLD_MS): void {
 		this.refill();
-		this.limitedUntil = Math.max(this.limitedUntil, Date.now() + holdMs);
+		const now = Date.now();
+		if (now >= this.limitedUntil) {
+			const sinceHold = now - this.limitedUntil;
+			this.holdMs =
+				this.limitedUntil > 0 && sinceHold < this.holdMs
+					? Math.min(this.holdMs * 2, TOKEN_RATE_LIMITED_MAX_HOLD_MS)
+					: TOKEN_RATE_LIMITED_HOLD_MS;
+		}
+		this.limitedUntil = Math.max(this.limitedUntil, now + Math.max(minHoldMs, this.holdMs));
 		this.tokens = Math.min(this.tokens, 0);
-		this.log(`rate limited by the server; ${TOKEN_REQUESTS_PER_MINUTE_LIMITED}/min for ${holdMs}ms`);
+		this.log(`rate limited by the server; ${TOKEN_REQUESTS_PER_MINUTE_LIMITED}/min until ${this.limitedUntil}`);
 	}
 
-	private limited(): boolean {
-		return Date.now() < this.limitedUntil;
+	private limited(at = Date.now()): boolean {
+		return at < this.limitedUntil;
 	}
 
-	private intervalMs(): number {
-		return Math.ceil(60_000 / (this.limited() ? TOKEN_REQUESTS_PER_MINUTE_LIMITED : this.perMinute));
+	private intervalMs(at = Date.now()): number {
+		return Math.ceil(60_000 / (this.limited(at) ? TOKEN_REQUESTS_PER_MINUTE_LIMITED : this.perMinute));
 	}
 
+	/** Credits the time since the last refill, at the rate that applied to each part of it. */
 	private refill(): void {
 		const now = Date.now();
-		const capacity = this.limited() ? 1 : this.burst;
-		this.tokens = Math.min(capacity, this.tokens + (now - this.refilledAt) / this.intervalMs());
+		// A clock stepped back credits nothing (instead of a huge debt).
+		const from = Math.min(this.refilledAt, now);
+		const holdEnd = Math.min(Math.max(this.limitedUntil, from), now);
+		const limitedSpan = holdEnd - from;
+		const freeSpan = now - holdEnd;
+		if (limitedSpan > 0) {
+			this.tokens = Math.min(1, this.tokens + limitedSpan / Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE_LIMITED));
+		}
+		if (freeSpan > 0 || !this.limited(now)) {
+			const capacity = this.limited(now) ? 1 : this.burst;
+			this.tokens = Math.min(capacity, this.tokens + freeSpan / Math.ceil(60_000 / this.perMinute));
+		}
 		this.refilledAt = now;
 	}
 
@@ -153,6 +181,7 @@ export class TokenRequestThrottle {
 	}
 
 	destroy() {
+		this.destroyed = true;
 		if (this.timer !== null) {
 			window.clearTimeout(this.timer);
 			this.timer = null;
@@ -277,7 +306,7 @@ export class RelayOnPremTokenProvider {
 				console.warn(
 					`[DIAG][RelayOnPremTokenProvider] 429 rate limited for doc ${docId}. retryAfter=${retryAfterMs}ms body=${errorText}`
 				);
-				this.throttle.slowDown(Math.max(retryAfterMs, TOKEN_RATE_LIMITED_HOLD_MS));
+				this.throttle.slowDown(retryAfterMs);
 				throw new RateLimitError(retryAfterMs, `Token request rate limited for doc ${docId}`);
 			}
 
