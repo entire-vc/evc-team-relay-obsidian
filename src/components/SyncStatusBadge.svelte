@@ -8,9 +8,10 @@
 	export let linked: RemoteFolderRecord | undefined;
 	export let progressPercent = 0;
 	export let transferPhase: "pending" | "running" | "completed" | "failed" = "pending";
+	export let accessDenied = false;
 
 	$: progressVisible = progressPercent > 0 && (progressPercent < 100 || transferPhase !== "completed");
-	$: relayLabel = `${linked?.workspace.displayName ?? "Relay Server"} (${connectionStatus})`;
+	$: relayLabel = `${linked?.workspace.displayName ?? "Relay Server"} (${accessDenied ? "no access" : connectionStatus})`;
 </script>
 
 <div class="evc-relay-folder-icons">
@@ -23,7 +24,7 @@
 		<span aria-label="Tracking Changes" class="notebook evc-relay-icon hidden">
 			<Layers class="evc-inline-icon" style="width: 0.8em" />
 		</span>
-		<span aria-label={relayLabel} class="satellite evc-relay-icon evc-relay-{connectionStatus}">
+		<span aria-label={relayLabel} class="satellite evc-relay-icon evc-relay-{connectionStatus}" class:evc-relay-no-access={accessDenied}>
 			<Satellite class="evc-inline-icon" />
 		</span>
 	{:else}
@@ -65,6 +66,10 @@
 
 	span.evc-relay-disconnected {
 		color: var(--color-base-40);
+	}
+
+	span.evc-relay-no-access {
+		color: var(--color-red);
 	}
 
 	span.hidden {

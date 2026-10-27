@@ -239,8 +239,16 @@ const PROBE_PHASE_TIMEOUT_MS = 30_000;
  */
 const RECONCILE_SETTLE_OUTER_TIMEOUT_MS = 8_000;
 
-/** Spacing of the slow re-fetch rounds for a doc that keeps reading empty (#266). */
-const SLOW_REFETCH_MS = 5 * 60 * 1000;
+/**
+ * Delays before each slow re-fetch round for a doc that keeps reading empty
+ * after the fast retries (#266). Short first steps pick up content that
+ * lands just after the fast budget (a cold room, a late peer upload) within
+ * seconds instead of a flat 5 min; the tail keeps the total wait
+ * before accepting a genuinely empty note above the old 3 x 5 min.
+ */
+const SLOW_REFETCH_SCHEDULE_MS = [
+	5_000, 10_000, 20_000, 40_000, 60_000, 120_000, 300_000, 300_000, 300_000,
+];
 
 /**
  * Slots on top of `laneLimit` that only priority items may take, and only
@@ -1884,11 +1892,17 @@ export class TransferQueue extends Loggable {
 
 	/**
 	 * `slowRounds`: once the fast retry budget is spent while a known-remote doc
-	 * still reads empty, re-fetch this many more times at SLOW_REFETCH_MS spacing
-	 * before accepting it as a genuinely empty note. Writing a 0-byte file earlier
-	 * is permanent -- it looks "present" to every later pass (#266).
+	 * still reads empty, re-fetch this many more times, one attempt per round on
+	 * the SLOW_REFETCH_SCHEDULE_MS delays, before accepting it as a genuinely
+	 * empty note. Writing a 0-byte file earlier is permanent -- it looks
+	 * "present" to every later pass (#266).
 	 */
-	private async fetchDocument(doc: Document, retry = 3, wait = 3000, slowRounds = 3) {
+	private async fetchDocument(
+		doc: Document,
+		retry = 3,
+		wait = 3000,
+		slowRounds = SLOW_REFETCH_SCHEDULE_MS.length,
+	) {
 		// Relay-linked docs sync over the WebSocket: skip the HTTP
 		// `as-update` round trip that would only fall back to it anyway.
 		// Under bulk syncs it used to fire once per fetched doc and log an
@@ -2010,9 +2024,12 @@ export class TransferQueue extends Loggable {
 			if (!doc.editLock) {
 				doc.goOffline();
 			}
+			const step = Math.max(0, SLOW_REFETCH_SCHEDULE_MS.length - slowRounds);
+			const delay =
+				SLOW_REFETCH_SCHEDULE_MS[Math.min(step, SLOW_REFETCH_SCHEDULE_MS.length - 1)];
 			this.clock.scheduleTimeout(() => {
-				void this.fetchDocument(doc, 3, 3000, slowRounds - 1);
-			}, SLOW_REFETCH_MS);
+				void this.fetchDocument(doc, 0, wait, slowRounds - 1);
+			}, delay);
 		} else if (!flushed && doc.content === "" && retry > 0) {
 			this.log(
 				"[getDocument] WS sync reported success but content is still empty for a known-remote doc — retrying",

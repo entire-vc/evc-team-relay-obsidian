@@ -83,6 +83,24 @@ export const TOKEN_RATE_LIMITED_HOLD_MS = 10 * 60_000;
 export const TOKEN_RATE_LIMITED_MAX_HOLD_MS = 60 * 60_000;
 
 /**
+ * The control plane refused the token outright: 401, or 403 even for read.
+ * Retrying soon gives the same answer, so callers back off (see
+ * accessDeniedBackoff.ts). `retryAt` is set by RelayCredentialCache once the
+ * refusal is recorded.
+ */
+export class RelayAccessDeniedError extends Error {
+	retryAt?: number;
+
+	constructor(
+		public readonly status: number,
+		message?: string,
+	) {
+		super(message ?? `Relay token refused: ${status}`);
+		this.name = "RelayAccessDeniedError";
+	}
+}
+
+/**
  * Token bucket in front of POST /v1/tokens/relay: up to `burst` requests at
  * once, then `perMinute`, served FIFO, except that background requests (see
  * tokenRequestClass.ts) go after every other waiting request.
@@ -239,6 +257,13 @@ export class RelayOnPremTokenProvider {
 	private normalizedUrl: string;
 	/** Shared throttle — all token requests for this provider share one queue */
 	private throttle: TokenRequestThrottle;
+	/**
+	 * Shares refused even for read. Their next probe asks for read only, so a
+	 * refused share costs one request per backoff window instead of two
+	 * (write -> 403 -> read -> 403). Any granted token removes the share, and
+	 * the next refresh asks for write again.
+	 */
+	private refusedShares = new Set<string>();
 
 	constructor(private config: RelayOnPremTokenConfig) {
 		// Normalize URL - remove trailing slashes to prevent double-slash issues
@@ -273,6 +298,10 @@ export class RelayOnPremTokenProvider {
 
 		if (!token) {
 			throw new Error("Not authenticated");
+		}
+
+		if (mode === "write" && this.refusedShares.has(folderId)) {
+			mode = "read";
 		}
 
 		this.log(`Requesting relay token for doc ${docId} in folder ${folderId}${filePath ? ` (file: ${filePath})` : ""}`);
@@ -332,12 +361,22 @@ export class RelayOnPremTokenProvider {
 				return this.requestToken(relayId, folderId, docId, "read", filePath);
 			}
 
+			if (response.status === 401 || response.status === 403) {
+				this.refusedShares.add(folderId);
+				const errorText = await response.text().catch(() => "");
+				throw new RelayAccessDeniedError(
+					response.status,
+					`Token request failed: ${response.status} - ${errorText}`,
+				);
+			}
+
 			if (!response.ok) {
 				const errorText = await response.text();
 				throw new Error(`Token request failed: ${response.status} - ${errorText}`);
 			}
 
 			const data = await response.json() as RelayTokenResponse;
+			this.refusedShares.delete(folderId);
 
 			// Convert to DocumentGrant format expected by the plugin
 			const expiryTime = localExpiryTime(data.expires_at, response.headers.get("Date"), data.expires_in);
