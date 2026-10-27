@@ -33,6 +33,9 @@ export function shareIdOf(documentId: string): string {
 	}
 }
 
+/** How long a share's token request may hold up the next one of that share. */
+const PROBE_WAIT_MS = 30_000;
+
 export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// Multi-server: one RelayOnPremTokenProvider per configured on-prem
 	// server, each bound to that server's own controlPlaneUrl + auth
@@ -184,10 +187,18 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		// costs a working share no throughput: the throttle already spaces
 		// token requests 500 ms apart, longer than the request takes
 		// (control plane p99 about 230 ms, 27.10).
+		// A request that never settles (no network timeout below) must not
+		// hold its share forever: past PROBE_WAIT_MS the next one takes over.
 		for (;;) {
 			const probe = this.shareProbes.get(shareId);
 			if (!probe) break;
-			await probe;
+			let timer: number | undefined;
+			const timedOut = await Promise.race([
+				probe.then(() => false),
+				new Promise<boolean>((resolve) => (timer = window.setTimeout(() => resolve(true), PROBE_WAIT_MS))),
+			]);
+			window.clearTimeout(timer);
+			if (timedOut && this.shareProbes.get(shareId) === probe) this.shareProbes.delete(shareId);
 		}
 		const retryAt = this.accessDenied.retryAt(shareId, Date.now());
 		if (retryAt !== undefined) {

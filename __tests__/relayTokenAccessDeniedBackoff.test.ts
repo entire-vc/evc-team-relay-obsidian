@@ -334,6 +334,22 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(tokenCalls() - before).toBeLessThanOrEqual(4);
 	});
 
+	test("a token request that never settles holds up its share's next request for 30 s, not forever", async () => {
+		mockFetch.mockImplementationOnce(() => new Promise<Response>(() => {}));
+		mockFetch.mockImplementation(() => respond(200));
+		const { cache } = build();
+		const [hung, next] = DOCS.map((d) => ResourceAddress.serialize(new RemoteDocumentAddress("relay-onprem", G, d)));
+		void cache.getToken(hung, hung, () => {}, "server-a").catch(() => undefined);
+		await jest.advanceTimersByTimeAsync(3_000);
+		let granted = false;
+		void cache.getToken(next, next, () => (granted = true), "server-a");
+
+		await jest.advanceTimersByTimeAsync(20_000);
+		expect(granted).toBe(false);
+		await jest.advanceTimersByTimeAsync(15_000);
+		expect(granted).toBe(true);
+	});
+
 	test("a successful connect drops the retry an earlier refusal left waiting", async () => {
 		mockFetch.mockImplementation(() => respond(401));
 		const { cache, pb } = build();
