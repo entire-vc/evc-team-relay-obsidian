@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.28
+- Fixed: a note deleted on another device while this device was offline came back after this device restarted, on every device and as a new note. A note removed while you were away is now deleted locally after the restart and is no longer uploaded again.
+
 ## 0.1.27
 - Fixed: during a large import, an edit to a closed note could be reported as sent while its connection was still waiting to open, and then reached other devices only half a minute or more later. The plugin now waits until the connection is ready before sending the edit.
 
