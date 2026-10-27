@@ -56,6 +56,7 @@ import { Plugin } from "obsidian";
 
 // Core sync/data model
 import { VaultShare, ShareRegistry } from "./VaultShare";
+import { holdsOnlySyncedText, uploadsOnModify } from "./uploadOnModify";
 import type { VaultShareSettings } from "./VaultShare";
 import { ViewBindingRegistry } from "./ViewBindings";
 import { RelayRegistry } from "./RelayRegistry";
@@ -2006,12 +2007,19 @@ export default class TeamRelayPlugin extends Plugin {
 						if (file && isAttachmentFile(file)) {
 							void file.runSync();
 						}
-						// For Documents (folder share files): if the file has no active
-						// WS connection, edits bypass Y.Text entirely (no live CM binding).
-						// Enqueue a background sync to push vault content to relay.
-						// When connected, LiveCMPluginValue handles sync automatically.
-						if (file && isDocument(file) && !file.isOnline) {
-							void folder.transfers.enqueueUpload(file, { priority: true });
+						// For Documents (folder share files): without an editor bound to
+						// the document, edits bypass Y.Text entirely (no live CM binding),
+						// even while a background pull holds it connected. Enqueue a sync
+						// to push vault content to relay. With an editor bound and
+						// connected, LiveCMPluginValue handles sync automatically.
+						if (file && isDocument(file) && uploadsOnModify(file)) {
+							if (!file.isOnline) {
+								void folder.transfers.enqueueUpload(file, { priority: true });
+							} else if (tfile instanceof TFile) {
+								void holdsOnlySyncedText(file, () => this.app.vault.read(tfile)).then((echo) => {
+									if (!echo) void folder.transfers.enqueueUpload(file, { priority: true });
+								});
+							}
 						}
 					}
 					// Trigger metadata resolve with the actual TFile (not our Document proxy)

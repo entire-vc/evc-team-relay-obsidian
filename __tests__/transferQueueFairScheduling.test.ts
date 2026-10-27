@@ -144,6 +144,7 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		const trace = queue.priorityUploadTrace();
 		expect(trace).toHaveLength(1);
 		expect(trace[0]).toMatchObject({ path: "Small/edited.md", runMs: 250, waitMs: 0, ok: true, ranAsPriority: true });
+		expect(trace[0].endedAt - trace[0].enqueuedAt).toBe(250);
 	});
 
 	test("a share whose whole backlog is priority can't take the reserved slot", async () => {
