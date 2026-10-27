@@ -52,6 +52,32 @@ describe("LocalDocumentStore", () => {
 		expect(doc2.getText("t").toString()).toBe("hello");
 	});
 
+	// A background pull reads the sync base right before writing a
+	// peer's edit. Under a bulk import that IndexedDB read queued for 18-38 s,
+	// so an open store answers it from memory.
+	test("the sync base survives a reopen and is then read without touching IndexedDB", async () => {
+		const name = `sync-base-${Math.random()}`;
+		const store1 = new LocalDocumentStore(name, new Y.Doc());
+		await withTimeout(store1.whenSynced, 2000, "first open");
+		expect(await store1.loadSyncBase()).toBeUndefined();
+		await store1.rememberSyncBase("agreed text");
+		expect(await store1.loadSyncBase()).toBe("agreed text");
+		await store1.destroy();
+
+		const store2 = new LocalDocumentStore(name, new Y.Doc());
+		await withTimeout(store2.whenSynced, 2000, "reopen");
+		const reads = jest.spyOn(IDBObjectStore.prototype, "get");
+		try {
+			expect(await store2.loadSyncBase()).toBe("agreed text");
+			await store2.rememberSyncBase("newer text");
+			expect(await store2.loadSyncBase()).toBe("newer text");
+			expect(reads).not.toHaveBeenCalled();
+		} finally {
+			reads.mockRestore();
+		}
+		expect(await store2.get("syncBase")).toBe("newer text");
+	});
+
 	test("get()/set() work correctly once a store is open", async () => {
 		const doc = new Y.Doc();
 		const store = new LocalDocumentStore(`getset-${Math.random()}`, doc);
