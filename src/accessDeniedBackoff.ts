@@ -1,12 +1,12 @@
 /**
  * Per-share backoff for relay tokens the control plane refuses outright
  * (401, or 403 even for read). Such a refusal does not heal by itself, so a
- * share in this state is asked again after 1, 2, 4 ... minutes, capped at 30,
+ * share in this state is asked again after 2, 4, 8 ... minutes, capped at 30,
  * instead of on the reconnect floor. Cleared by a successful token for the
  * share, a sign-in/refresh, or a manual reconnect.
  */
 
-const FIRST_DELAY_MS = 60_000;
+const FIRST_DELAY_MS = 2 * 60_000;
 const MAX_DELAY_MS = 30 * 60_000;
 
 export function accessDeniedDelayMs(failures: number): number {

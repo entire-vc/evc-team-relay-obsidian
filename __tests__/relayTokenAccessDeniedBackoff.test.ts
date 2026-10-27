@@ -82,6 +82,20 @@ function respond(status: number): Promise<Response> {
 	} as Response);
 }
 
+/** Answer token requests after `latencyMs`, recording how many overlap. */
+let inFlight = 0;
+let maxInFlight = 0;
+function respondSlowly(status: number, latencyMs: number): Promise<Response> {
+	inFlight++;
+	maxInFlight = Math.max(maxInFlight, inFlight);
+	return new Promise((resolve) => {
+		setTimeout(() => {
+			inFlight--;
+			resolve(respond(status));
+		}, latencyMs);
+	});
+}
+
 function tokenCalls(): number {
 	return mockFetch.mock.calls.filter(([url]) => String(url).endsWith("/v1/tokens/relay")).length;
 }
@@ -124,6 +138,8 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 	beforeEach(() => {
 		jest.useFakeTimers();
 		mockFetch.mockReset();
+		inFlight = 0;
+		maxInFlight = 0;
 		(testGlobal as { WebSocket?: unknown }).WebSocket = FakeWS;
 	});
 	afterEach(() => {
@@ -142,31 +158,49 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(tokenCalls()).toBeLessThanOrEqual(4);
 	});
 
-	test("several documents of a refused share reconnecting together still cost at most 4 requests", async () => {
-		mockFetch.mockImplementation(() => respond(401));
-		const { pb, docIn } = build();
-		const docs = [
-			"66666666-6666-4666-8666-666666666661",
-			"66666666-6666-4666-8666-666666666662",
-			"66666666-6666-4666-8666-666666666663",
-		].map(docIn);
+	const DOCS = [
+		"66666666-6666-4666-8666-666666666661",
+		"66666666-6666-4666-8666-666666666662",
+		"66666666-6666-4666-8666-666666666663",
+	];
 
-		for (const p of [pb, ...docs]) void p.bringOnline();
+	test("documents of a refused share ask one at a time: at most 4 requests in 10 minutes, never two in flight", async () => {
+		// Latency well above the 2.4 s throttle spacing, so unserialized
+		// requests would overlap.
+		mockFetch.mockImplementation(() => respondSlowly(401, 5_000));
+		const { pb, docIn } = build();
+
+		for (const p of [pb, ...DOCS.map(docIn)]) void p.bringOnline();
 		await jest.advanceTimersByTimeAsync(10 * MINUTE);
 
 		expect(tokenCalls()).toBeGreaterThanOrEqual(1);
 		expect(tokenCalls()).toBeLessThanOrEqual(4);
+		expect(maxInFlight).toBe(1);
 	});
 
-	test("403 on the read fallback backs off the same way", async () => {
+	test("CONTROL: after the share's first grant its documents ask concurrently", async () => {
+		mockFetch.mockImplementation(() => respondSlowly(200, 5_000));
+		const { pb, docIn } = build();
+		const first = pb.bringOnline();
+		await jest.advanceTimersByTimeAsync(10_000);
+		expect(await first).toBe(true);
+		maxInFlight = 0;
+
+		for (const p of DOCS.map(docIn)) void p.bringOnline();
+		await jest.advanceTimersByTimeAsync(30_000);
+
+		expect(maxInFlight).toBeGreaterThan(1);
+	});
+
+	test("10 minutes of 403 (write, then read) cost at most 4 token requests", async () => {
 		mockFetch.mockImplementation(() => respond(403));
 		const { pb } = build();
 
 		void pb.bringOnline();
 		await jest.advanceTimersByTimeAsync(10 * MINUTE);
 
-		// each attempt is write -> 403 -> read -> 403: two requests
-		expect(tokenCalls()).toBeLessThanOrEqual(8);
+		expect(tokenCalls()).toBeGreaterThanOrEqual(2);
+		expect(tokenCalls()).toBeLessThanOrEqual(4);
 	});
 
 	test("the share reports no access while backed off, and a manual reset retries at once", async () => {

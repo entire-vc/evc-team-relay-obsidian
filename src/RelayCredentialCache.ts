@@ -176,7 +176,9 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		const shareId = shareIdOf(documentId);
 		// Until a share has granted a token, its documents ask one at a time,
 		// so a refused share costs one request per backoff window, not one
-		// per document reconnecting at once.
+		// per document reconnecting at once. The price is that a working
+		// share's first token of the session is awaited before its other
+		// documents ask; after that first grant they ask concurrently again.
 		for (;;) {
 			const probe = this.grantedShares.has(shareId) ? undefined : this.shareProbes.get(shareId);
 			if (!probe) break;

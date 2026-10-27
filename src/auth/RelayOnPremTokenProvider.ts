@@ -257,6 +257,13 @@ export class RelayOnPremTokenProvider {
 	private normalizedUrl: string;
 	/** Shared throttle — all token requests for this provider share one queue */
 	private throttle: TokenRequestThrottle;
+	/**
+	 * Shares refused even for read. Their next probe asks for read only, so a
+	 * refused share costs one request per backoff window instead of two
+	 * (write -> 403 -> read -> 403). Any granted token removes the share, and
+	 * the next refresh asks for write again.
+	 */
+	private refusedShares = new Set<string>();
 
 	constructor(private config: RelayOnPremTokenConfig) {
 		// Normalize URL - remove trailing slashes to prevent double-slash issues
@@ -291,6 +298,10 @@ export class RelayOnPremTokenProvider {
 
 		if (!token) {
 			throw new Error("Not authenticated");
+		}
+
+		if (mode === "write" && this.refusedShares.has(folderId)) {
+			mode = "read";
 		}
 
 		this.log(`Requesting relay token for doc ${docId} in folder ${folderId}${filePath ? ` (file: ${filePath})` : ""}`);
@@ -351,6 +362,7 @@ export class RelayOnPremTokenProvider {
 			}
 
 			if (response.status === 401 || response.status === 403) {
+				this.refusedShares.add(folderId);
 				const errorText = await response.text().catch(() => "");
 				throw new RelayAccessDeniedError(
 					response.status,
@@ -364,6 +376,7 @@ export class RelayOnPremTokenProvider {
 			}
 
 			const data = await response.json() as RelayTokenResponse;
+			this.refusedShares.delete(folderId);
 
 			// Convert to DocumentGrant format expected by the plugin
 			const expiryTime = localExpiryTime(data.expires_at, response.headers.get("Date"), data.expires_in);
