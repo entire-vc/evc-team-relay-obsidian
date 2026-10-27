@@ -1598,7 +1598,7 @@ export default class TeamRelayPlugin extends Plugin {
 						void folder.bringOnline();
 						relaySynced++;
 					} else {
-						this.inboundSyncPoller?.track(share.id, share.serverId, false, share.web_content_updated_at);
+						this.inboundSyncPoller?.track(share.id, share.serverId, this.isShareFolderLocal(share.id, share.path), share.web_content_updated_at);
 					}
 				}
 			}
