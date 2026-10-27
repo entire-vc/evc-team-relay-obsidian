@@ -267,6 +267,10 @@ export class TransferQueue extends Loggable {
 
 	private syncLane: QueueLaneState;
 	private readonly uploadTrace: PriorityUploadTrace[] = [];
+	/** Documents a background pull connected and still holds. */
+	private readonly pullHolds = new Set<string>();
+	/** Pull connections left open for a queued upload, which then closes them. */
+	private readonly handedToUpload = new Set<string>();
 	private downloadLane: QueueLaneState;
 
 	private paused = true;
@@ -537,6 +541,7 @@ export class TransferQueue extends Loggable {
 					})
 					.finally(() => {
 						releaseTokens?.();
+						if (lane === this.syncLane) this.closeHandedConnection(item.syncEntry);
 						if (lane === this.syncLane && item.priority) {
 							const endedAt = Date.now();
 							this.uploadTrace.push({
@@ -1084,7 +1089,10 @@ export class TransferQueue extends Loggable {
 		}
 
 		const providerSynced = doc.onceEverSynced();
-		const intent = doc.connectionIntent;
+		// A connection a background pull opened is not someone else's to keep:
+		// wait for this upload's own sync, then close it once the pull is done.
+		const borrowed = this.pullHolds.has(doc.entityGuid) || this.handedToUpload.has(doc.entityGuid);
+		const intent = borrowed ? "disconnected" : doc.connectionIntent;
 		const connected = await doc.bringOnline();
 		if (!connected) {
 			this.warn("[uploadDocumentViaSocket] connect failed for", doc.entryPath);
@@ -1146,7 +1154,12 @@ export class TransferQueue extends Loggable {
 		}
 
 		// promise can take some time
-		if (intent === "disconnected" && !(isDocument(doc) ? doc.editLock : doc.editLock)) {
+		this.handedToUpload.delete(doc.entityGuid);
+		if (
+			intent === "disconnected" &&
+			!(isDocument(doc) ? doc.editLock : doc.editLock) &&
+			!this.pullHolds.has(doc.entityGuid)
+		) {
 			doc.goOffline();
 			doc.vaultShare.credentialCache.dropFromQueue(ResourceAddress.serialize(doc.resourceAddress));
 		}
@@ -1193,6 +1206,15 @@ export class TransferQueue extends Loggable {
 	 * check against.
 	 */
 	async pullIfUnchanged(doc: Document, control: PullControl = {}): Promise<PullResult> {
+		try {
+			return await this.pullIfUnchangedOnce(doc, control);
+		} finally {
+			// Every return releases the hold; this covers a throw.
+			this.pullHolds.delete(doc.entityGuid);
+		}
+	}
+
+	private async pullIfUnchangedOnce(doc: Document, control: PullControl): Promise<PullResult> {
 		const { signal, onPhase } = control;
 		// Every await below may outlive the caller's deadline:
 		// once `signal` is aborted the caller has already freed this pull's
@@ -1207,6 +1229,7 @@ export class TransferQueue extends Loggable {
 		if (aborted()) return { outcome: "aborted" };
 		const intent = doc.connectionIntent;
 		onPhase?.("connect");
+		if (intent === "disconnected") this.pullHolds.add(doc.entityGuid);
 		const connected = await doc.bringOnline();
 		if (!connected || aborted()) {
 			// bringOnline() can leave a retry scheduled (or, if it resolved
@@ -1396,10 +1419,25 @@ export class TransferQueue extends Loggable {
 
 	/** Drops the connection pullIfUnchanged() opened, unless the doc was already online or is being edited. */
 	private releasePulledDoc(doc: Document, intent: Document["connectionIntent"]): void {
-		if (intent === "disconnected" && !doc.editLock) {
-			doc.goOffline();
-			doc.vaultShare.credentialCache.dropFromQueue(ResourceAddress.serialize(doc.resourceAddress));
+		if (intent !== "disconnected") return;
+		this.pullHolds.delete(doc.entityGuid);
+		if (doc.editLock) return;
+		if (this.syncLane.inFlight.has(doc.entityGuid)) {
+			// An upload of a local edit is queued or running on this
+			// connection: it closes it when done.
+			this.handedToUpload.add(doc.entityGuid);
+			return;
 		}
+		doc.goOffline();
+		doc.vaultShare.credentialCache.dropFromQueue(ResourceAddress.serialize(doc.resourceAddress));
+	}
+
+	/** Closes a pull connection handed to an upload that ended without closing it. */
+	private closeHandedConnection(entry: TransferTask["syncEntry"]): void {
+		if (!this.handedToUpload.delete(entry.entityGuid)) return;
+		if (!isDocument(entry) || entry.editLock || this.pullHolds.has(entry.entityGuid)) return;
+		entry.goOffline();
+		entry.vaultShare.credentialCache.dropFromQueue(ResourceAddress.serialize(entry.resourceAddress));
 	}
 
 	/** Resolves `promise` or `undefined` on timeout, whichever comes first -- never rejects. */
