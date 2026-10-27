@@ -164,10 +164,10 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		"66666666-6666-4666-8666-666666666663",
 	];
 
-	test("documents of a refused share ask one at a time: at most 4 requests in 10 minutes, never two in flight", async () => {
+	test.each([401, 403])("%i: documents of a refused share ask one at a time: at most 4 requests in 10 minutes, never two in flight", async (status) => {
 		// Latency well above the 2.4 s throttle spacing, so unserialized
 		// requests would overlap.
-		mockFetch.mockImplementation(() => respondSlowly(401, 5_000));
+		mockFetch.mockImplementation(() => respondSlowly(status, 5_000));
 		const { pb, docIn } = build();
 
 		for (const p of [pb, ...DOCS.map(docIn)]) void p.bringOnline();
