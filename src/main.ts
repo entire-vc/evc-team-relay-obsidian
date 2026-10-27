@@ -103,6 +103,7 @@ import {
 import { AttachmentSyncSettings } from "./AttachmentSyncSettings";
 import { FileHashCache, isAttachmentFile } from "./AttachmentFile";
 import { isDocument } from "./Document";
+import { needsUploadOnModify } from "./uploadOnModify";
 import { TenantRegistry, type TenantSettings } from "./TenantRegistry";
 import {
 	DEFAULT_RELAY_ONPREM_SETTINGS,
@@ -2006,12 +2007,12 @@ export default class TeamRelayPlugin extends Plugin {
 						if (file && isAttachmentFile(file)) {
 							void file.runSync();
 						}
-						// For Documents (folder share files): if the file has no active
-						// WS connection, edits bypass Y.Text entirely (no live CM binding).
-						// Enqueue a background sync to push vault content to relay.
-						// When connected, LiveCMPluginValue handles sync automatically.
-						if (file && isDocument(file) && !file.isOnline) {
-							void folder.transfers.enqueueUpload(file, { priority: true });
+						// For Documents (folder share files): without an open editor,
+						// edits bypass Y.Text entirely (no live CM binding). Enqueue a
+						// background sync to push vault content to relay. With an editor
+						// bound, LiveCMPluginValue handles sync automatically.
+						if (file && isDocument(file) && needsUploadOnModify(file)) {
+							void folder.transfers.enqueueUpload(file, { priority: true, source: "edit" });
 						}
 					}
 					// Trigger metadata resolve with the actual TFile (not our Document proxy)

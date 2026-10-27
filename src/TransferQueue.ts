@@ -41,7 +41,18 @@ export interface TransferTask {
 	priority: boolean;
 	/** Clock time the item was queued, for oldest-wait accounting. */
 	queuedAt: number;
+	/** Wall-clock ms the item was queued, for lining a trace up with other devices. */
+	enqueuedAt: number;
+	/** What queued it, when the caller said. */
+	source?: UploadSource;
 }
+
+/**
+ * Why an upload was queued: a local edit, a new note, a background pull
+ * that found an edit nothing had pushed, a retry after a failed run, or a
+ * second run for an edit made while the first one ran.
+ */
+export type UploadSource = "edit" | "create" | "kept-local" | "retry" | "rerun";
 
 export interface EnqueueOptions {
 	/**
@@ -50,6 +61,8 @@ export interface EnqueueOptions {
 	 * it never waits behind a startup pass over hundreds of documents.
 	 */
 	priority?: boolean;
+	/** Recorded in the priority upload trace. */
+	source?: UploadSource;
 }
 
 /** Per-lane queue snapshot exposed by `TransferQueue.laneStats()`. */
@@ -139,6 +152,10 @@ interface QueueLaneState {
  */
 export interface PriorityUploadTrace {
 	path: string;
+	/** Wall-clock ms the upload was queued. */
+	enqueuedAt: number;
+	/** What queued it; "other" when the caller didn't say. */
+	source: UploadSource | "other";
 	endedAt: number;
 	waitMs: number;
 	runMs: number;
@@ -538,6 +555,8 @@ export class TransferQueue extends Loggable {
 						if (lane === this.syncLane && item.priority) {
 							this.uploadTrace.push({
 								path: item.absolutePath,
+								enqueuedAt: item.enqueuedAt,
+								source: item.source ?? "other",
 								endedAt: Date.now(),
 								waitMs: startedAt - item.queuedAt,
 								runMs: this.clock.now() - startedAt,
@@ -582,7 +601,7 @@ export class TransferQueue extends Loggable {
 		lane.reruns++;
 		const again =
 			lane === this.syncLane
-				? this.enqueueUpload(item.syncEntry, { priority })
+				? this.enqueueUpload(item.syncEntry, { priority, source: "rerun" })
 				: this.enqueueFetch(item.syncEntry, { priority });
 		void again.catch((error: unknown) => this.warn("[rerun] failed for", item.entityGuid, error));
 	}
@@ -770,7 +789,7 @@ export class TransferQueue extends Loggable {
 		group.queuedUploads++;
 		this.batches.put(item.vaultShare, group);
 
-		return this.pushToLane(this.syncLane, item, options.priority ?? false);
+		return this.pushToLane(this.syncLane, item, options.priority ?? false, options.source);
 	}
 
 	/**
@@ -909,6 +928,7 @@ export class TransferQueue extends Loggable {
 	private makeQueueItem(
 		item: AttachmentFile | Document | CanvasDocument,
 		priority: boolean,
+		source?: UploadSource,
 	): TransferTask {
 		const vaultShare = item.vaultShare;
 		return {
@@ -919,6 +939,8 @@ export class TransferQueue extends Loggable {
 			vaultShare,
 			priority,
 			queuedAt: this.clock.now(),
+			enqueuedAt: Date.now(),
+			source,
 		};
 	}
 
@@ -936,6 +958,7 @@ export class TransferQueue extends Loggable {
 		lane: QueueLaneState,
 		item: AttachmentFile | Document | CanvasDocument,
 		priority: boolean,
+		source?: UploadSource,
 	): Promise<void> {
 		lane.inFlight.add(item.entityGuid);
 		const completion = new Promise<void>((resolve, reject) => {
@@ -944,7 +967,7 @@ export class TransferQueue extends Loggable {
 
 		// Arrival order, not path order: nextRunnable() picks across shares,
 		// and enqueueShareUpload() already enqueues each pass path-sorted.
-		lane.queue.push(this.makeQueueItem(item, priority));
+		lane.queue.push(this.makeQueueItem(item, priority, source));
 		void this.drainLane(lane);
 
 		return completion;
@@ -1308,7 +1331,7 @@ export class TransferQueue extends Loggable {
 						`keeping local edit and queueing its upload`,
 				);
 				this.releasePulledDoc(doc, intent);
-				void this.enqueueUpload(doc, { priority: true }).catch((err: unknown) => {
+				void this.enqueueUpload(doc, { priority: true, source: "kept-local" }).catch((err: unknown) => {
 					this.warn("[pullIfUnchanged] queueing upload of local edit failed", doc.entryPath, err);
 				});
 				return { outcome: "kept-local", remoteText };
@@ -2043,7 +2066,7 @@ export class TransferQueue extends Loggable {
 				return;
 			}
 			this.uploadRetryStats.retried++;
-			void this.enqueueUpload(doc, { priority }).catch((error: unknown) =>
+			void this.enqueueUpload(doc, { priority, source: "retry" }).catch((error: unknown) =>
 				this.warn("[uploadRetry] failed for", doc.entryPath, error),
 			);
 		}, delay);

@@ -146,6 +146,26 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		expect(trace[0]).toMatchObject({ path: "Small/edited.md", runMs: 250, waitMs: 0, ok: true, ranAsPriority: true });
 	});
 
+	test("the trace says when and why each priority upload was queued", async () => {
+		const small = makeShare("Small");
+		const before = Date.now();
+		void queue.enqueueUpload(makeDoc(small, "edited.md"), { priority: true, source: "edit" });
+		void queue.enqueueUpload(makeDoc(small, "created.md"), { priority: true });
+		await flushMacrotasks();
+		finish.get("Small:edited.md")?.();
+		finish.get("Small:created.md")?.();
+		await flushMacrotasks();
+		const trace = queue.priorityUploadTrace();
+		expect(trace.map((t) => [t.path, t.source])).toEqual([
+			["Small/edited.md", "edit"],
+			["Small/created.md", "other"],
+		]);
+		for (const t of trace) {
+			expect(t.enqueuedAt).toBeGreaterThanOrEqual(before);
+			expect(t.enqueuedAt).toBeLessThanOrEqual(t.endedAt);
+		}
+	});
+
 	test("a share whose whole backlog is priority can't take the reserved slot", async () => {
 		// Live under load: a 700-note import is queued as priority (each note
 		// was written while its doc was offline), so the import held the
