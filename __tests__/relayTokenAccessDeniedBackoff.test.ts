@@ -89,7 +89,7 @@ function respondSlowly(status: number, latencyMs: number): Promise<Response> {
 	inFlight++;
 	maxInFlight = Math.max(maxInFlight, inFlight);
 	return new Promise((resolve) => {
-		setTimeout(() => {
+		window.setTimeout(() => {
 			inFlight--;
 			resolve(respond(status));
 		}, latencyMs);
