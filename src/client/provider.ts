@@ -30,6 +30,14 @@ import * as awarenessProtocol from "y-protocols/awareness";
 import { ObservableV2 } from "lib0/observable";
 import * as math from "lib0/math";
 import * as url from "lib0/url";
+import { tokenRequestClass } from "../auth/tokenRequestClass";
+import {
+	type ConnectTicket,
+	enqueueConnect,
+	HANDSHAKE_TIMEOUT_MS,
+	recordHandshake,
+	recordHandshakeTimeout,
+} from "./connectGate";
 
 export const messageSync = 0;
 export const messageAwareness = 1;
@@ -193,12 +201,13 @@ const encodeAwarenessOf = (
 };
 
 /**
- * Open a socket and wire it up. Every exit path from a socket — error, close,
- * or the liveness check — funnels back here through a backoff timer, so this
- * is the single place a connection is born.
+ * Queue a socket and wire it up once it is its turn (see connectGate). Every
+ * exit path from a socket — error, close, or the liveness check — funnels back
+ * here through a backoff timer, so this is the single place a connection is
+ * born.
  */
 const setupWS = (provider: YSweetProvider): void => {
-	if (!provider.shouldConnect || provider.ws !== null) {
+	if (!provider.shouldConnect || provider.ws !== null || provider.connectTicket !== null) {
 		provider.connectTrace.skipped = provider.shouldConnect ? "socket-present" : "not-wanted";
 		return;
 	}
@@ -207,14 +216,43 @@ const setupWS = (provider: YSweetProvider): void => {
 		return;
 	}
 
+	provider.connectTrace.queuedAt = Date.now();
+	provider.wsconnecting = true;
+	const cls = tokenRequestClass(provider.roomname);
+	provider.connectTicket = enqueueConnect(provider.url, cls, () => openWS(provider));
+};
+
+const releaseConnectTicket = (provider: YSweetProvider): void => {
+	if (provider.connectTicket === null) return;
+	const ticket = provider.connectTicket;
+	provider.connectTicket = null;
+	ticket.release();
+};
+
+const openWS = (provider: YSweetProvider): void => {
+	if (!provider.shouldConnect || provider.ws !== null) {
+		releaseConnectTicket(provider);
+		provider.wsconnecting = false;
+		return;
+	}
 	const websocket = new provider._WS(provider.url);
-	provider.connectTrace.socketAt = Date.now();
+	const startedAt = Date.now();
+	provider.connectTrace.socketAt = startedAt;
 	provider.connectTrace.skipped = undefined;
 	websocket.binaryType = "arraybuffer";
 	provider.ws = websocket;
 	provider.wsconnecting = true;
 	provider.wsconnected = false;
 	provider.synced = false;
+
+	// A handshake stuck this long would hold every other socket to this
+	// server behind it: give up the turn and retry through onclose.
+	const handshakeTimer = window.setTimeout(() => {
+		if (provider.ws !== websocket || provider.wsconnected) return;
+		recordHandshakeTimeout();
+		releaseConnectTicket(provider);
+		websocket.close();
+	}, HANDSHAKE_TIMEOUT_MS);
 
 	let awarenessResendTimer: number | null = null;
 	const stopAwarenessResend = () => {
@@ -237,6 +275,8 @@ const setupWS = (provider: YSweetProvider): void => {
 	};
 
 	websocket.onclose = (event: CloseEvent) => {
+		window.clearTimeout(handshakeTimer);
+		if (provider.ws === websocket) releaseConnectTicket(provider);
 		stopAwarenessResend();
 		provider.emit("connection-close", [event, provider]);
 		provider.ws = null;
@@ -273,7 +313,10 @@ const setupWS = (provider: YSweetProvider): void => {
 	};
 
 	websocket.onopen = () => {
+		window.clearTimeout(handshakeTimer);
+		releaseConnectTicket(provider);
 		provider.connectTrace.openAt = Date.now();
+		recordHandshake(provider.connectTrace.openAt - startedAt);
 		provider.wsLastMessageReceived = time.getUnixTime();
 		provider.wsconnecting = false;
 		provider.wsconnected = true;
@@ -341,6 +384,8 @@ export interface ConnectTrace {
 	calledAt: number;
 	/** Why no socket was opened at that call (a later retry may open one). */
 	skipped?: "socket-present" | "not-wanted" | "before-connect";
+	/** When the latest socket was queued for its turn (see connectGate). */
+	queuedAt?: number;
 	/** The latest socket created since the call. */
 	socketAt?: number;
 	openAt?: number;
@@ -370,6 +415,8 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 	ws: WebSocket | null = null;
 	/** Timings of the latest connect() (see ConnectTrace). */
 	connectTrace: ConnectTrace = { calledAt: 0, failedSockets: 0 };
+	/** Our place in connectGate while a socket waits for its turn or handshakes. */
+	connectTicket: ConnectTicket | null = null;
 	wsLastMessageReceived = 0;
 	shouldConnect: boolean;
 	maxConnectionErrors: number;
@@ -531,7 +578,7 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 
 	connect(): void {
 		this.shouldConnect = true;
-		if (!this.wsconnected && this.ws === null) {
+		if (!this.wsconnected && this.ws === null && this.connectTicket === null) {
 			this.connectTrace = { calledAt: Date.now(), failedSockets: 0 };
 			setupWS(this);
 			this.connectBc();
@@ -545,6 +592,8 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 	disconnect(): void {
 		this.shouldConnect = false;
 		this.disconnectBc();
+		releaseConnectTicket(this);
+		if (this.ws === null) this.wsconnecting = false;
 		if (this.ws !== null) {
 			this.ws.close();
 			this.ws = null;

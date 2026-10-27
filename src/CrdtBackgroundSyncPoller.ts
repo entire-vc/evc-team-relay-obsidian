@@ -103,6 +103,7 @@ import type { PullPhase, PullResult, RelayProbeSample } from "./TransferQueue";
 import { textFingerprint } from "./docActivity";
 import { namedLogger } from "./logging";
 import { holdBackgroundTokens, tokenWaitStats, type TokenWaitSummary } from "./auth/tokenRequestClass";
+import { connectGateStats, type ConnectGateStats } from "./client/connectGate";
 
 const log = namedLogger("[CrdtBackgroundSyncPoller]");
 
@@ -232,6 +233,8 @@ export interface PollerStats {
 	};
 	/** Relay-token waits in the request throttle, per class (tokenRequestClass.ts). */
 	tokenWait: { normal: TokenWaitSummary; background: TokenWaitSummary; backgroundDocs: number };
+	/** Socket handshakes: turn waits per class, handshake times, timeouts. */
+	connectGate: ConnectGateStats;
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -870,6 +873,7 @@ export class CrdtBackgroundSyncPoller {
 			importing: [...this.importingShares()].map((folder) => folder.path ?? folder.entityGuid),
 			relayProbe: this.relayProbeStats(),
 			tokenWait: tokenWaitStats(),
+			connectGate: connectGateStats(),
 		};
 	}
 

@@ -14,6 +14,8 @@
  * document is background while at least one background holder has it.
  */
 
+import { summarise, type WaitSummary } from "../waitSummary";
+
 const holds = new Map<string, number>();
 
 export type TokenRequestClass = "normal" | "background";
@@ -45,19 +47,7 @@ export function recordTokenWait(cls: TokenRequestClass, ms: number): void {
 	if (samples.length > WAIT_SAMPLES) samples.shift();
 }
 
-export interface TokenWaitSummary {
-	count: number;
-	p50: number;
-	p95: number;
-	max: number;
-}
-
-function summarise(samples: number[]): TokenWaitSummary {
-	const sorted = [...samples].sort((a, b) => a - b);
-	const at = (p: number) =>
-		sorted.length === 0 ? 0 : sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)];
-	return { count: sorted.length, p50: at(50), p95: at(95), max: sorted.length > 0 ? sorted[sorted.length - 1] : 0 };
-}
+export type TokenWaitSummary = WaitSummary;
 
 /** Recent throttle waits per class, plus how many documents are background now. */
 export function tokenWaitStats(): { normal: TokenWaitSummary; background: TokenWaitSummary; backgroundDocs: number } {

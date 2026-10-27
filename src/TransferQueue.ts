@@ -183,6 +183,8 @@ export interface RelayProbeSample {
 	phases?: {
 		tokenMs?: number;
 		connectCallMs?: number;
+		/** When the socket was queued for its turn; socketMs minus this is the wait. */
+		queuedMs?: number;
 		socketMs?: number;
 		openMs?: number;
 		skipped?: string;
@@ -1429,6 +1431,7 @@ export class TransferQueue extends Loggable {
 		return {
 			tokenMs: doc.lastTokenMs,
 			connectCallMs: since(trace.calledAt),
+			queuedMs: since(trace.queuedAt),
 			socketMs: since(trace.socketAt),
 			openMs: since(trace.openAt),
 			skipped: trace.skipped,
