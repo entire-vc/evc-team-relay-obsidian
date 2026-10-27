@@ -100,6 +100,22 @@ export class RelayAccessDeniedError extends Error {
 	}
 }
 
+/** How long POST /v1/tokens/relay may take on the network before it counts as failed. */
+export const RELAY_TOKEN_TIMEOUT_MS = 30_000;
+
+/**
+ * POST /v1/tokens/relay did not answer within RELAY_TOKEN_TIMEOUT_MS.
+ * requestUrl cannot be cancelled, so the request may still be in flight and
+ * may still reach the control plane; callers keep the share off the network
+ * for a while instead of asking again at once.
+ */
+export class RelayTokenTimeoutError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RelayTokenTimeoutError";
+	}
+}
+
 /**
  * Token bucket in front of POST /v1/tokens/relay: up to `burst` requests at
  * once, then `perMinute`, served FIFO, except that background requests (see
@@ -334,7 +350,7 @@ export class RelayOnPremTokenProvider {
 		await this.throttle.acquire(docId);
 
 		try {
-			const response = await platformFetch(
+			const fetched = platformFetch(
 				`${this.normalizedUrl}/v1/tokens/relay`,
 				{
 					method: "POST",
@@ -345,6 +361,17 @@ export class RelayOnPremTokenProvider {
 					body: JSON.stringify(request),
 				}
 			);
+			// Timed from here, not from the throttle wait above: only the
+			// network may stall the request.
+			let timer: number | undefined;
+			const response = await Promise.race([
+				fetched,
+				new Promise<never>((_, reject) => {
+					timer = window.setTimeout(() => reject(new RelayTokenTimeoutError(
+						`Token request for doc ${docId} got no answer in ${RELAY_TOKEN_TIMEOUT_MS / 1000}s`,
+					)), RELAY_TOKEN_TIMEOUT_MS);
+				}),
+			]).finally(() => window.clearTimeout(timer));
 
 			if (response.status === 429) {
 				// Parse Retry-After header (seconds) if present, default 60 s

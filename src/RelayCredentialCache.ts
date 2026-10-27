@@ -11,6 +11,7 @@ import { platformFetch } from "./platformFetch";
 import { refresh as universalRefresh } from "./RelayCredentialRefresh";
 import {
 	RelayAccessDeniedError,
+	RelayTokenTimeoutError,
 	type RelayOnPremTokenProvider,
 } from "./auth/RelayOnPremTokenProvider";
 import { AccessDeniedBackoff } from "./accessDeniedBackoff";
@@ -32,9 +33,6 @@ export function shareIdOf(documentId: string): string {
 		return documentId;
 	}
 }
-
-/** How long a share's token request may hold up the next one of that share. */
-const PROBE_WAIT_MS = 30_000;
 
 export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// Multi-server: one RelayOnPremTokenProvider per configured on-prem
@@ -64,6 +62,10 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	private accessDenied = new AccessDeniedBackoff();
 	// The one token request in flight for each share.
 	private shareProbes = new Map<string, Promise<void>>();
+	// Shares whose last token request timed out. That request cannot be
+	// cancelled and may still be in flight, so the share is not asked again
+	// until this backoff runs out.
+	private stalled = new AccessDeniedBackoff();
 	private accessListeners = new Set<(shareId: string) => void>();
 
 	constructor(
@@ -187,26 +189,28 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		// costs a working share no throughput: the throttle already spaces
 		// token requests 500 ms apart, longer than the request takes
 		// (control plane p99 about 230 ms, 27.10).
-		// A request that never settles (no network timeout below) must not
-		// hold its share forever: past PROBE_WAIT_MS the next one takes over.
+		// A request that times out on the network (RelayTokenTimeoutError)
+		// may still be in flight, so its share is backed off below rather
+		// than asked again at once.
 		for (;;) {
 			const probe = this.shareProbes.get(shareId);
 			if (!probe) break;
-			let timer: number | undefined;
-			const timedOut = await Promise.race([
-				probe.then(() => false),
-				new Promise<boolean>((resolve) => (timer = window.setTimeout(() => resolve(true), PROBE_WAIT_MS))),
-			]);
-			window.clearTimeout(timer);
-			if (timedOut && this.shareProbes.get(shareId) === probe) this.shareProbes.delete(shareId);
+			await probe;
 		}
-		const retryAt = this.accessDenied.retryAt(shareId, Date.now());
+		const now = Date.now();
+		const retryAt = this.accessDenied.retryAt(shareId, now);
 		if (retryAt !== undefined) {
-			const denied = new RelayAccessDeniedError(0, `Relay token refused for share ${shareId}; next try in ${Math.ceil((retryAt - Date.now()) / 1000)}s`);
+			const denied = new RelayAccessDeniedError(0, `Relay token refused for share ${shareId}; next try in ${Math.ceil((retryAt - now) / 1000)}s`);
 			denied.retryAt = retryAt;
 			// Not inline: the renewal queue calls the next refresh from this
 			// callback, and a run of backed-off documents would recurse.
 			void Promise.resolve().then(() => onError(denied));
+			return;
+		}
+		const stalledUntil = this.stalled.retryAt(shareId, now);
+		if (stalledUntil !== undefined) {
+			const stalled = new Error(`Relay token request for share ${shareId} timed out; next try in ${Math.ceil((stalledUntil - now) / 1000)}s`);
+			void Promise.resolve().then(() => onError(stalled));
 			return;
 		}
 		let settle!: () => void;
@@ -224,6 +228,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 				(grant) => {
 					const wasDenied = this.accessDenied.isDenied(shareId);
 					this.accessDenied.clear(shareId);
+					this.stalled.clear(shareId);
 					done();
 					if (wasDenied) this.notifyAccessChange(shareId);
 					onSuccess(grant);
@@ -234,6 +239,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 						err.retryAt = this.accessDenied.recordDenied(shareId, Date.now());
 						if (!wasDenied) this.notifyAccessChange(shareId);
 					}
+					if (err instanceof RelayTokenTimeoutError) this.stalled.recordDenied(shareId, Date.now());
 					done();
 					onError(err);
 				},
