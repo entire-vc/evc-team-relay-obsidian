@@ -1085,6 +1085,7 @@ export default class TeamRelayPlugin extends Plugin {
 													);
 												}
 												// Remove local shared folder
+												if (folder.entityGuid) this.inboundSyncPoller?.unregisterShare(folder.entityGuid);
 												this.shareRegistry.delete(folder);
 												this.explorerDecorations?.refreshExistingRows();
 												new Notice(`Folder "${folder.path}" unshared`);
@@ -1971,6 +1972,8 @@ export default class TeamRelayPlugin extends Plugin {
 						(folder) => folder.path === file.path,
 					);
 					if (folder) {
+						// The folder left the vault: stop polling its share.
+						if (folder.entityGuid) this.inboundSyncPoller?.unregisterShare(folder.entityGuid);
 						this.shareRegistry.delete(folder);
 						return;
 					}
