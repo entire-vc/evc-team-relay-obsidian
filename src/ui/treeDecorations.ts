@@ -101,6 +101,7 @@ class FolderStatusPill implements Disposable {
 			target: this.el,
 			props: {
 				connectionStatus: this.vaultShare.connectionState.status,
+				accessDenied: this.vaultShare.accessDenied,
 				hubId: this.vaultShare.workspaceId,
 				linked: this.vaultShare.linked,
 				progressPercent: 0,
@@ -112,6 +113,7 @@ class FolderStatusPill implements Disposable {
 			this.vaultShare.subscribe(this.el, (state: ConnectionState) => {
 				this.pill.update({
 					connectionStatus: state.status,
+					accessDenied: this.vaultShare.accessDenied,
 					hubId: this.vaultShare.workspaceId,
 					linked: this.vaultShare.linked,
 				});

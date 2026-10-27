@@ -15,6 +15,7 @@ import type { DocumentGrant } from "./relay/TokenShapes";
 import { ResourceAddress, type ResourceAddressType } from "./ResourceAddress";
 import { currentToggles } from "./featureToggleState";
 import { computeReconnectDelay } from "./reconnectThrottle";
+import { RelayAccessDeniedError } from "./auth/RelayOnPremTokenProvider";
 import { createPermanentUserData } from "./permanentUserData";
 
 const EMPTY_TOKEN: DocumentGrant = {
@@ -398,11 +399,21 @@ export class ProviderBacked extends Loggable {
 			// same cancel-on-dismantle() — so this path composes with the
 			// existing one instead of adding a second, differently-throttled
 			// retry loop.
-			this.reconnectGate.schedule(this._liveProvider.maxBackoffTime, () => {
+			// A refused share (401/403) is not retried on the reconnect floor:
+			// wait out its backoff, which RelayCredentialCache keeps per share.
+			const retryAt = e instanceof RelayAccessDeniedError ? e.retryAt : undefined;
+			const floor = Math.max(this._liveProvider.maxBackoffTime, (retryAt ?? 0) - Date.now());
+			this.reconnectGate.schedule(floor, () => {
 				void this.bringOnline();
 			});
+			this.broadcastState();
 			return false;
 		}
+	}
+
+	/** The control plane refuses this share's token (401/403); retries are backed off. */
+	get accessDenied(): boolean {
+		return this.credentialCache.isAccessDenied(ResourceAddress.serialize(this.resourceAddress));
 	}
 
 	public get connectionState(): ConnectionState {
