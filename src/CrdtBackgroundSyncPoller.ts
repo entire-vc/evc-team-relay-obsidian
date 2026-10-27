@@ -151,10 +151,16 @@ const GIVEN_UP_SAMPLES = 20;
 const AWAIT_CONTENT_MS = 60_000;
 const MAX_AWAITING = 6;
 /**
- * A share with more announced work than this queued or running is
+ * A share with more announced pulls than this queued or running is
  * importing. While another share has an edit waiting, it keeps at most one
  * regular slot: on 0.1.15 our own import slowed the relay to 16-19s per
  * document, and the edits waited on the same relay.
+ *
+ * Re-checks and pulls waiting connected for their text don't count: they are
+ * edits that were slow to arrive, not new work. On 0.1.21 they took a share
+ * with one edit every 10 s over the line during an import (up to 6 can wait
+ * connected), and its edits then waited behind the import as background work
+ * for 40-108 s.
  */
 const IMPORT_BACKLOG = 5;
 const RELAY_PROBE_SAMPLES = 60;
@@ -457,9 +463,9 @@ export class CrdtBackgroundSyncPoller {
 	/** Shares with more than IMPORT_BACKLOG announced pulls queued or running. */
 	private importingShares(): Set<VaultShare> {
 		const counts = new Map<VaultShare, number>();
-		for (const [share, queues] of this.queues) counts.set(share, queues.priority.size + queues.late.size);
+		for (const [share, queues] of this.queues) counts.set(share, queues.priority.size);
 		for (const inFlight of this.pulling.values()) {
-			if (!inFlight.announced && !inFlight.late) continue;
+			if (!inFlight.announced || inFlight.phase === "await-content") continue;
 			const share = inFlight.pull.folder;
 			counts.set(share, (counts.get(share) ?? 0) + 1);
 		}
