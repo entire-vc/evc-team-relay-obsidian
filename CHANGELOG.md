@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.17
+- Fixed: while edits to closed notes are waiting to sync, a large background import or upload now uses at most one connection at a time, so the edits are no longer slowed down by it. The import speeds back up once the edits are through.
+- Fixed: when another device reports a change to a closed note before the server has its text, the plugin now stays connected and receives the text as soon as it arrives, instead of reconnecting for each check.
+
 ## 0.1.16
 - Fixed: on a computer whose clock runs more than a minute behind the server, the plugin no longer keeps using an expired connection token. Previously the live connection to a shared note was refused about once a minute until the token was renewed.
 
