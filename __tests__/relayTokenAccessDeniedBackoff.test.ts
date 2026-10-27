@@ -2,7 +2,7 @@
  * A share the signed-in account cannot open (POST /v1/tokens/relay answers
  * 401, or 403 even for read) used to be retried on a fixed short floor
  * forever: bringOnline() failed, rescheduled itself through ReconnectGate,
- * and asked the control plane again (prod log 27.10: one client, 60 x 401
+ * and asked the control plane again (seen in production: one client, 60 x 401
  * per hour, 0 successes). Drives the REAL ProviderBacked + RelayCredentialCache
  * + RelayOnPremTokenProvider; only the network (platformFetch) is faked.
  */
@@ -89,7 +89,7 @@ function respondSlowly(status: number, latencyMs: number): Promise<Response> {
 	inFlight++;
 	maxInFlight = Math.max(maxInFlight, inFlight);
 	return new Promise((resolve) => {
-		setTimeout(() => {
+		window.setTimeout(() => {
 			inFlight--;
 			resolve(respond(status));
 		}, latencyMs);
