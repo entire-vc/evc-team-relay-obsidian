@@ -167,6 +167,25 @@ const RELAY_PROBE_SAMPLES = 60;
 const STATS_LOG_EVERY_MS = 60_000;
 const LATENCY_SAMPLES = 200;
 
+/**
+ * One announced pull into a share that isn't importing, for a load test to
+ * line up with the edit that caused it. `announcedAt` is wall-clock ms; the
+ * other times are ms after the pull started.
+ */
+export interface EditPullTrace {
+	path: string;
+	announcedAt: number;
+	queuedMs: number;
+	express: boolean;
+	awaits: boolean;
+	phases: Partial<Record<PullPhase, number>>;
+	totalMs: number;
+	outcome: string;
+	matched: boolean;
+}
+
+const EDIT_TRACE_SAMPLES = 100;
+
 /** A document waiting for a lane slot. */
 interface PendingPull {
 	folder: VaultShare;
@@ -241,6 +260,8 @@ export interface PollerStats {
 	tokenWait: { normal: TokenWaitSummary; background: TokenWaitSummary; backgroundDocs: number };
 	/** Socket handshakes: turn waits per class, handshake times, timeouts. */
 	connectGate: ConnectGateStats;
+	/** Announced pulls outside an import, newest last. */
+	edits: EditPullTrace[];
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -269,6 +290,7 @@ export class CrdtBackgroundSyncPoller {
 	/** At most one pending re-check per document; a newer announcement replaces it. */
 	private readonly recheckTimers = new Map<string, number>();
 	private readonly timeouts: Partial<Record<PullPhase | "queued", number>> = {};
+	private readonly editTrace: EditPullTrace[] = [];
 	private readonly deliveries: number[] = [];
 	private completed = 0;
 	private failed = 0;
@@ -600,8 +622,10 @@ export class CrdtBackgroundSyncPoller {
 		this.pulling.set(guid, inFlight);
 		// A sweep pull or one into an importing share lets edits get their
 		// relay tokens first (see tokenRequestClass.ts).
-		if (lane === "sweep" || this.importingShares().has(folder)) inFlight.releaseTokens = holdBackgroundTokens(guid);
+		const importing = this.importingShares().has(folder);
+		if (lane === "sweep" || importing) inFlight.releaseTokens = holdBackgroundTokens(guid);
 		const startedAt = this.timeProvider.now();
+		const phaseAt: Partial<Record<PullPhase, number>> = {};
 		log("Re-checking unopened document for remote updates", {
 			path: file.entryPath,
 			announced: pull.expected !== undefined,
@@ -616,6 +640,9 @@ export class CrdtBackgroundSyncPoller {
 			inFlight.releaseTokens?.();
 			if (inFlight.deadline !== undefined) this.timeProvider.cancelTimeout(inFlight.deadline);
 			this.pulling.delete(guid);
+			if (pull.expected !== undefined && lane !== "sweep" && !importing) {
+				this.traceEdit(pull, result, { startedAt, express, awaits, phaseAt });
+			}
 			if (!this.destroyed) {
 				this.afterPull(pull, result);
 				if (redrain) this.drain();
@@ -657,6 +684,7 @@ export class CrdtBackgroundSyncPoller {
 			.pullIfUnchanged(file, {
 				signal: controller.signal,
 				onPhase: (phase) => {
+					phaseAt[phase] ??= this.timeProvider.now() - startedAt;
 					const wasAwaiting = inFlight.phase === "await-content";
 					inFlight.phase = phase;
 					if (settled) return;
@@ -690,6 +718,29 @@ export class CrdtBackgroundSyncPoller {
 				}
 				finish(result ?? { outcome: "connect-failed" });
 			});
+	}
+
+	private traceEdit(
+		pull: PendingPull,
+		result: PullResult | undefined,
+		run: { startedAt: number; express: boolean; awaits: boolean; phaseAt: Partial<Record<PullPhase, number>> },
+	): void {
+		const now = this.timeProvider.now();
+		const announcedAt = pull.announcedAt ?? pull.queuedAt;
+		const expected = this.announcedWhilePulling.get(pull.file.entityGuid)?.expected ?? pull.expected;
+		const remote = result?.remoteText;
+		this.editTrace.push({
+			path: pull.file.entryPath,
+			announcedAt: Date.now() - (now - announcedAt),
+			queuedMs: run.startedAt - pull.queuedAt,
+			express: run.express,
+			awaits: run.awaits,
+			phases: { ...run.phaseAt },
+			totalMs: now - run.startedAt,
+			outcome: result?.outcome ?? "deadline",
+			matched: remote !== undefined && textFingerprint(remote) === expected,
+		});
+		if (this.editTrace.length > EDIT_TRACE_SAMPLES) this.editTrace.shift();
 	}
 
 	private afterPull(pull: PendingPull, result: PullResult | undefined): void {
@@ -880,6 +931,7 @@ export class CrdtBackgroundSyncPoller {
 			relayProbe: this.relayProbeStats(),
 			tokenWait: tokenWaitStats(),
 			connectGate: connectGateStats(),
+			edits: [...this.editTrace],
 		};
 	}
 

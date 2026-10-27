@@ -793,6 +793,34 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("an announced pull outside an import is traced with its phases and whether its text matched", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("a", 0, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		folder.trackedEntries.set("a-0", { __isDocument: true, isOnline: false, entityGuid: "a-0", entryPath: "a/0.md" });
+		folder.announce("a-0", textFingerprint("typed"));
+		await flushPromises();
+		const [first] = held;
+		clock.setTime(t0 + 300);
+		first.control.onPhase?.("await-content");
+		clock.setTime(t0 + 1_200);
+		first.control.onPhase?.("compare");
+		first.resolve({ outcome: "flushed", remoteText: "typed" });
+		await flushPromises();
+		const [edit] = poller.stats().edits;
+		expect(edit).toMatchObject({
+			path: "a/0.md",
+			awaits: true,
+			phases: { "await-content": 300, compare: 1_200 },
+			totalMs: 1_200,
+			outcome: "flushed",
+			matched: true,
+		});
+		poller.destroy();
+	});
+
 	test("an announced pull waits connected for the text, without holding a slot or hitting the deadline", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
