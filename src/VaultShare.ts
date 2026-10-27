@@ -2427,7 +2427,7 @@ export class VaultShare extends ProviderBacked {
 				}
 				void (isDocument(item) ? item.markSyncOrigin("local") : item.markSyncOrigin("local"));
 				this.log(`[${item.entryPath}] Uploading file`);
-				await this.transfers.enqueueUpload(item, { priority });
+				await this.transfers.enqueueUpload(item, { priority, source: "create" });
 				void this.noteUploaded(item);
 			}
 		})();
