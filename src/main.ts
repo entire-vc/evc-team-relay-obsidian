@@ -1085,6 +1085,7 @@ export default class TeamRelayPlugin extends Plugin {
 													);
 												}
 												// Remove local shared folder
+												if (folder.entityGuid) this.inboundSyncPoller?.unregisterShare(folder.entityGuid);
 												this.shareRegistry.delete(folder);
 												this.explorerDecorations?.refreshExistingRows();
 												new Notice(`Folder "${folder.path}" unshared`);
@@ -1271,6 +1272,14 @@ export default class TeamRelayPlugin extends Plugin {
 		this.webSyncManager?.onFileRenamed(file.path, oldPath);
 	}
 
+	/** Whether a folder share has a VaultShare or a folder in this vault. */
+	private isShareFolderLocal(shareId: string, sharePath: string): boolean {
+		return (
+			!!this.shareRegistry.locate((sf) => sf.entityGuid === shareId) ||
+			!!resolveShareFolder(this.app.vault, sharePath)
+		);
+	}
+
 	private async loadRelayOnPremShares() {
 		const log = namedLogger("[RelayOnPrem]", "log");
 		const err = namedLogger("[RelayOnPrem]", "error");
@@ -1356,10 +1365,15 @@ export default class TeamRelayPlugin extends Plugin {
 						}
 					}
 
-					// Register all folder shares for inbound polling (v1.9)
+					// Inbound polling only for folders present in the vault; the
+					// rest are checked against this list (v1.9).
 					if (share.kind === "folder" && this.inboundSyncPoller) {
-						this.inboundSyncPoller.registerShare(share.id, share.serverId);
-						log(`Registered inbound poller for folder ${share.path} on server ${share.serverId}`);
+						this.inboundSyncPoller.track(
+							share.id,
+							share.serverId,
+							this.isShareFolderLocal(share.id, share.path),
+							share.web_content_updated_at,
+						);
 					}
 				}
 
@@ -1453,10 +1467,15 @@ export default class TeamRelayPlugin extends Plugin {
 						}
 					}
 
-					// Register all folder shares for inbound polling (v1.9)
+					// Inbound polling only for folders present in the vault; the
+					// rest are checked against this list (v1.9).
 					if (share.kind === "folder" && this.inboundSyncPoller) {
-						this.inboundSyncPoller.registerShare(share.id, defaultServerId);
-						log(`Registered inbound poller for folder ${share.path}`);
+						this.inboundSyncPoller.track(
+							share.id,
+							defaultServerId,
+							this.isShareFolderLocal(share.id, share.path),
+							share.web_content_updated_at,
+						);
 					}
 				}
 			} else {
@@ -1579,6 +1598,8 @@ export default class TeamRelayPlugin extends Plugin {
 					if (folder) {
 						void folder.bringOnline();
 						relaySynced++;
+					} else {
+						this.inboundSyncPoller?.track(share.id, share.serverId, this.isShareFolderLocal(share.id, share.path), share.web_content_updated_at);
 					}
 				}
 			}
@@ -1951,6 +1972,8 @@ export default class TeamRelayPlugin extends Plugin {
 						(folder) => folder.path === file.path,
 					);
 					if (folder) {
+						// The folder left the vault: stop polling its share.
+						if (folder.entityGuid) this.inboundSyncPoller?.unregisterShare(folder.entityGuid);
 						this.shareRegistry.delete(folder);
 						return;
 					}

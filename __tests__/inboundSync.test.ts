@@ -140,6 +140,42 @@ describe("InboundSyncPoller", () => {
 		expect(fileDownloader.downloadShare).toHaveBeenCalledWith(SHARE_ID, SERVER_ID);
 	});
 
+	test("a share whose folder is not in the vault costs no GET per poll; a local one is polled", async () => {
+		(clientManager.getShare as unknown as jest.Mock<() => Promise<unknown>>).mockResolvedValue(
+			makeShare("2026-06-08T10:00:00Z"),
+		);
+
+		for (let i = 0; i < 14; i++) poller.track(`remote-${i}`, SERVER_ID, false, null);
+		poller.track(SHARE_ID, SERVER_ID, true, null);
+		poller.start();
+
+		for (let t = 1; t <= 10; t++) {
+			timeProvider.setTime(startTime + t * 30_000);
+			await flushPromises();
+		}
+
+		const polled = (clientManager.getShare as jest.Mock).mock.calls.map((c) => c[1]);
+		expect(polled.filter((id) => id !== SHARE_ID)).toEqual([]);
+		expect(polled.length).toBe(10);
+	});
+
+	test("a non-local share is downloaded from the listed timestamp once, and not again while it is unchanged", async () => {
+		const ts = "2026-06-08T10:00:00Z";
+
+		poller.track("remote", SERVER_ID, false, ts);
+		await flushPromises();
+		expect(fileDownloader.downloadShare).toHaveBeenCalledWith("remote", SERVER_ID);
+
+		poller.track("remote", SERVER_ID, false, ts);
+		await flushPromises();
+		expect(fileDownloader.downloadShare).toHaveBeenCalledTimes(1);
+
+		poller.track("remote", SERVER_ID, false, "2026-06-08T11:00:00Z");
+		await flushPromises();
+		expect(fileDownloader.downloadShare).toHaveBeenCalledTimes(2);
+		expect(clientManager.getShare).not.toHaveBeenCalled();
+	});
+
 	test("skips downloadShare when web_content_updated_at is unchanged", async () => {
 		const ts = "2026-06-08T10:00:00Z";
 		(clientManager.getShare as jest.Mock).mockResolvedValue(makeShare(ts));
