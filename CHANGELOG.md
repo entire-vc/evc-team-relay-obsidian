@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.20
+- Improved: the sync health check now records how long each step of connecting to the server takes, so slow connections can be traced to their cause.
+
 ## 0.1.19
 - Fixed: during a large import or background sync, edits to closed notes and changes from other devices now get access to the server ahead of the background work, instead of waiting in line behind it for up to half a minute.
 
