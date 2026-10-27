@@ -327,9 +327,14 @@ export class CrdtBackgroundSyncPoller {
 		return queues;
 	}
 
+	/** Not open in the editor. The probed document is online only for the probe. */
+	private isClosed(file: Document): boolean {
+		return !file.isOnline || file.entityGuid === this.probing;
+	}
+
 	private canQueue(file: Document): boolean {
 		return (
-			!file.isOnline &&
+			this.isClosed(file) &&
 			!this.pulling.has(file.entityGuid) &&
 			!this.abandonedWrites.has(file.entityGuid)
 		);
@@ -361,7 +366,7 @@ export class CrdtBackgroundSyncPoller {
 	private onAnnounced(folder: VaultShare, guid: string, expected: string): void {
 		if (this.destroyed) return;
 		const file = folder.trackedEntries.get(guid);
-		if (!file || !isDocument(file) || file.isOnline) return;
+		if (!file || !isDocument(file) || !this.isClosed(file)) return;
 		const now = this.timeProvider.now();
 		// A newer marker supersedes whatever re-check the older one left behind.
 		this.cancelRecheck(guid);

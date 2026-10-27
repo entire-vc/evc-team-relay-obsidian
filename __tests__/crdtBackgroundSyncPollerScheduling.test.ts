@@ -838,10 +838,14 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
 		poller.startRelayProbe("a/0.md", 10_000);
 		poller.start();
+		// The probe has connected it.
+		const probed = folder.trackedEntries.get("a-0") as FakeFile;
+		probed.isOnline = true;
 		folder.announce("a-0", textFingerprint("edited"));
 		await flushPromises();
 		expect(startedGuids(pull)).toEqual([]);
 
+		probed.isOnline = false;
 		releaseProbe();
 		await flushPromises();
 		expect(startedGuids(pull)).toEqual(["a-0"]);
