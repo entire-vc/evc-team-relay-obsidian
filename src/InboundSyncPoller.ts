@@ -1,7 +1,8 @@
 /**
  * Inbound Sync Poller (v1.9)
  *
- * Polls web_content_updated_at on connected folder shares at a fixed cadence.
+ * Polls web_content_updated_at on folder shares present in the vault at a fixed
+ * cadence; other shares are checked from the share list (see track()).
  * On detecting a bump, triggers InboundFileDownloader to pull new sync-artifact items.
  * Skips polls while an outbound sync is in flight to prevent echo loops.
  */
@@ -47,6 +48,49 @@ export class InboundSyncPoller {
 		const lastUpdatedAt = this.persistedUpdatedAt.get(shareId) ?? null;
 		this.watchedShares.set(shareId, { serverId, lastUpdatedAt });
 		log("Registered share for polling", { shareId, serverId, lastUpdatedAt });
+	}
+
+	/**
+	 * Route a folder share from the share list. One whose folder is in the
+	 * vault is polled; any other one is checked once against the
+	 * web_content_updated_at the list already carries, so folders that are
+	 * not here cost no GET /v1/shares/{id} per poll. Called again on each
+	 * list load and on "Sync all shares".
+	 */
+	track(
+		shareId: string,
+		serverId: string,
+		local: boolean,
+		listedUpdatedAt: string | null | undefined,
+	): void {
+		if (local) {
+			this.registerShare(shareId, serverId);
+			return;
+		}
+		this.watchedShares.delete(shareId);
+		void this.checkListedShare(shareId, serverId, listedUpdatedAt ?? null);
+	}
+
+	/** Download a share not in the poll set if its listed timestamp moved past the watermark. */
+	async checkListedShare(
+		shareId: string,
+		serverId: string,
+		listedUpdatedAt: string | null,
+	): Promise<void> {
+		if (!listedUpdatedAt || listedUpdatedAt === (this.persistedUpdatedAt.get(shareId) ?? null)) {
+			return;
+		}
+		try {
+			const result = await this.fileDownloader.downloadShare(shareId, serverId);
+			if (result !== "skipped") {
+				this.persistedUpdatedAt.set(shareId, listedUpdatedAt);
+			}
+		} catch (err: unknown) {
+			log("Failed to download listed share", {
+				shareId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
 	}
 
 	unregisterShare(shareId: string): void {
