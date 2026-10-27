@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.21
+- Fixed: during a large import or background sync, edits to closed notes and changes from other devices no longer wait up to half a minute to connect behind background connections. Connections for notes in use now go first, and a connection attempt that hangs is retried instead of holding up the rest.
+
 ## 0.1.20
 - Improved: the sync health check now records how long each step of connecting to the server takes, so slow connections can be traced to their cause.
 
