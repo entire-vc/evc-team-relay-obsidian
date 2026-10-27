@@ -33,8 +33,6 @@ export function shareIdOf(documentId: string): string {
 	}
 }
 
-const GRANT_FALLBACK_MS = 10 * 60_000;
-
 export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// Multi-server: one RelayOnPremTokenProvider per configured on-prem
 	// server, each bound to that server's own controlPlaneUrl + auth
@@ -61,16 +59,8 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// until their backoff runs out, whichever path asks (reconnect gate,
 	// background poller, editor open).
 	private accessDenied = new AccessDeniedBackoff();
-	// Shares that granted a token since their last refusal, until that
-	// token's expiry, and the one token request in flight for each share
-	// that has none. An expired grant says nothing about access now: after a
-	// sleep the share may have been revoked, so it is probed again first.
-	private grantedShares = new Map<string, number>();
+	// The one token request in flight for each share.
 	private shareProbes = new Map<string, Promise<void>>();
-	// Documents that have held a token (granted or restored from storage):
-	// asking again is a renewal, even once the cache has dropped the lapsed
-	// token before asking.
-	private heldDocuments = new Set<string>();
 	private accessListeners = new Set<(shareId: string) => void>();
 
 	constructor(
@@ -174,9 +164,6 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		if (this.isRelayOnPremMode && onpremServerId) {
 			this.documentServerMap.set(documentId, onpremServerId);
 		}
-		// A token restored from storage counts as held too; the cache drops
-		// a lapsed one before asking, so note it while it is still here.
-		if (this.tokenEntries?.get(documentId)?.token) this.heldDocuments.add(documentId);
 		return super.acquireToken(documentId, friendlyName, callback);
 	}
 
@@ -191,19 +178,14 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		onError: (err: Error) => void,
 	): Promise<void> {
 		const shareId = shareIdOf(documentId);
-		// Until a share has granted a token, its documents ask one at a time,
-		// so a refused share costs one request per backoff window, not one
-		// per document reconnecting at once. The price is that a working
-		// share's first token of the session is awaited before its other
-		// documents ask; after that first grant they ask concurrently again.
-		// Renewals of tokens a document already holds always ask one at a
-		// time: nothing waits on them, and a share refused mid-session must
-		// not cost one request per renewal running at once.
-		const renewing = this.heldDocuments.has(documentId) || !!this.tokenEntries?.get(documentId)?.token;
-		const serialized = () =>
-			renewing || !((this.grantedShares.get(shareId) ?? 0) > Date.now());
+		// A share's documents ask one at a time, so a share refused at any
+		// point (first connect, after a sleep, mid-session) costs one request
+		// per backoff window, not one per document asking at once. This
+		// costs a working share no throughput: the throttle already spaces
+		// token requests 500 ms apart, longer than the request takes
+		// (control plane p99 about 230 ms, 27.10).
 		for (;;) {
-			const probe = serialized() ? this.shareProbes.get(shareId) : undefined;
+			const probe = this.shareProbes.get(shareId);
 			if (!probe) break;
 			await probe;
 		}
@@ -216,15 +198,12 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 			void Promise.resolve().then(() => onError(denied));
 			return;
 		}
-		let settle: (() => void) | undefined;
-		let probe: Promise<void> | undefined;
-		if (serialized()) {
-			probe = new Promise<void>((resolve) => (settle = resolve));
-			this.shareProbes.set(shareId, probe);
-		}
+		let settle!: () => void;
+		const probe = new Promise<void>((resolve) => (settle = resolve));
+		this.shareProbes.set(shareId, probe);
 		const done = () => {
-			if (probe && this.shareProbes.get(shareId) === probe) this.shareProbes.delete(shareId);
-			settle?.();
+			if (this.shareProbes.get(shareId) === probe) this.shareProbes.delete(shareId);
+			settle();
 		};
 		try {
 			await universalRefresh(
@@ -233,11 +212,6 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 				documentId,
 				(grant) => {
 					const wasDenied = this.accessDenied.isDenied(shareId);
-					this.heldDocuments.add(documentId);
-					// No expiry on the grant: count it good for the token
-					// lifetime the sweep assumes when it cannot read one.
-					const expiry = getJwtExpiryFromDocumentGrant(grant) || Date.now() + GRANT_FALLBACK_MS;
-					this.grantedShares.set(shareId, Math.max(expiry, this.grantedShares.get(shareId) ?? 0));
 					this.accessDenied.clear(shareId);
 					done();
 					if (wasDenied) this.notifyAccessChange(shareId);
@@ -246,7 +220,6 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 				(err) => {
 					if (err instanceof RelayAccessDeniedError) {
 						const wasDenied = this.accessDenied.isDenied(shareId);
-						this.grantedShares.delete(shareId);
 						err.retryAt = this.accessDenied.recordDenied(shareId, Date.now());
 						if (!wasDenied) this.notifyAccessChange(shareId);
 					}
@@ -291,7 +264,6 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 
 	clear(filter?: (token: CredentialEntry<DocumentGrant>) => boolean) {
 		if (!filter) {
-			this.heldDocuments.clear();
 			this.filePathMap.clear();
 			this.documentServerMap.clear();
 			super.purge(filter);
@@ -299,7 +271,6 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		}
 		this.tokenEntries?.forEach((value, key) => {
 			if (filter(value)) {
-				this.heldDocuments.delete(key);
 				this.filePathMap.delete(key);
 				this.documentServerMap.delete(key);
 			}
@@ -308,7 +279,6 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	}
 
 	destroy() {
-		this.heldDocuments.clear();
 		this.filePathMap.clear();
 		this.documentServerMap.clear();
 		for (const provider of this.relayOnPremProviders.values()) {

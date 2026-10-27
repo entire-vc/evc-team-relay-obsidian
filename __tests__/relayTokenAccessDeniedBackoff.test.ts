@@ -186,18 +186,16 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(maxInFlight).toBe(1);
 	});
 
-	test("CONTROL: after the share's first grant its documents ask concurrently", async () => {
-		mockFetch.mockImplementation(() => respondSlowly(200, 5_000));
-		const { pb, docIn } = build();
-		const first = pb.bringOnline();
-		await jest.advanceTimersByTimeAsync(10_000);
-		expect(await first).toBe(true);
-		maxInFlight = 0;
+	test("CONTROL: a working share's documents ask one at a time and are all connected within seconds", async () => {
+		// Control-plane latency well above its 2026 p99 (about 230 ms).
+		mockFetch.mockImplementation(() => respondSlowly(200, 400));
+		const { docIn } = build();
+		const ps = ["66666666-6666-4666-8666-66666666666a", ...DOCS].map(docIn);
+		const results = ps.map((p) => p.bringOnline());
+		await jest.advanceTimersByTimeAsync(5_000);
 
-		for (const p of DOCS.map(docIn)) void p.bringOnline();
-		await jest.advanceTimersByTimeAsync(30_000);
-
-		expect(maxInFlight).toBeGreaterThan(1);
+		expect(await Promise.all(results)).toEqual([true, true, true, true]);
+		expect(maxInFlight).toBe(1);
 	});
 
 	test("10 minutes of 403 (write, then read) cost at most 4 token requests", async () => {
@@ -311,7 +309,7 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(tokenCalls() - before).toBeLessThanOrEqual(4);
 	});
 
-	test("documents with lapsed tokens restored from storage ask one at a time while another grant is current", async () => {
+	test("documents with lapsed tokens restored from storage (and pruned by the sweep) ask one at a time while another grant is current", async () => {
 		mockFetch.mockImplementation(() => respond(200));
 		const { cache, docIn } = build();
 		expect(await online(docIn("88888888-8888-4888-8888-8888888888a0"))).toBe(true);
@@ -322,6 +320,9 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		for (const id of ids) {
 			entries.set(id, { token: { url: "wss://relay.example.com", docId: id, token: "old", expiryTime: 1 }, friendlyName: id, expiryTime: 1, attempts: 0 });
 		}
+		// The sweep's first pass prunes them before any document asks.
+		cache.startSweeping();
+		cache.stopSweeping();
 
 		mockFetch.mockImplementation(() => respondSlowly(401, 5_000));
 		maxInFlight = 0;
