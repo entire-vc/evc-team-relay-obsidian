@@ -335,12 +335,12 @@ export class TransferQueue extends Loggable {
 		}, 1000);
 	}
 
-	/** Queue sizes per share, priority backlog, active count and oldest wait, per lane. */
 	/** The most recent priority uploads, newest last. */
 	priorityUploadTrace(): PriorityUploadTrace[] {
 		return [...this.uploadTrace];
 	}
 
+	/** Queue sizes per share, priority backlog, active count and oldest wait, per lane. */
 	laneStats(): { uploads: LaneStats; fetches: LaneStats } {
 		return { uploads: this.statsFor(this.syncLane), fetches: this.statsFor(this.downloadLane) };
 	}
@@ -527,8 +527,8 @@ export class TransferQueue extends Loggable {
 				lane
 					.run(item)
 					.then(() => {
-						ok = true;
 						this.completeQueueItem(lane, item);
+						ok = true;
 					})
 					.catch((error: unknown) => {
 						this.failQueueItem(lane, item, error);

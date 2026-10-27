@@ -175,6 +175,8 @@ const LATENCY_SAMPLES = 200;
 export interface EditPullTrace {
 	path: string;
 	announcedAt: number;
+	/** Wall-clock ms of a newer announcement that came in during the pull. */
+	reannouncedAt?: number;
 	queuedMs: number;
 	express: boolean;
 	awaits: boolean;
@@ -641,7 +643,11 @@ export class CrdtBackgroundSyncPoller {
 			if (inFlight.deadline !== undefined) this.timeProvider.cancelTimeout(inFlight.deadline);
 			this.pulling.delete(guid);
 			if (pull.expected !== undefined && lane !== "sweep" && !importing) {
-				this.traceEdit(pull, result, { startedAt, express, awaits, phaseAt });
+				try {
+					this.traceEdit(pull, result, { startedAt, express, awaits, phaseAt });
+				} catch (err: unknown) {
+					log("Could not trace an announced pull", { path: file.entryPath, err });
+				}
 			}
 			if (!this.destroyed) {
 				this.afterPull(pull, result);
@@ -726,12 +732,15 @@ export class CrdtBackgroundSyncPoller {
 		run: { startedAt: number; express: boolean; awaits: boolean; phaseAt: Partial<Record<PullPhase, number>> },
 	): void {
 		const now = this.timeProvider.now();
+		const wall = (at: number) => Date.now() - (now - at);
 		const announcedAt = pull.announcedAt ?? pull.queuedAt;
-		const expected = this.announcedWhilePulling.get(pull.file.entityGuid)?.expected ?? pull.expected;
+		const late = this.announcedWhilePulling.get(pull.file.entityGuid);
+		const expected = late?.expected ?? pull.expected;
 		const remote = result?.remoteText;
 		this.editTrace.push({
 			path: pull.file.entryPath,
-			announcedAt: Date.now() - (now - announcedAt),
+			announcedAt: wall(announcedAt),
+			...(late ? { reannouncedAt: wall(late.at) } : {}),
 			queuedMs: run.startedAt - pull.queuedAt,
 			express: run.express,
 			awaits: run.awaits,
