@@ -50,24 +50,22 @@ describe("TokenRequestThrottle", () => {
 		await flush();
 		expect(order).toHaveLength(TOKEN_REQUEST_BURST);
 
-		ask("edit");
-		// Queued while background: once opened it goes ahead too.
+		// A pull that gave up releases its hold; its queued request must not
+		// jump ahead of an edit queued after it.
 		releases[29]();
+		ask("edit");
 		jest.advanceTimersByTime(Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE));
 		await flush();
-		expect(order.slice(TOKEN_REQUEST_BURST)).toEqual(["bulk-29"]);
-		jest.advanceTimersByTime(Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE));
-		await flush();
-		expect(order.slice(TOKEN_REQUEST_BURST)).toEqual(["bulk-29", "edit"]);
+		expect(order.slice(TOKEN_REQUEST_BURST)).toEqual(["edit"]);
 
 		const waits = tokenWaitStats();
-		expect(waits.normal.count).toBe(2);
-		expect(waits.normal.max).toBeLessThanOrEqual(2 * Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE));
+		expect(waits.normal.count).toBe(1);
+		expect(waits.normal.max).toBeLessThanOrEqual(Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE));
 		// The rest still comes, in order.
 		jest.advanceTimersByTime(60_000);
 		await flush();
-		expect(order.slice(TOKEN_REQUEST_BURST + 2)).toEqual(
-			Array.from({ length: 30 - TOKEN_REQUEST_BURST - 1 }, (_, i) => `bulk-${TOKEN_REQUEST_BURST + i}`),
+		expect(order.slice(TOKEN_REQUEST_BURST + 1)).toEqual(
+			Array.from({ length: 30 - TOKEN_REQUEST_BURST }, (_, i) => `bulk-${TOKEN_REQUEST_BURST + i}`),
 		);
 		releases.forEach((release) => release());
 		throttle.destroy();

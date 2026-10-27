@@ -9,7 +9,7 @@ import { platformFetch } from "../platformFetch";
 import { namedLogger } from "../logging";
 import type { DocumentGrant, FileGrant } from "../relay/TokenShapes";
 import type { IAuthProvider } from "./IAuthProvider";
-import { recordTokenWait, tokenRequestClass } from "./tokenRequestClass";
+import { recordTokenWait, tokenRequestClass, type TokenRequestClass } from "./tokenRequestClass";
 
 export interface RelayTokenRequest {
 	share_id: string;
@@ -100,7 +100,7 @@ export class TokenRequestThrottle {
 	private limitedUntil = 0;
 	private holdMs = TOKEN_RATE_LIMITED_HOLD_MS;
 	private destroyed = false;
-	private queue: Array<{ docId?: string; queuedAt: number; resolve: () => void }> = [];
+	private queue: Array<{ cls: TokenRequestClass; queuedAt: number; resolve: () => void }> = [];
 	private timer: number | null = null;
 	private log = namedLogger("[TokenRequestThrottle]", "debug");
 
@@ -113,13 +113,15 @@ export class TokenRequestThrottle {
 
 	/**
 	 * Resolves when it is this caller's turn to make a network request. The
-	 * class of `docId` is read when a slot frees up, not here: a document
-	 * queued by a background pull and then opened goes ahead from then on.
+	 * class of `docId` is taken here and kept: a background pull that gave up
+	 * leaves its request queued, and it must not jump ahead of newer edits
+	 * once the hold is gone. (An open that joins such a request in flight
+	 * keeps its place too, behind the ordinary requests only.)
 	 */
 	acquire(docId?: string): Promise<void> {
 		if (this.destroyed) return Promise.resolve();
 		return new Promise((resolve) => {
-			this.queue.push({ docId, queuedAt: Date.now(), resolve });
+			this.queue.push({ cls: tokenRequestClass(docId), queuedAt: Date.now(), resolve });
 			if (this.timer === null) this.dispatch();
 		});
 	}
@@ -174,9 +176,9 @@ export class TokenRequestThrottle {
 		this.refill();
 		while (this.queue.length > 0 && this.tokens >= 1) {
 			this.tokens -= 1;
-			const first = this.queue.findIndex((waiter) => tokenRequestClass(waiter.docId) === "normal");
+			const first = this.queue.findIndex((waiter) => waiter.cls === "normal");
 			const [next] = this.queue.splice(first === -1 ? 0 : first, 1);
-			recordTokenWait(tokenRequestClass(next.docId), Date.now() - next.queuedAt);
+			recordTokenWait(next.cls, Date.now() - next.queuedAt);
 			this.log(`dispatching token request (queue remaining: ${this.queue.length})`);
 			next.resolve();
 		}

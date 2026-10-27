@@ -8,10 +8,10 @@
  * bulk traffic, the queue was FIFO, and the relay probe waited up to 28s to
  * connect while the control plane answered every token in under a second.
  *
- * Kept by document id (the `doc_id` of the token request) rather than passed
- * along with the request: the request is shared by everyone who asks for the
- * same document while it is in flight, so its class is read at dispatch time.
- * A document is background while at least one background holder has it.
+ * Kept by document id (the `doc_id` of the token request), so the background
+ * holders (TransferQueue, the poller) need not thread it through the
+ * credential cache. The throttle reads it when a request is queued. A
+ * document is background while at least one background holder has it.
  */
 
 const holds = new Map<string, number>();
