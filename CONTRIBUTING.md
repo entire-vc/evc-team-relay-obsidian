@@ -35,30 +35,35 @@ npm run lint
 them, are produced by the pipeline only.** A manual build is fine for debugging and
 sideloading. Publishing one by hand is not.
 
-To release: bump `manifest.json`'s `version` on `main` (normal PR/merge), then dispatch
-the release workflow with that version — **no tag-push rights needed**:
+Releases are batched. A fix, merge or QA retry does not imply a new stable.
+Collect the intended fixes on one release card, merge one version change, and freeze
+one full candidate SHA. Run acceptance against that SHA and the same recorded artifact
+digests on RU and Entire, using both MacBook and Mini. Any candidate change invalidates
+the receipt. Missing cells or failed scenarios block publication.
 
-```bash
-gh workflow run release.yml --repo entire-vc/evc-team-relay-obsidian -f version=1.2.3
-```
+Daedalus authorizes the batch; Ralph publishes it after independent review. The JSON
+receipt supplied to `workflow_dispatch` must name the candidate SHA, contain a PASS and
+an HTTPS evidence link for each of `ru-macbook`, `ru-mini`, `entire-macbook`, `entire-mini`
+in `matrix`, accepted SHA-256 digests for `main.js`, `manifest.json`, `styles.css`
+in `artifacts`, and an HTTPS `decision` link to Daedalus's release decision. The decision
+and evidence must identify the same SHA and artifact digests. The workflow validates
+receipt structure and SHA binding; independent reviewers verify the linked evidence.
 
-CI verifies `1.2.3` matches the committed `manifest.json` on `main`, creates+pushes the
-`1.2.3` tag itself (as the CI identity), then builds and releases in the same run. If the
-tag already exists — e.g. re-running attestation, or `-f allow_overwrite=true` to
-deliberately republish — CI builds that existing tag instead of cutting a new one.
+The release workflow is dispatch-only: provide `version`, `candidate_sha` (40 hex
+characters), and `qa_receipt`. It checks that the accepted commit is on main and that
+an existing version tag points to that exact commit. It then builds and attests the
+candidate, restores the committed manifest, checks that the built artifact digests equal the accepted digests, and publishes
+the assets. A non-reproducible build fails before publication. Tag pushes alone
+do not publish. Do not create a stable release to obtain a QA build: use CI build
+artifacts/test sideloads, record their digests, and compare the stable artifact digests
+after publication. Promoting the stored artifacts directly remains a future improvement.
 
-Tagging by hand still works the same way it always did (and still triggers the same
-pipeline), it's just no longer the only path:
-
-```bash
-git tag 1.2.3          # bare — a 'v' prefix will NOT trigger the workflow
-git push origin 1.2.3
-```
-
-`.github/workflows/release.yml` then builds the tagged tree, restores the committed
-`manifest.json`, verifies the tag equals `manifest.version`, attests build provenance
-for `main.js`/`styles.css`, and creates the release with the three assets. The tag is
-the version — there is no step where a human types the version anywhere else.
+Critical production security, data-loss/corruption or outage fixes may get their own
+urgent hotfix batch with incident, urgency, narrow diff and rollback recorded. This
+accelerates scheduling; the candidate, independent review and four-cell gate remain.
+Never silently replace stable assets or move a published tag. Re-running an interrupted
+publication for an existing version still requires the same accepted SHA and receipt;
+`allow_overwrite` is only an explicit recovery operation authorized on that card.
 
 ### Why hand-publishing is refused
 

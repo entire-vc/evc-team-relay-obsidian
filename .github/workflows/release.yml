@@ -1,15 +1,19 @@
 name: Release
 # Build, attest provenance and publish a release tagged EXACTLY = manifest.version
 # (bare semver, no 'v'), with main.js, manifest.json and styles.css as assets.
-# A workflow_dispatch naming a version whose tag does not exist yet creates and
-# pushes the tag itself, then continues into the same build/attest/release steps.
+# Stable publication is dispatch-only after batched acceptance of one immutable SHA.
+# A tag push alone never publishes a stable release.
 on:
-  push:
-    tags: ['[0-9]*.[0-9]*.[0-9]*']        # bare semver only — a 'v'-prefixed tag won't trigger
   workflow_dispatch:
     inputs:
       version:
         description: 'version to create+release (new tag) or (re)build/attest/release (existing tag) — bare semver, e.g. 1.2.5'
+        required: true
+      candidate_sha:
+        description: 'Full accepted commit SHA; never a moving branch'
+        required: true
+      qa_receipt:
+        description: 'JSON receipt: candidate_sha; artifacts {main.js,manifest.json,styles.css}: SHA256; matrix {ru-macbook,ru-mini,entire-macbook,entire-mini}: {verdict:PASS,evidence:https URL}; decision:https URL'
         required: true
       allow_overwrite:
         description: 'republish over an EXISTING release of this version (say why in the run notes)'
@@ -23,30 +27,94 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Determine dispatch ref (does this version's tag exist yet?)
-        # Only meaningful for workflow_dispatch. A tag-push run always builds the pushed tag,
-        # so this step is skipped and the checkout below falls back to github.ref unchanged.
-        id: dispatch
-        if: github.event_name == 'workflow_dispatch'
+      - name: Check batch acceptance receipt
+        # This binds a reviewed receipt to the exact candidate. Evidence authenticity
+        # and the Daedalus decision still require independent review on the release card.
+        env:
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          QA_RECEIPT: ${{ inputs.qa_receipt }}
         run: |
-          set -eu
-          if git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/${{ inputs.version }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "ref=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
-          fi
+          python3 - <<'PY_RECEIPT'
+          import json, os, re
+          from urllib.parse import urlparse
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', os.environ['VERSION']):
+              raise SystemExit('version must be bare numeric semver')
+          sha = os.environ['CANDIDATE_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', sha):
+              raise SystemExit('candidate_sha must be a full commit SHA')
+          receipt = json.loads(os.environ['QA_RECEIPT'])
+          if receipt.get('candidate_sha') != sha:
+              raise SystemExit('receipt belongs to a different candidate')
+          def link(value):
+              u = urlparse(value if isinstance(value, str) else '')
+              return u.scheme == 'https' and bool(u.netloc)
+          for cell in ('ru-macbook', 'ru-mini', 'entire-macbook', 'entire-mini'):
+              result = receipt.get('matrix', {}).get(cell, {})
+              if result.get('verdict') != 'PASS' or not link(result.get('evidence')):
+                  raise SystemExit('missing PASS/evidence for ' + cell)
+          if not link(receipt.get('decision')):
+              raise SystemExit('Daedalus release decision link required')
+          for asset in ('main.js', 'manifest.json', 'styles.css'):
+              if not re.fullmatch(r'[0-9a-f]{64}', receipt.get('artifacts', {}).get(asset, '')):
+                  raise SystemExit('accepted artifact SHA256 required for ' + asset)
+          print('Four-cell receipt bound to candidate ' + sha)
+          PY_RECEIPT
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && steps.dispatch.outputs.ref || github.ref }}
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+      - name: Require the accepted candidate on main; preserve existing tag identity
+        id: dispatch
+        env:
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -eu
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$CANDIDATE_SHA" origin/main
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            test "$(git rev-parse "refs/tags/$VERSION^{commit}")" = "$CANDIDATE_SHA" || {
+              echo '::error::existing tag belongs to a different candidate'; exit 1;
+            }
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
+      - run: npm ci
+      - run: npm run build
+      - name: Restore committed manifest.json (a dev/debug build must NEVER change the published version)
+        # A debug build may stamp manifest.json (esbuild
+        # debug overwrite, version=beta). The published version MUST be the tag's committed manifest.
+        run: git checkout HEAD -- manifest.json
+      - name: Resolve + verify version (bare, tag == manifest)
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.version }}"; else TAG="${GITHUB_REF_NAME}"; fi
+          VER=$(node -p "require('./manifest.json').version")
+          case "$TAG" in v*) echo "::error::tag '$TAG' has a 'v' prefix — Obsidian needs bare semver"; exit 1;; esac
+          if [ "$TAG" != "$VER" ]; then echo "::error::tag '$TAG' != manifest.version '$VER'"; exit 1; fi
+          [ -f main.js ] || { echo "::error::main.js not built"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Verify the built bytes equal the accepted candidate artifacts
+        env:
+          QA_RECEIPT: ${{ inputs.qa_receipt }}
+        run: |
+          python3 - <<'PY_DIGEST'
+          import hashlib, json, os
+          from pathlib import Path
+          accepted = json.loads(os.environ['QA_RECEIPT'])['artifacts']
+          for name in ('main.js', 'manifest.json', 'styles.css'):
+              digest = hashlib.sha256(Path(name).read_bytes()).hexdigest()
+              if digest != accepted[name]:
+                  raise SystemExit('built artifact differs from accepted bytes: ' + name)
+          print('Accepted artifact digests match')
+          PY_DIGEST
       - name: Create + push release tag as CI identity (workflow_dispatch, new tag only)
-        # Runs on the dispatching branch, BEFORE the build — a build's manifest.json can get
-        # stamped with a debug/dev version (see the restore step below); the version that
-        # decides whether we're allowed to cut this tag must be the committed one.
+        # Only after build and accepted-byte checks; the manifest was restored from the commit.
         if: github.event_name == 'workflow_dispatch' && steps.dispatch.outputs.exists != 'true'
         run: |
           set -eu
@@ -62,21 +130,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag "$TAG"
           git push origin "$TAG"
-      - run: npm ci || npm install
-      - run: npm run build
-      - name: Restore committed manifest.json (a dev/debug build must NEVER change the published version)
-        # A debug build may stamp manifest.json (esbuild
-        # debug overwrite, version=beta). The published version MUST be the tag's committed manifest.
-        run: git checkout HEAD -- manifest.json
-      - name: Resolve + verify version (bare, tag == manifest)
-        id: v
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.version }}"; else TAG="${GITHUB_REF_NAME}"; fi
-          VER=$(node -p "require('./manifest.json').version")
-          case "$TAG" in v*) echo "::error::tag '$TAG' has a 'v' prefix — Obsidian needs bare semver"; exit 1;; esac
-          if [ "$TAG" != "$VER" ]; then echo "::error::tag '$TAG' != manifest.version '$VER'"; exit 1; fi
-          [ -f main.js ] || { echo "::error::main.js not built"; exit 1; }
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance (main.js, styles.css)
         uses: actions/attest-build-provenance@v4
         with:
