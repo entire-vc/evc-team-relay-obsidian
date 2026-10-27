@@ -70,57 +70,85 @@ export class RateLimitError extends Error {
 	}
 }
 
+/** Steady token-request rate per control plane. */
+export const TOKEN_REQUESTS_PER_MINUTE = 120;
+/** Requests that may go out back-to-back after a quiet spell. */
+export const TOKEN_REQUEST_BURST = 10;
+/** Rate after the control plane answered 429: the old 30/min server limit, with margin. */
+export const TOKEN_REQUESTS_PER_MINUTE_LIMITED = 25;
+/** How long the slower rate holds after a 429 (at least the Retry-After). */
+export const TOKEN_RATE_LIMITED_HOLD_MS = 10 * 60_000;
+
 /**
- * Throttle queue: ensures at most `maxPerMinute` requests are dispatched
- * per 60-second window by spacing them out.
+ * Token bucket in front of POST /v1/tokens/relay: up to `burst` requests at
+ * once, then `perMinute`, served FIFO.
  *
- * With the control-plane limit of 30 req/min we use 25 slots/min (2 400 ms
- * minimum spacing) to stay safely below the ceiling.
+ * The control plane allows 300 req/min per user and share. This used to be
+ * a fixed 25/min queue sized for the old 30/min limit, and under a bulk sync
+ * it became the bottleneck: measured on a two-client stand, both clients sat
+ * at the ceiling and each new connection queued ~47s for its token. A server
+ * that still has the old limit answers 429; `slowDown()` then drops to the
+ * old rate for a while.
  */
-class TokenRequestThrottle {
-	/** Minimum delay between consecutive dispatched requests (ms) */
-	private readonly minIntervalMs: number;
-	/** Timestamp when the last request was dispatched */
-	private lastDispatchAt = 0;
-	/** Queue of pending resolvers waiting for their turn */
+export class TokenRequestThrottle {
+	private tokens: number;
+	private refilledAt = Date.now();
+	private limitedUntil = 0;
 	private queue: Array<() => void> = [];
 	private timer: number | null = null;
 	private log = namedLogger("[TokenRequestThrottle]", "debug");
 
-	constructor(maxPerMinute = 25) {
-		this.minIntervalMs = Math.ceil(60_000 / maxPerMinute);
+	constructor(
+		private readonly perMinute = TOKEN_REQUESTS_PER_MINUTE,
+		private readonly burst = TOKEN_REQUEST_BURST,
+	) {
+		this.tokens = burst;
 	}
 
-	/**
-	 * Returns a promise that resolves when it is this caller's turn to make
-	 * a network request.  Callers are served in FIFO order with at least
-	 * `minIntervalMs` between each dispatch.
-	 */
+	/** Resolves when it is this caller's turn to make a network request (FIFO). */
 	acquire(): Promise<void> {
 		return new Promise((resolve) => {
 			this.queue.push(resolve);
-			if (this.queue.length === 1) {
-				this._scheduleNext();
-			}
+			if (this.timer === null) this.dispatch();
 		});
 	}
 
-	private _scheduleNext() {
-		if (this.queue.length === 0) return;
+	/** The server answered 429: hold the old rate for `holdMs`, with no burst. */
+	slowDown(holdMs = TOKEN_RATE_LIMITED_HOLD_MS): void {
+		this.refill();
+		this.limitedUntil = Math.max(this.limitedUntil, Date.now() + holdMs);
+		this.tokens = Math.min(this.tokens, 0);
+		this.log(`rate limited by the server; ${TOKEN_REQUESTS_PER_MINUTE_LIMITED}/min for ${holdMs}ms`);
+	}
 
+	private limited(): boolean {
+		return Date.now() < this.limitedUntil;
+	}
+
+	private intervalMs(): number {
+		return Math.ceil(60_000 / (this.limited() ? TOKEN_REQUESTS_PER_MINUTE_LIMITED : this.perMinute));
+	}
+
+	private refill(): void {
 		const now = Date.now();
-		const elapsed = now - this.lastDispatchAt;
-		const delay = Math.max(0, this.minIntervalMs - elapsed);
+		const capacity = this.limited() ? 1 : this.burst;
+		this.tokens = Math.min(capacity, this.tokens + (now - this.refilledAt) / this.intervalMs());
+		this.refilledAt = now;
+	}
 
+	private dispatch(): void {
+		this.refill();
+		while (this.queue.length > 0 && this.tokens >= 1) {
+			this.tokens -= 1;
+			const next = this.queue.shift();
+			this.log(`dispatching token request (queue remaining: ${this.queue.length})`);
+			next?.();
+		}
+		if (this.queue.length === 0) return;
+		const delay = Math.max(0, Math.ceil((1 - this.tokens) * this.intervalMs()));
 		this.timer = window.setTimeout(() => {
 			this.timer = null;
-			const next = this.queue.shift();
-			if (next) {
-				this.lastDispatchAt = Date.now();
-				this.log(`dispatching queued request (queue remaining: ${this.queue.length})`);
-				next();
-				this._scheduleNext();
-			}
+			this.dispatch();
 		}, delay);
 	}
 
@@ -176,8 +204,7 @@ export class RelayOnPremTokenProvider {
 	constructor(private config: RelayOnPremTokenConfig) {
 		// Normalize URL - remove trailing slashes to prevent double-slash issues
 		this.normalizedUrl = config.controlPlaneUrl.replace(/\/+$/, "");
-		// 25 req/min leaves a 5-req safety margin below the server's 30 req/min limit
-		this.throttle = new TokenRequestThrottle(25);
+		this.throttle = new TokenRequestThrottle();
 	}
 
 	/**
@@ -193,7 +220,8 @@ export class RelayOnPremTokenProvider {
 
 	/**
 	 * Request a relay token for document access.
-	 * Requests are throttled to ≤25/min and throw RateLimitError on HTTP 429.
+	 * Requests go through the shared TokenRequestThrottle and throw
+	 * RateLimitError on HTTP 429, which also slows the throttle down.
 	 */
 	async requestToken(
 		relayId: string,
@@ -249,6 +277,7 @@ export class RelayOnPremTokenProvider {
 				console.warn(
 					`[DIAG][RelayOnPremTokenProvider] 429 rate limited for doc ${docId}. retryAfter=${retryAfterMs}ms body=${errorText}`
 				);
+				this.throttle.slowDown(Math.max(retryAfterMs, TOKEN_RATE_LIMITED_HOLD_MS));
 				throw new RateLimitError(retryAfterMs, `Token request rate limited for doc ${docId}`);
 			}
 
