@@ -151,10 +151,10 @@ describe("pullIfUnchanged — waiting connected for announced content", () => {
 		expect(result.outcome).toBe("unchanged");
 		expect(clock.now() - waitStart).toBeGreaterThanOrEqual(5_000);
 		expect(clock.now() - waitStart).toBeLessThan(6_000);
-		// One reconnect at 4s, then the release at the end.
-		expect(bringOnline).toHaveBeenCalledTimes(2);
+		// A reconnect at 4s would leave under one interval of the wait: none.
+		expect(bringOnline).toHaveBeenCalledTimes(1);
 		expect(writeContents).not.toHaveBeenCalled();
-		expect(goOffline).toHaveBeenCalledTimes(2);
+		expect(goOffline).toHaveBeenCalledTimes(1);
 	});
 
 	test("text the first connection never receives arrives on a reconnect, within seconds", async () => {
@@ -183,6 +183,52 @@ describe("pullIfUnchanged — waiting connected for announced content", () => {
 		expect(doc.writeContents).toHaveBeenCalledWith(doc.fakeDoc, "edited by peer");
 		expect(onReconnect).toHaveBeenCalledTimes(1);
 		expect(clock.now() - waitStart).toBeLessThan(5_000);
+		expect(doc.goOffline).toHaveBeenCalledTimes(2);
+	});
+
+	test("reconnects back off and stop short of the end of the wait", async () => {
+		const clock = new SteppingClock();
+		const { fakeDoc, bringOnline } = makeFakeDoc();
+		let waitStart = 0;
+		const reconnectsAt: number[] = [];
+		await clock.settle(
+			makeQueue(clock).pullIfUnchanged(fakeDoc, {
+				expected: () => textFingerprint("never"),
+				awaitContentMs: 60_000,
+				onReconnect: () => reconnectsAt.push(clock.now() - waitStart),
+				onPhase: (phase) => {
+					if (phase === "await-content") waitStart = clock.now();
+				},
+			}),
+		);
+		// 4s, then 8s and 16s later; the next would be due at 60s, when the wait ends.
+		expect(reconnectsAt).toEqual([4_000, 12_000, 28_000]);
+		expect(bringOnline).toHaveBeenCalledTimes(4);
+	});
+
+	test("aborted during a reconnect: no write, connection dropped", async () => {
+		const clock = new SteppingClock();
+		const controller = new AbortController();
+		let connects = 0;
+		const doc = makeFakeDoc({
+			bringOnline: async () => {
+				if (++connects === 2) {
+					doc.setContent("edited by peer");
+					controller.abort();
+				}
+				return true;
+			},
+		});
+		const result = await clock.settle(
+			makeQueue(clock).pullIfUnchanged(doc.fakeDoc, {
+				signal: controller.signal,
+				expected: () => textFingerprint("edited by peer"),
+				awaitContentMs: 60_000,
+			}),
+		);
+		expect(result).toEqual({ outcome: "aborted" });
+		expect(doc.writeContents).not.toHaveBeenCalled();
+		// Once for the reconnect, once for the release.
 		expect(doc.goOffline).toHaveBeenCalledTimes(2);
 	});
 

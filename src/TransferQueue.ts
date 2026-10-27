@@ -223,7 +223,7 @@ const PULL_CONNECT_TIMEOUT_MS = 15_000;
 const PULL_SYNC_GRACE_MS = 2_000;
 /** How often a pull waiting for announced text looks at it again. */
 const AWAIT_CONTENT_CHECK_MS = 250;
-/** How long a pull waits connected for announced text before it reconnects to ask again. */
+/** How long a pull waits connected for announced text before it first reconnects to ask again; doubles after each. */
 const AWAIT_CONTENT_RECONNECT_MS = 4_000;
 /** probeRelay(): cap on each of its two phases. */
 const PROBE_PHASE_TIMEOUT_MS = 30_000;
@@ -1478,7 +1478,10 @@ export class TransferQueue extends Loggable {
 	 * load: three edits waited 20-38s connected for text the relay already
 	 * had, while a fresh connect synced in under half a second. So a pull
 	 * that owns its connection (`reconnect` set) asks again on a new one
-	 * whenever the text is still missing after AWAIT_CONTENT_RECONNECT_MS.
+	 * when the text is still missing after AWAIT_CONTENT_RECONNECT_MS, then
+	 * after twice that, and so on: many stuck pulls must not pile connects
+	 * onto a relay that is already slow. No reconnect starts once the wait
+	 * has less than one interval left.
 	 */
 	private async awaitText(
 		doc: Document,
@@ -1489,12 +1492,15 @@ export class TransferQueue extends Loggable {
 	): Promise<void> {
 		const until = this.clock.now() + maxMs;
 		let askedAt = this.clock.now();
+		let interval = AWAIT_CONTENT_RECONNECT_MS;
 		while (!aborted() && this.clock.now() < until) {
 			const want = expected();
 			if (want === undefined || textFingerprint(doc.content) === want) return;
-			if (reconnect && this.clock.now() - askedAt >= AWAIT_CONTENT_RECONNECT_MS) {
+			const now = this.clock.now();
+			if (reconnect && now - askedAt >= interval && until - now >= interval) {
 				await reconnect();
 				askedAt = this.clock.now();
+				interval *= 2;
 				continue;
 			}
 			await this.delay(AWAIT_CONTENT_CHECK_MS);
