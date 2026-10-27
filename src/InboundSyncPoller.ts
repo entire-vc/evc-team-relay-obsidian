@@ -24,6 +24,9 @@ interface WatchedShare {
 
 export class InboundSyncPoller {
 	private watchedShares: Map<string, WatchedShare> = new Map();
+	// The check running for a share, by the poll or from the share list;
+	// checks of one share run one after another.
+	private shareChecks = new Map<string, Promise<void>>();
 	private intervalId: number | null = null;
 	private polling = false;
 	private serverBackoff = new Map<string, { failures: number; retryAt: number }>();
@@ -73,27 +76,62 @@ export class InboundSyncPoller {
 		void this.checkListedShare(shareId, serverId, listedUpdatedAt ?? null, isLocalNow);
 	}
 
-	/** Download a share not in the poll set if its listed timestamp moved past the watermark. */
-	async checkListedShare(
+	/**
+	 * Download a share not in the poll set if its listed timestamp moved past
+	 * the watermark. Checks of one share run one after another, so two list
+	 * loads close together download it once and the watermark only moves
+	 * forward. `isLocalNow` re-checks presence after a download.
+	 */
+	checkListedShare(
 		shareId: string,
 		serverId: string,
 		listedUpdatedAt: string | null,
 		isLocalNow?: () => boolean,
 	): Promise<void> {
-		if (!listedUpdatedAt || listedUpdatedAt === (this.persistedUpdatedAt.get(shareId) ?? null)) {
+		const previous = this.shareChecks.get(shareId) ?? Promise.resolve();
+		const check = previous.then(() => this.runListedCheck(shareId, serverId, listedUpdatedAt, isLocalNow));
+		this.shareChecks.set(shareId, check);
+		void check.then(() => {
+			if (this.shareChecks.get(shareId) === check) this.shareChecks.delete(shareId);
+		});
+		return check;
+	}
+
+	private async runListedCheck(
+		shareId: string,
+		serverId: string,
+		listedUpdatedAt: string | null,
+		isLocalNow?: () => boolean,
+	): Promise<void> {
+		const watermark = this.persistedUpdatedAt.get(shareId) ?? null;
+		if (!listedUpdatedAt || listedUpdatedAt === watermark) {
+			return;
+		}
+		if (watermark && Date.parse(listedUpdatedAt) <= Date.parse(watermark)) {
 			return;
 		}
 		try {
 			const result = await this.fileDownloader.downloadShare(shareId, serverId);
-			if (result !== "skipped") {
+			// A poll of this share may have moved the watermark meanwhile.
+			const current = this.persistedUpdatedAt.get(shareId);
+			if (result !== "skipped" && (!current || Date.parse(listedUpdatedAt) > Date.parse(current))) {
 				this.persistedUpdatedAt.set(shareId, listedUpdatedAt);
-				if (isLocalNow?.()) this.registerShare(shareId, serverId);
+				const watched = this.watchedShares.get(shareId);
+				if (watched) watched.lastUpdatedAt = listedUpdatedAt;
 			}
+			if (result !== "skipped" && isLocalNow?.()) this.registerShare(shareId, serverId);
 		} catch (err: unknown) {
 			log("Failed to download listed share", {
 				shareId,
 				error: err instanceof Error ? err.message : String(err),
 			});
+		}
+	}
+
+	/** Stop polling every watched share `keep` rejects. */
+	retainOnly(keep: (shareId: string) => boolean): void {
+		for (const shareId of [...this.watchedShares.keys()]) {
+			if (!keep(shareId)) this.unregisterShare(shareId);
 		}
 	}
 
@@ -123,7 +161,14 @@ export class InboundSyncPoller {
 			for (const [shareId, info] of this.watchedShares) {
 				const backoff = this.serverBackoff.get(info.serverId);
 				if (backoff && this.timeProvider.now() < backoff.retryAt) continue;
-				if (await this._checkShare(shareId, info.serverId, info.lastUpdatedAt)) {
+				// A check from the share list is still running for it.
+				if (this.shareChecks.has(shareId)) continue;
+				const check = this._checkShare(shareId, info.serverId, info.lastUpdatedAt);
+				const lock = check.then(() => undefined);
+				this.shareChecks.set(shareId, lock);
+				const ok = await check;
+				if (this.shareChecks.get(shareId) === lock) this.shareChecks.delete(shareId);
+				if (ok) {
 					recoveredServers.add(info.serverId);
 				} else {
 					failedServers.add(info.serverId);

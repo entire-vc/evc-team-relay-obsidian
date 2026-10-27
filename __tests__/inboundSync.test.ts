@@ -1184,3 +1184,174 @@ describe("InboundSyncPoller persisted lastUpdatedAt", () => {
 		expect(persistedStore.has(SHARE_ID)).toBe(false);
 	});
 });
+
+describe("InboundSyncPoller: shares checked from the share list", () => {
+	let timeProvider: MockClock;
+	let clientManager: ReturnType<typeof makeMockClientManager>;
+	let webSyncManager: ReturnType<typeof makeMockWebSyncManager>;
+
+	beforeEach(() => {
+		jest.clearAllMocks();
+		timeProvider = new MockClock();
+		clientManager = makeMockClientManager();
+		webSyncManager = makeMockWebSyncManager();
+	});
+
+	test("two list loads close together download a share once at a time, and the watermark never moves back", async () => {
+		const store = new Map<string, string>();
+		let releaseFirst!: () => void;
+		const order: string[] = [];
+		const downloadShare = jest
+			.fn<() => Promise<"ran" | "skipped">>()
+			.mockImplementationOnce(() => {
+				order.push("start-1");
+				return new Promise((resolve) => (releaseFirst = () => { order.push("end-1"); resolve("ran"); }));
+			})
+			.mockImplementation(async () => {
+				order.push("start-n");
+				return "ran";
+			});
+		const poller = new InboundSyncPoller(
+			timeProvider,
+			clientManager as any,
+			webSyncManager as any,
+			{ downloadShare, isInboundWriting: () => false } as any,
+			30_000,
+			store,
+		);
+
+		const first = poller.checkListedShare("remote", SERVER_ID, "2026-06-08T10:00:00Z");
+		const second = poller.checkListedShare("remote", SERVER_ID, "2026-06-08T11:00:00Z");
+		await flushPromises();
+		expect(order).toEqual(["start-1"]);
+		releaseFirst();
+		await Promise.all([first, second]);
+
+		expect(order).toEqual(["start-1", "end-1", "start-n"]);
+		expect(store.get("remote")).toBe("2026-06-08T11:00:00Z");
+
+		// An older listing seen later does not pull the watermark back.
+		await poller.checkListedShare("remote", SERVER_ID, "2026-06-08T10:00:00Z");
+		expect(downloadShare).toHaveBeenCalledTimes(2);
+		expect(store.get("remote")).toBe("2026-06-08T11:00:00Z");
+	});
+
+	test("a share that turns local while its listed check runs is not polled over it, and keeps the newer watermark", async () => {
+		const store = new Map<string, string>();
+		let releaseListed!: () => void;
+		const downloadShare = jest
+			.fn<() => Promise<"ran" | "skipped">>()
+			.mockImplementationOnce(() => new Promise((resolve) => (releaseListed = () => resolve("ran"))))
+			.mockResolvedValue("ran");
+		(clientManager.getShare as unknown as jest.Mock<() => Promise<unknown>>).mockResolvedValue(makeShare("2026-06-08T11:00:00Z"));
+		const poller = new InboundSyncPoller(
+			timeProvider,
+			clientManager as any,
+			webSyncManager as any,
+			{ downloadShare, isInboundWriting: () => false } as any,
+			30_000,
+			store,
+		);
+
+		poller.track("s", SERVER_ID, false, "2026-06-08T10:00:00Z");
+		await flushPromises();
+		poller.track("s", SERVER_ID, true, null);
+		poller.start();
+		timeProvider.setTime(timeProvider.now() + 30_000);
+		await flushPromises();
+		// Not polled while the listed download is still running.
+		expect(clientManager.getShare).not.toHaveBeenCalled();
+
+		releaseListed();
+		await flushPromises();
+		timeProvider.setTime(timeProvider.now() + 30_000);
+		await flushPromises();
+		expect(clientManager.getShare).toHaveBeenCalledTimes(1);
+		expect(store.get("s")).toBe("2026-06-08T11:00:00Z");
+	});
+
+	test("a listed download that finishes after a newer poll does not pull the watermark back", async () => {
+		const store = new Map<string, string>();
+		let releaseListed!: () => void;
+		const downloadShare = jest
+			.fn<() => Promise<"ran" | "skipped">>()
+			.mockImplementationOnce(() => new Promise((resolve) => (releaseListed = () => resolve("ran"))));
+		const poller = new InboundSyncPoller(
+			timeProvider,
+			clientManager as any,
+			webSyncManager as any,
+			{ downloadShare, isInboundWriting: () => false } as any,
+			30_000,
+			store,
+		);
+
+		const listed = poller.checkListedShare("s", SERVER_ID, "2026-06-08T10:00:00Z");
+		await flushPromises();
+		store.set("s", "2026-06-08T11:00:00Z"); // a poll of the share got there first
+		releaseListed();
+		await listed;
+
+		expect(store.get("s")).toBe("2026-06-08T11:00:00Z");
+	});
+
+	test("a check from the share list waits for a poll of the same share already running, and keeps its watermark", async () => {
+		const store = new Map<string, string>();
+		let releasePoll!: () => void;
+		const order: string[] = [];
+		const downloadShare = jest
+			.fn<() => Promise<"ran" | "skipped">>()
+			.mockImplementationOnce(() => {
+				order.push("poll-start");
+				return new Promise((resolve) => (releasePoll = () => { order.push("poll-end"); resolve("ran"); }));
+			})
+			.mockImplementation(async () => {
+				order.push("listed");
+				return "ran";
+			});
+		(clientManager.getShare as unknown as jest.Mock<() => Promise<unknown>>).mockResolvedValue(makeShare("2026-06-08T11:00:00Z"));
+		const poller = new InboundSyncPoller(
+			timeProvider,
+			clientManager as any,
+			webSyncManager as any,
+			{ downloadShare, isInboundWriting: () => false } as any,
+			30_000,
+			store,
+		);
+
+		poller.registerShare("s", SERVER_ID);
+		poller.start();
+		timeProvider.setTime(timeProvider.now() + 30_000);
+		await flushPromises();
+		expect(order).toEqual(["poll-start"]);
+
+		const listed = poller.checkListedShare("s", SERVER_ID, "2026-06-08T10:00:00Z");
+		await flushPromises();
+		expect(order).toEqual(["poll-start"]);
+		releasePoll();
+		await listed;
+
+		// The older listed timestamp is not downloaded over the poll's newer one.
+		expect(order).toEqual(["poll-start", "poll-end"]);
+		expect(store.get("s")).toBe("2026-06-08T11:00:00Z");
+	});
+
+	test("retainOnly stops polling the shares it rejects", async () => {
+		const poller = new InboundSyncPoller(
+			timeProvider,
+			clientManager as any,
+			webSyncManager as any,
+			{ downloadShare: jest.fn(), isInboundWriting: () => false } as any,
+			30_000,
+		);
+		(clientManager.getShare as unknown as jest.Mock<() => Promise<unknown>>).mockResolvedValue(makeShare("2026-06-08T10:00:00Z"));
+		poller.registerShare("kept", SERVER_ID);
+		poller.registerShare("unshared", SERVER_ID);
+
+		poller.retainOnly((id) => id === "kept");
+		poller.start();
+		timeProvider.setTime(timeProvider.now() + 30_000);
+		await flushPromises();
+
+		expect((clientManager.getShare as jest.Mock).mock.calls.map((c) => c[1])).toEqual(["kept"]);
+	});
+});
