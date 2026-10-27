@@ -6,7 +6,8 @@
  *   `updates`  autoIncrement — one Yjs update per record, appended as the
  *              document changes and periodically collapsed into a single
  *              record so the store does not grow without bound.
- *   `custom`   plain key/value — our own metadata (server-sync flag, origin).
+ *   `custom`   plain key/value — our own metadata (server-sync flag, origin,
+ *              sync base).
  *
  * Store names, the autoIncrement flag and the metadata keys are load-bearing:
  * they address data already written on users' machines. Renaming any of them
@@ -23,6 +24,8 @@ const UPDATES_STORE = "updates";
 /** Metadata keys inside the `custom` store. Values are what is on disk today. */
 const KEY_SERVER_SYNC = "serverSync";
 const KEY_ORIGIN = "origin";
+/** Text this client and the relay last agreed on; see `Document.getSyncBase()`. */
+const KEY_SYNC_BASE = "syncBase";
 
 /**
  * Collapse thresholds. The first pass after opening the database tolerates a
@@ -171,6 +174,14 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 	_lastKey = 0;
 	_serverSynced = false;
 	_origin: DocumentOrigin | undefined = undefined;
+	/**
+	 * In-memory copy of the stored sync base, loaded with the other metadata
+	 * and written through by `rememberSyncBase()`. A background pull reads it
+	 * right before writing a peer's edit; under a bulk import the IndexedDB
+	 * queue held that read for 18-38 s, so it is not read from
+	 * disk again once the store is open.
+	 */
+	private _syncBase: string | undefined = undefined;
 
 	private _trimSize = COLD_START_COLLAPSE_AT;
 	private _storeTimeoutId: number | null = null;
@@ -216,6 +227,8 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 				this._origin = (await getFromDb(db, KEY_ORIGIN)) as
 					| DocumentOrigin
 					| undefined;
+				const syncBase = await getFromDb(db, KEY_SYNC_BASE);
+				this._syncBase = typeof syncBase === "string" ? syncBase : undefined;
 				if (this._destroyed) return db;
 				this._trimSize = LIVE_COLLAPSE_AT;
 				this.synced = true;
@@ -343,6 +356,20 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 	async rememberOrigin(origin: DocumentOrigin): Promise<unknown> {
 		this._origin = origin;
 		return this.set(KEY_ORIGIN, origin);
+	}
+
+	/** The stored sync base, served from memory once the store is open. */
+	async loadSyncBase(): Promise<string | undefined> {
+		await this._dbref;
+		return this._syncBase;
+	}
+
+	async rememberSyncBase(text: string): Promise<unknown> {
+		// After the open, which loads the stored value into `_syncBase`:
+		// setting it earlier would be overwritten by that older value.
+		await this._dbref;
+		this._syncBase = text;
+		return this.set(KEY_SYNC_BASE, text);
 	}
 
 	async loadOrigin(): Promise<DocumentOrigin | undefined> {

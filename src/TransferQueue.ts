@@ -173,6 +173,7 @@ export type PullPhase =
 	| "grace"
 	| "await-content"
 	| "compare"
+	| "sync-base"
 	| "preserve"
 	| "write";
 
@@ -1296,6 +1297,7 @@ export class TransferQueue extends Loggable {
 			!sameTextContent(remoteText, vaultContentsAfter) &&
 			doc.vaultShare.folderIndex.tracks(doc.entryPath)
 		) {
+			onPhase?.("sync-base");
 			const syncBase = await doc.getSyncBase();
 			// A peer's new note whose text reached the relay after this
 			// client's initial fetch gave up on it (fetchDocument() only

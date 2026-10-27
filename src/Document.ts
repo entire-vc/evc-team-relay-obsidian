@@ -468,8 +468,6 @@ export class Document extends ProviderBacked implements SyncableEntry, MimeTyped
 		return this._indexeddbPersistence.loadServerSyncFlag();
 	}
 
-	private static readonly SYNC_BASE_KEY = "syncBase";
-
 	/**
 	 * The content this document's Y.Doc and the relay were last confirmed to
 	 * agree on -- i.e. what `this.content` held right after the most recent
@@ -482,14 +480,14 @@ export class Document extends ProviderBacked implements SyncableEntry, MimeTyped
 	 * `markServerAcked()`/`markSyncOrigin()` above -- survives this
 	 * short-lived instance being recreated on the next `enqueueUpload` for a
 	 * doc with no live editor binding, unlike an in-memory field would.
+	 * Reads come from the store's in-memory copy once it is open.
 	 */
 	async getSyncBase(): Promise<string | undefined> {
-		const stored: unknown = await this._indexeddbPersistence.get(Document.SYNC_BASE_KEY);
-		return typeof stored === "string" ? stored : undefined;
+		return this._indexeddbPersistence.loadSyncBase();
 	}
 
 	async setSyncBase(text: string): Promise<void> {
-		await this._indexeddbPersistence.set(Document.SYNC_BASE_KEY, text);
+		await this._indexeddbPersistence.rememberSyncBase(text);
 	}
 
 	static matchesTrackedExtension(this: void, vpath: string): boolean {
