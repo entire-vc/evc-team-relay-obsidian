@@ -365,6 +365,9 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 	}
 
 	async rememberSyncBase(text: string): Promise<unknown> {
+		// After the open, which loads the stored value into `_syncBase`:
+		// setting it earlier would be overwritten by that older value.
+		await this._dbref;
 		this._syncBase = text;
 		return this.set(KEY_SYNC_BASE, text);
 	}

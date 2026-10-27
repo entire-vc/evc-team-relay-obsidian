@@ -78,6 +78,20 @@ describe("LocalDocumentStore", () => {
 		expect(await store2.get("syncBase")).toBe("newer text");
 	});
 
+	test("a sync base set while the store is still opening is not replaced by the stored one", async () => {
+		const name = `sync-base-early-${Math.random()}`;
+		const store1 = new LocalDocumentStore(name, new Y.Doc());
+		await withTimeout(store1.whenSynced, 2000, "first open");
+		await store1.rememberSyncBase("old");
+		await store1.destroy();
+
+		const store2 = new LocalDocumentStore(name, new Y.Doc());
+		await store2.rememberSyncBase("new");
+
+		expect(await store2.loadSyncBase()).toBe("new");
+		expect(await store2.get("syncBase")).toBe("new");
+	});
+
 	test("get()/set() work correctly once a store is open", async () => {
 		const doc = new Y.Doc();
 		const store = new LocalDocumentStore(`getset-${Math.random()}`, doc);
