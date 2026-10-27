@@ -24,7 +24,11 @@ export class AccessDeniedBackoff {
 
 	/** Record a refusal; returns the time before which the share is not asked again. */
 	recordDenied(shareId: string, now: number): number {
-		const failures = (this.entries.get(shareId)?.failures ?? 0) + 1;
+		const existing = this.entries.get(shareId);
+		// Requests that were already in flight when the share was refused
+		// belong to the same window and do not lengthen it.
+		if (existing && now < existing.retryAt) return existing.retryAt;
+		const failures = (existing?.failures ?? 0) + 1;
 		const retryAt = now + accessDeniedDelayMs(failures);
 		this.entries.set(shareId, { failures, retryAt });
 		return retryAt;

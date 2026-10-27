@@ -59,6 +59,10 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// until their backoff runs out, whichever path asks (reconnect gate,
 	// background poller, editor open).
 	private accessDenied = new AccessDeniedBackoff();
+	// Shares that granted a token since their last refusal, and the one
+	// token request in flight for each share that has not.
+	private grantedShares = new Set<string>();
+	private shareProbes = new Map<string, Promise<DocumentGrant>>();
 
 	constructor(
 		private authSession: AuthSession,
@@ -170,18 +174,45 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 			this.documentServerMap.set(documentId, onpremServerId);
 		}
 		const shareId = shareIdOf(documentId);
+		// Until a share has granted a token, its documents ask one at a time,
+		// so a refused share costs one request per backoff window, not one
+		// per document reconnecting at once.
+		for (;;) {
+			const probe = this.grantedShares.has(shareId) ? undefined : this.shareProbes.get(shareId);
+			if (!probe) break;
+			await probe.catch(() => undefined);
+		}
 		const retryAt = this.accessDenied.retryAt(shareId, Date.now());
 		if (retryAt !== undefined) {
 			const denied = new RelayAccessDeniedError(0, `Relay token refused for share ${shareId}; next try in ${Math.ceil((retryAt - Date.now()) / 1000)}s`);
 			denied.retryAt = retryAt;
 			throw denied;
 		}
+		const attempt = this.acquireShareToken(shareId, documentId, friendlyName, callback);
+		if (!this.grantedShares.has(shareId)) {
+			this.shareProbes.set(shareId, attempt);
+			const release = () => {
+				if (this.shareProbes.get(shareId) === attempt) this.shareProbes.delete(shareId);
+			};
+			attempt.then(release, release);
+		}
+		return attempt;
+	}
+
+	private async acquireShareToken(
+		shareId: string,
+		documentId: string,
+		friendlyName: string,
+		callback: (token: DocumentGrant) => void,
+	): Promise<DocumentGrant> {
 		try {
 			const grant = await super.acquireToken(documentId, friendlyName, callback);
+			this.grantedShares.add(shareId);
 			this.accessDenied.clear(shareId);
 			return grant;
 		} catch (err: unknown) {
 			if (err instanceof RelayAccessDeniedError) {
+				this.grantedShares.delete(shareId);
 				err.retryAt = this.accessDenied.recordDenied(shareId, Date.now());
 			}
 			throw err;

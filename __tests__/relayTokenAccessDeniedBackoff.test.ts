@@ -28,7 +28,7 @@ const mockFetch = platformFetch as jest.MockedFunction<typeof platformFetch>;
 import { ProviderBacked } from "../src/ProviderBacked";
 import { RelayCredentialCache } from "../src/RelayCredentialCache";
 import { RelayOnPremTokenProvider } from "../src/auth/RelayOnPremTokenProvider";
-import { RemoteFolderAddress } from "../src/ResourceAddress";
+import { RemoteDocumentAddress, RemoteFolderAddress } from "../src/ResourceAddress";
 import type { IAuthProvider } from "../src/auth/IAuthProvider";
 import type { AuthSession } from "../src/AuthSession";
 import { MockClock } from "./mocks/MockClock";
@@ -110,7 +110,13 @@ function build() {
 		{ getCurrentUserForServer: () => undefined, on: () => (() => {}) } as unknown as AuthSession,
 		"server-a",
 	);
-	return { cache, pb };
+	return { cache, pb, docIn: (docGuid: string) => new ProviderBacked(
+		docGuid,
+		new RemoteDocumentAddress("relay-onprem", G, docGuid),
+		cache,
+		{ getCurrentUserForServer: () => undefined, on: () => (() => {}) } as unknown as AuthSession,
+		"server-a",
+	) };
 }
 
 describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", () => {
@@ -130,6 +136,22 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		const { pb } = build();
 
 		void pb.bringOnline();
+		await jest.advanceTimersByTimeAsync(10 * MINUTE);
+
+		expect(tokenCalls()).toBeGreaterThanOrEqual(1);
+		expect(tokenCalls()).toBeLessThanOrEqual(4);
+	});
+
+	test("several documents of a refused share reconnecting together still cost at most 4 requests", async () => {
+		mockFetch.mockImplementation(() => respond(401));
+		const { pb, docIn } = build();
+		const docs = [
+			"66666666-6666-4666-8666-666666666661",
+			"66666666-6666-4666-8666-666666666662",
+			"66666666-6666-4666-8666-666666666663",
+		].map(docIn);
+
+		for (const p of [pb, ...docs]) void p.bringOnline();
 		await jest.advanceTimersByTimeAsync(10 * MINUTE);
 
 		expect(tokenCalls()).toBeGreaterThanOrEqual(1);
