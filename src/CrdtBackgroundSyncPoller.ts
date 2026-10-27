@@ -91,6 +91,14 @@
  *  - The sweep stays as the fallback for writers that don't announce
  *    changes (older clients, server-side edits); the announcement is the
  *    fast path that makes a single edit in a large vault arrive in seconds.
+ *  - A share's sweep pass starts at most once per SWEEP_PASS_INTERVAL_MS.
+ *    Every sweep pull opens a per-document connection, and a relay token
+ *    lives 5 min, so each one minted a fresh POST /v1/tokens/relay. With
+ *    passes refilled back to back, a ~900-document vault re-visited every
+ *    document about every 5 min: ~175 token requests/min from one idle
+ *    client, enough for a burst to drain the control-plane DB pool
+ *    (alert 27.10, QueuePool timeout -> 503). The floor bounds that to
+ *    documents / interval; announced changes are not affected.
  *
  * `stats()` exposes oldest wait, per-share queue sizes, in-flight count,
  * timeouts by phase and announced-change delivery latencies; a summary is
@@ -108,6 +116,8 @@ import { connectGateStats, type ConnectGateStats } from "./client/connectGate";
 const log = namedLogger("[CrdtBackgroundSyncPoller]");
 
 const DEFAULT_POLL_INTERVAL_MS = 10_000;
+/** Minimum time from the start of one sweep pass over a share to the next. */
+export const SWEEP_PASS_INTERVAL_MS = 15 * 60_000;
 /**
  * Hard ceiling on one pull, start to finish. Above pullIfUnchanged()'s own
  * 15s connect wait + 2s grace so a healthy-but-slow pull isn't cut short;
@@ -206,7 +216,11 @@ interface ShareQueues {
 	priority: Map<string, PendingPull>;
 	late: Map<string, PendingPull>;
 	sweep: Map<string, PendingPull>;
+	/** When the current sweep pass was queued; undefined before the first. */
+	sweepRefilledAt?: number;
 }
+
+type Lane = "priority" | "late" | "sweep";
 
 interface InFlight {
 	pull: PendingPull;
@@ -308,7 +322,7 @@ export class CrdtBackgroundSyncPoller {
 	/** The document a relay probe has connected right now, across stop/start. */
 	private probing?: string;
 	/** Announced pulls that came up while their document was being probed. */
-	private readonly heldByProbe = new Map<string, { pull: PendingPull; lane: keyof ShareQueues }>();
+	private readonly heldByProbe = new Map<string, { pull: PendingPull; lane: Lane }>();
 	private readonly probeSamples: RelayProbeSample[] = [];
 	private lastStatsLogAt = 0;
 	private destroyed = false;
@@ -318,6 +332,7 @@ export class CrdtBackgroundSyncPoller {
 		private readonly shareRegistry: ShareRegistry,
 		private readonly pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
 		private readonly pullDeadlineMs = PULL_DEADLINE_MS,
+		private readonly sweepPassIntervalMs = SWEEP_PASS_INTERVAL_MS,
 	) {}
 
 	start(): void {
@@ -347,6 +362,13 @@ export class CrdtBackgroundSyncPoller {
 			// the next one instead of rejoining the tail every tick.
 			if (queues.sweep.size > 0) return;
 			const now = this.timeProvider.now();
+			if (
+				queues.sweepRefilledAt !== undefined &&
+				now - queues.sweepRefilledAt < this.sweepPassIntervalMs
+			) {
+				return;
+			}
+			queues.sweepRefilledAt = now;
 			for (const file of folder.trackedEntries.values()) {
 				if (!isDocument(file) || !this.canQueue(file) || file.entityGuid === this.probing) continue;
 				if (queues.priority.has(file.entityGuid) || queues.late.has(file.entityGuid)) continue;
@@ -444,7 +466,7 @@ export class CrdtBackgroundSyncPoller {
 	 * let that stream hold all regular slots, so edits elsewhere whose
 	 * content arrived after their marker were never pulled again.
 	 */
-	private takeNext(limit: number): { pull: PendingPull; lane: keyof ShareQueues } | undefined {
+	private takeNext(limit: number): { pull: PendingPull; lane: Lane } | undefined {
 		const lateRunning = [...this.pulling.values()].filter((inFlight) => inFlight.late).length;
 		const importing = this.importingShares();
 		const editsWaiting = this.editsWaiting(importing);
@@ -473,7 +495,7 @@ export class CrdtBackgroundSyncPoller {
 	 * re-check from a share with nothing in flight at all (one starved by
 	 * another share's backlog, not the share producing it).
 	 */
-	private takeExpress(): { pull: PendingPull; lane: keyof ShareQueues } | undefined {
+	private takeExpress(): { pull: PendingPull; lane: Lane } | undefined {
 		const announcing = new Set<VaultShare>();
 		const active = new Set<VaultShare>();
 		for (const inFlight of this.pulling.values()) {
@@ -540,7 +562,7 @@ export class CrdtBackgroundSyncPoller {
 		return pull;
 	}
 
-	private takeFrom(lane: keyof ShareQueues, eligible: (share: VaultShare) => boolean): PendingPull | undefined {
+	private takeFrom(lane: Lane, eligible: (share: VaultShare) => boolean): PendingPull | undefined {
 		const shares = [...this.queues.keys()];
 		for (let i = 0; i < shares.length; i++) {
 			const index = (this.cursor + i) % shares.length;
@@ -576,7 +598,7 @@ export class CrdtBackgroundSyncPoller {
 				if (inFlight.express) expressBusy = true;
 				else regular++;
 			}
-			let next: { pull: PendingPull; lane: keyof ShareQueues; express: boolean } | undefined;
+			let next: { pull: PendingPull; lane: Lane; express: boolean } | undefined;
 			if (regular < limit) {
 				const taken = this.takeNext(limit);
 				if (taken) next = { ...taken, express: false };
@@ -605,7 +627,7 @@ export class CrdtBackgroundSyncPoller {
 		return undefined;
 	}
 
-	private startPull(pull: PendingPull, lane: keyof ShareQueues, express: boolean): void {
+	private startPull(pull: PendingPull, lane: Lane, express: boolean): void {
 		const { folder, file } = pull;
 		const guid = file.entityGuid;
 		const controller = new AbortController();

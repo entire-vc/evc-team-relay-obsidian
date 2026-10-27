@@ -25,6 +25,12 @@
  *   (i) one express pull at a time; regular slots stay at laneLimit
  * (g) and (h) MUST fail on the poller without the express slot
  * (origin/main@d7f58c8).
+ *
+ * Sweep pass interval (alert 27.10, tokens/relay storm):
+ *   (j) a share's next sweep pass starts no sooner than
+ *       SWEEP_PASS_INTERVAL_MS after the previous one, while announced
+ *       changes are still pulled at once. MUST fail on origin/main@de982fb,
+ *       which refilled the sweep on the first tick after a pass drained.
  */
 
 import { describe, test, expect, beforeEach, jest } from "@jest/globals";
@@ -38,7 +44,7 @@ jest.mock("src/logging", () => ({
 }));
 
 import { MockClock } from "./mocks/MockClock";
-import { CrdtBackgroundSyncPoller, PULL_DEADLINE_MS } from "src/CrdtBackgroundSyncPoller";
+import { CrdtBackgroundSyncPoller, PULL_DEADLINE_MS, SWEEP_PASS_INTERVAL_MS } from "src/CrdtBackgroundSyncPoller";
 import { textFingerprint, type RemoteActivityListener } from "src/docActivity";
 import type { Document } from "src/Document";
 import type { PullControl, PullResult } from "src/TransferQueue";
@@ -169,7 +175,7 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 			return new Promise<PullResult>((resolve) => held.push({ file, control, resolve }));
 		});
 		const folder = makeFolder("a", 2, pull, 2);
-		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 60_000);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 60_000, PULL_DEADLINE_MS, 0);
 		poller.start();
 		expect(startedGuids(pull)).toEqual(["a-0", "a-1"]);
 
@@ -236,6 +242,31 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		held.shift()?.resolve({ outcome: "unchanged", remoteText: "" });
 		await flushPromises();
 		expect(startedGuids(pull)[4]).toBe("s-91");
+		poller.destroy();
+	});
+
+	test("a share's next sweep pass waits SWEEP_PASS_INTERVAL_MS; announced changes don't", async () => {
+		const pull = jest.fn<PullFn>().mockResolvedValue({ outcome: "unchanged", remoteText: "" });
+		const folder = makeFolder("s", 2, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 60_000);
+		poller.start();
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["s-0", "s-1"]);
+
+		// Every tick inside the interval finds the pass drained but too recent.
+		for (let t = 60_000; t < SWEEP_PASS_INTERVAL_MS; t += 60_000) {
+			clock.setTime(t0 + t);
+			await flushPromises();
+		}
+		expect(pull).toHaveBeenCalledTimes(2);
+
+		folder.announce("s-1", textFingerprint(""));
+		await flushPromises();
+		expect(startedGuids(pull)[2]).toBe("s-1");
+
+		clock.setTime(t0 + SWEEP_PASS_INTERVAL_MS);
+		await flushPromises();
+		expect(startedGuids(pull).slice(3)).toEqual(["s-0", "s-1"]);
 		poller.destroy();
 	});
 
@@ -370,7 +401,7 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		const pull = holdingPull(held);
 		const imp = makeFolder("imp", 301, pull, 3);
 		const other = makeFolder("other", 30, pull, 3);
-		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([imp, other]) as never, 31_000);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([imp, other]) as never, 31_000, PULL_DEADLINE_MS, 0);
 		poller.start();
 		const settleAll = async () => {
 			while (held.length > 0) {

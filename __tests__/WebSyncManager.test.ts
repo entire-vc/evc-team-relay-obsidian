@@ -47,10 +47,10 @@ function makeClientManager(): RelayOnPremShareClientManager {
 	} as unknown as RelayOnPremShareClientManager;
 }
 
-/** Doc-share sync (syncFile()) goes through clientManager.getClient(serverId).{getShare,updateShare}. */
+/** Doc-share sync (syncFile()) reads the share via clientManager.getShare() and writes via clientManager.getClient(serverId).updateShare. */
 function makeDocClient(webSlug = "doc-slug") {
 	return {
-		getShare: jest.fn(async () => ({ web_slug: webSlug })),
+		getShare: jest.fn(async (_shareId: string) => ({ web_slug: webSlug })),
 		updateShare: jest.fn(async (_shareId: string, _req: unknown) => undefined),
 	};
 }
@@ -61,6 +61,9 @@ function makeClientManagerWithClient(
 	return {
 		syncFolderFileContent: jest.fn(async () => undefined),
 		getClient: jest.fn(() => client),
+		// Real RelayOnPremShareClientManager.getShare(serverId, shareId) serves a
+		// cached share or delegates to client.getShare(shareId).
+		getShare: jest.fn(async (_serverId: string, shareId: string) => client.getShare(shareId)),
 		// Real RelayOnPremShareClientManager.updateShare(serverId, shareId, req)
 		// resolves the per-server client and delegates to client.updateShare(shareId, req).
 		updateShare: jest.fn(async (_serverId: string, shareId: string, req: unknown) =>
