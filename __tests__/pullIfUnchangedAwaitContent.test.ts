@@ -8,6 +8,11 @@
  * connected after the grace window until the text matches (or its wait runs
  * out), on one connect.
  *
+ * Measured on 0.1.24 under an 800-note bulk load: three edits still waited
+ * 20-38s connected for text the relay already had. A pull that owns its
+ * connection now reconnects when the text is still missing after a few
+ * seconds.
+ *
  * probeRelay() times connect and first sync of one closed document, so a
  * load test can tell relay latency from client scheduling.
  */
@@ -62,7 +67,9 @@ async function flushMacrotasks(times = 20): Promise<void> {
 	}
 }
 
-function makeFakeDoc(opts: { bringOnline?: () => Promise<boolean>; onceFreshlySynced?: () => Promise<void> } = {}) {
+function makeFakeDoc(
+	opts: { bringOnline?: () => Promise<boolean>; onceFreshlySynced?: () => Promise<void>; editLock?: boolean } = {},
+) {
 	let content = "shared content";
 	const goOffline = jest.fn();
 	const bringOnline = jest.fn(opts.bringOnline ?? (async () => true));
@@ -70,7 +77,7 @@ function makeFakeDoc(opts: { bringOnline?: () => Promise<boolean>; onceFreshlySy
 	const fakeDoc = Object.create(Document.prototype) as Document;
 	Object.defineProperty(fakeDoc, "entryPath", { value: "note.md" });
 	Object.defineProperty(fakeDoc, "entityGuid", { value: "test-guid" });
-	Object.defineProperty(fakeDoc, "editLock", { value: false });
+	Object.defineProperty(fakeDoc, "editLock", { value: opts.editLock ?? false });
 	Object.defineProperty(fakeDoc, "resourceAddress", { value: {} });
 	Object.defineProperty(fakeDoc, "awaitFirstSync", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "content", { get: () => content });
@@ -144,9 +151,54 @@ describe("pullIfUnchanged — waiting connected for announced content", () => {
 		expect(result.outcome).toBe("unchanged");
 		expect(clock.now() - waitStart).toBeGreaterThanOrEqual(5_000);
 		expect(clock.now() - waitStart).toBeLessThan(6_000);
-		expect(bringOnline).toHaveBeenCalledTimes(1);
+		// One reconnect at 4s, then the release at the end.
+		expect(bringOnline).toHaveBeenCalledTimes(2);
 		expect(writeContents).not.toHaveBeenCalled();
-		expect(goOffline).toHaveBeenCalledTimes(1);
+		expect(goOffline).toHaveBeenCalledTimes(2);
+	});
+
+	test("text the first connection never receives arrives on a reconnect, within seconds", async () => {
+		const clock = new SteppingClock();
+		let connects = 0;
+		const doc = makeFakeDoc({
+			bringOnline: async () => {
+				// The relay only hands the edit to a second connection.
+				if (++connects === 2) doc.setContent("edited by peer");
+				return true;
+			},
+		});
+		let waitStart = 0;
+		const onReconnect = jest.fn();
+		const result = await clock.settle(
+			makeQueue(clock).pullIfUnchanged(doc.fakeDoc, {
+				expected: () => textFingerprint("edited by peer"),
+				awaitContentMs: 60_000,
+				onReconnect,
+				onPhase: (phase) => {
+					if (phase === "await-content") waitStart = clock.now();
+				},
+			}),
+		);
+		expect(result.outcome).toBe("flushed");
+		expect(doc.writeContents).toHaveBeenCalledWith(doc.fakeDoc, "edited by peer");
+		expect(onReconnect).toHaveBeenCalledTimes(1);
+		expect(clock.now() - waitStart).toBeLessThan(5_000);
+		expect(doc.goOffline).toHaveBeenCalledTimes(2);
+	});
+
+	test("a connection an editor holds is never dropped to ask again", async () => {
+		const clock = new SteppingClock();
+		const { fakeDoc, bringOnline } = makeFakeDoc({ editLock: true });
+		const onReconnect = jest.fn();
+		await clock.settle(
+			makeQueue(clock).pullIfUnchanged(fakeDoc, {
+				expected: () => textFingerprint("never"),
+				awaitContentMs: 10_000,
+				onReconnect,
+			}),
+		);
+		expect(onReconnect).not.toHaveBeenCalled();
+		expect(bringOnline).toHaveBeenCalledTimes(1);
 	});
 
 	test("aborted while waiting: no write, connection dropped", async () => {

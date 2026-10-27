@@ -184,6 +184,8 @@ export interface EditPullTrace {
 	totalMs: number;
 	outcome: string;
 	matched: boolean;
+	/** Reconnects while waiting for the announced text, when there were any. */
+	reconnects?: number;
 }
 
 const EDIT_TRACE_SAMPLES = 100;
@@ -628,6 +630,7 @@ export class CrdtBackgroundSyncPoller {
 		if (lane === "sweep" || importing) inFlight.releaseTokens = holdBackgroundTokens(guid);
 		const startedAt = this.timeProvider.now();
 		const phaseAt: Partial<Record<PullPhase, number>> = {};
+		let reconnects = 0;
 		log("Re-checking unopened document for remote updates", {
 			path: file.entryPath,
 			announced: pull.expected !== undefined,
@@ -644,7 +647,7 @@ export class CrdtBackgroundSyncPoller {
 			this.pulling.delete(guid);
 			if (pull.expected !== undefined && lane !== "sweep" && !importing) {
 				try {
-					this.traceEdit(pull, result, { startedAt, express, awaits, phaseAt });
+					this.traceEdit(pull, result, { startedAt, express, awaits, phaseAt, reconnects });
 				} catch (err: unknown) {
 					log("Could not trace an announced pull", { path: file.entryPath, err });
 				}
@@ -709,6 +712,7 @@ export class CrdtBackgroundSyncPoller {
 					? {
 							expected: () => this.announcedWhilePulling.get(guid)?.expected ?? pull.expected,
 							awaitContentMs: AWAIT_CONTENT_MS,
+							onReconnect: () => reconnects++,
 						}
 					: {}),
 			})
@@ -729,7 +733,13 @@ export class CrdtBackgroundSyncPoller {
 	private traceEdit(
 		pull: PendingPull,
 		result: PullResult | undefined,
-		run: { startedAt: number; express: boolean; awaits: boolean; phaseAt: Partial<Record<PullPhase, number>> },
+		run: {
+			startedAt: number;
+			express: boolean;
+			awaits: boolean;
+			phaseAt: Partial<Record<PullPhase, number>>;
+			reconnects: number;
+		},
 	): void {
 		const now = this.timeProvider.now();
 		const wall = (at: number) => Date.now() - (now - at);
@@ -748,6 +758,7 @@ export class CrdtBackgroundSyncPoller {
 			totalMs: now - run.startedAt,
 			outcome: result?.outcome ?? "deadline",
 			matched: remote !== undefined && textFingerprint(remote) === expected,
+			...(run.reconnects > 0 ? { reconnects: run.reconnects } : {}),
 		});
 		if (this.editTrace.length > EDIT_TRACE_SAMPLES) this.editTrace.shift();
 	}
