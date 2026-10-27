@@ -1424,6 +1424,8 @@ export class TransferQueue extends Loggable {
 		const trace = doc._liveProvider?.connectTrace;
 		if (!trace) return undefined;
 		const since = (t?: number) => (t === undefined || t < startedAt ? undefined : t - startedAt);
+		// connect() was not called in this probe (the token request failed): the rest is an older attempt's.
+		if (trace.calledAt < startedAt) return { tokenMs: doc.lastTokenMs, failedSockets: 0 };
 		return {
 			tokenMs: doc.lastTokenMs,
 			connectCallMs: since(trace.calledAt),

@@ -209,6 +209,7 @@ const setupWS = (provider: YSweetProvider): void => {
 
 	const websocket = new provider._WS(provider.url);
 	provider.connectTrace.socketAt = Date.now();
+	provider.connectTrace.skipped = undefined;
 	websocket.binaryType = "arraybuffer";
 	provider.ws = websocket;
 	provider.wsconnecting = true;
@@ -535,7 +536,9 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 			setupWS(this);
 			this.connectBc();
 		} else if (!this.wsconnected) {
-			this.connectTrace = { calledAt: Date.now(), failedSockets: 0, skipped: "socket-present" };
+			// Keep the in-flight socket's times and failures: they explain the wait.
+			this.connectTrace.calledAt = Date.now();
+			this.connectTrace.skipped = "socket-present";
 		}
 	}
 

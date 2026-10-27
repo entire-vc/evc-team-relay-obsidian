@@ -376,6 +376,7 @@ export class ProviderBacked extends Loggable {
 			return true;
 		}
 		const tokenFrom = Date.now();
+		this.lastTokenMs = undefined;
 		try {
 			const clientToken = await this.requestProviderToken();
 			this.lastTokenMs = Date.now() - tokenFrom;
