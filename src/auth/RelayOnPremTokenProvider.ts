@@ -83,6 +83,24 @@ export const TOKEN_RATE_LIMITED_HOLD_MS = 10 * 60_000;
 export const TOKEN_RATE_LIMITED_MAX_HOLD_MS = 60 * 60_000;
 
 /**
+ * The control plane refused the token outright: 401, or 403 even for read.
+ * Retrying soon gives the same answer, so callers back off (see
+ * accessDeniedBackoff.ts). `retryAt` is set by RelayCredentialCache once the
+ * refusal is recorded.
+ */
+export class RelayAccessDeniedError extends Error {
+	retryAt?: number;
+
+	constructor(
+		public readonly status: number,
+		message?: string,
+	) {
+		super(message ?? `Relay token refused: ${status}`);
+		this.name = "RelayAccessDeniedError";
+	}
+}
+
+/**
  * Token bucket in front of POST /v1/tokens/relay: up to `burst` requests at
  * once, then `perMinute`, served FIFO, except that background requests (see
  * tokenRequestClass.ts) go after every other waiting request.
@@ -330,6 +348,14 @@ export class RelayOnPremTokenProvider {
 					`Write access denied for doc ${docId} — retrying as read-only (viewer role)`
 				);
 				return this.requestToken(relayId, folderId, docId, "read", filePath);
+			}
+
+			if (response.status === 401 || response.status === 403) {
+				const errorText = await response.text().catch(() => "");
+				throw new RelayAccessDeniedError(
+					response.status,
+					`Token request failed: ${response.status} - ${errorText}`,
+				);
 			}
 
 			if (!response.ok) {

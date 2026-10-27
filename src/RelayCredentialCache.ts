@@ -9,7 +9,11 @@ import type { App } from "obsidian";
 import { ResourceAddress, type ResourceAddressType, RemoteFileAddress } from "./ResourceAddress";
 import { platformFetch } from "./platformFetch";
 import { refresh as universalRefresh } from "./RelayCredentialRefresh";
-import type { RelayOnPremTokenProvider } from "./auth/RelayOnPremTokenProvider";
+import {
+	RelayAccessDeniedError,
+	type RelayOnPremTokenProvider,
+} from "./auth/RelayOnPremTokenProvider";
+import { AccessDeniedBackoff } from "./accessDeniedBackoff";
 
 declare const GIT_TAG: string;
 
@@ -17,6 +21,16 @@ declare const GIT_TAG: string;
 // this getter just exposes it in the shape CredentialCache's generic cache expects.
 function getJwtExpiryFromDocumentGrant(grant: DocumentGrant): number {
 	return grant.expiryTime || 0;
+}
+
+/** Refusals are per share: every document of a folder share shares one entry. */
+function shareIdOf(documentId: string): string {
+	try {
+		const address = ResourceAddress.parse(documentId);
+		return "folderGuid" in address ? address.folderGuid : documentId;
+	} catch {
+		return documentId;
+	}
 }
 
 export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
@@ -41,6 +55,10 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// documentId rather than inside it, since relayId in that encoding is a
 	// fixed "relay-onprem" marker, not a real server identifier.
 	private documentServerMap: Map<string, string> = new Map();
+	// Shares whose token the control plane refused (401/403): not asked again
+	// until their backoff runs out, whichever path asks (reconnect gate,
+	// background poller, editor open).
+	private accessDenied = new AccessDeniedBackoff();
 
 	constructor(
 		private authSession: AuthSession,
@@ -151,7 +169,33 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		if (this.isRelayOnPremMode && onpremServerId) {
 			this.documentServerMap.set(documentId, onpremServerId);
 		}
-		return super.acquireToken(documentId, friendlyName, callback);
+		const shareId = shareIdOf(documentId);
+		const retryAt = this.accessDenied.retryAt(shareId, Date.now());
+		if (retryAt !== undefined) {
+			const denied = new RelayAccessDeniedError(0, `Relay token refused for share ${shareId}; next try in ${Math.ceil((retryAt - Date.now()) / 1000)}s`);
+			denied.retryAt = retryAt;
+			throw denied;
+		}
+		try {
+			const grant = await super.acquireToken(documentId, friendlyName, callback);
+			this.accessDenied.clear(shareId);
+			return grant;
+		} catch (err: unknown) {
+			if (err instanceof RelayAccessDeniedError) {
+				err.retryAt = this.accessDenied.recordDenied(shareId, Date.now());
+			}
+			throw err;
+		}
+	}
+
+	/** True while the share of this document is refused by the control plane. */
+	isAccessDenied(documentId: string): boolean {
+		return this.accessDenied.isDenied(shareIdOf(documentId));
+	}
+
+	/** Forget every refusal: after a sign-in/token refresh or a manual reconnect. */
+	clearAccessDenied(): void {
+		this.accessDenied.clear();
 	}
 
 	clear(filter?: (token: CredentialEntry<DocumentGrant>) => boolean) {

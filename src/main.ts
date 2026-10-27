@@ -873,6 +873,8 @@ export default class TeamRelayPlugin extends Plugin {
 			this.registerEditorExtension(liveViews.cmExtensions);
 
 			const handleLoginStateChange = () => {
+				// A new session may open shares the old one was refused.
+				this.credentialCache.clearAccessDenied();
 				if (this.authSession.isAuthenticated) {
 					this._handleAuthLogin();
 				} else {
@@ -1571,7 +1573,9 @@ export default class TeamRelayPlugin extends Plugin {
 			new Notice("Syncing all shares...");
 			const shares = await this.shareClientManager.getAllSharesFlat();
 
-			// 1. Reconnect CRDT relay for all folder shares
+			// 1. Reconnect CRDT relay for all folder shares. A manual sync
+			// retries refused shares now instead of after their backoff.
+			this.credentialCache.clearAccessDenied();
 			let relaySynced = 0;
 			for (const share of shares) {
 				if (share.kind === "folder") {
