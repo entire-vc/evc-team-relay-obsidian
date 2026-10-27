@@ -106,8 +106,12 @@ export class InboundSyncPoller {
 		}
 		try {
 			const result = await this.fileDownloader.downloadShare(shareId, serverId);
-			if (result !== "skipped") {
+			// A poll of this share may have moved the watermark meanwhile.
+			const current = this.persistedUpdatedAt.get(shareId);
+			if (result !== "skipped" && (!current || Date.parse(listedUpdatedAt) > Date.parse(current))) {
 				this.persistedUpdatedAt.set(shareId, listedUpdatedAt);
+				const watched = this.watchedShares.get(shareId);
+				if (watched) watched.lastUpdatedAt = listedUpdatedAt;
 			}
 		} catch (err: unknown) {
 			log("Failed to download listed share", {
@@ -150,6 +154,8 @@ export class InboundSyncPoller {
 			for (const [shareId, info] of this.watchedShares) {
 				const backoff = this.serverBackoff.get(info.serverId);
 				if (backoff && this.timeProvider.now() < backoff.retryAt) continue;
+				// A check from the share list is still running for it.
+				if (this.listedChecks.has(shareId)) continue;
 				if (await this._checkShare(shareId, info.serverId, info.lastUpdatedAt)) {
 					recoveredServers.add(info.serverId);
 				} else {

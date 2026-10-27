@@ -813,13 +813,10 @@ export default class TeamRelayPlugin extends Plugin {
 			);
 			// Every way a shared folder goes away (deleted, unshared from the
 			// menu, the share view or the management modal) leaves the
-			// registry; stop polling a share the registry no longer has.
+			// registry; stop polling a share that no longer has a VaultShare
+			// or, for one polled by path alone, its folder.
 			this.register(
-				this.shareRegistry.on(() =>
-					this.inboundSyncPoller?.retainOnly(
-						(shareId) => !!this.shareRegistry.locate((sf) => sf.entityGuid === shareId),
-					),
-				),
+				this.shareRegistry.on(() => this.inboundSyncPoller?.retainOnly(this.keepPollingShare)),
 			);
 		}
 
@@ -1281,12 +1278,36 @@ export default class TeamRelayPlugin extends Plugin {
 		this.webSyncManager?.onFileRenamed(file.path, oldPath);
 	}
 
-	/** Whether a folder share has a VaultShare or a folder in this vault. */
-	private isShareFolderLocal(shareId: string, sharePath: string): boolean {
-		return (
-			!!this.shareRegistry.locate((sf) => sf.entityGuid === shareId) ||
-			!!resolveShareFolder(this.app.vault, sharePath)
-		);
+	/**
+	 * Folder shares polled because a folder sits at their path although no
+	 * VaultShare was made for it; keyed by share id, valued by that path.
+	 */
+	private pathOnlyPolledShares = new Map<string, string>();
+
+	/** Whether a polled share still has a VaultShare, or still has its folder. */
+	private keepPollingShare = (shareId: string): boolean => {
+		if (this.shareRegistry.locate((sf) => sf.entityGuid === shareId)) return true;
+		const path = this.pathOnlyPolledShares.get(shareId);
+		return path !== undefined && !!resolveShareFolder(this.app.vault, path);
+	};
+
+	/**
+	 * Hand a folder share from the share list to the inbound poller: polled
+	 * if it has a VaultShare or a folder in this vault, otherwise checked
+	 * from the listed timestamp.
+	 */
+	private trackFolderShare(
+		shareId: string,
+		serverId: string,
+		sharePath: string,
+		listedUpdatedAt: string | null | undefined,
+	): void {
+		if (!this.inboundSyncPoller) return;
+		const registered = !!this.shareRegistry.locate((sf) => sf.entityGuid === shareId);
+		const pathOnly = !registered && !!resolveShareFolder(this.app.vault, sharePath);
+		if (pathOnly) this.pathOnlyPolledShares.set(shareId, sharePath);
+		else this.pathOnlyPolledShares.delete(shareId);
+		this.inboundSyncPoller.track(shareId, serverId, registered || pathOnly, listedUpdatedAt);
 	}
 
 	private async loadRelayOnPremShares() {
@@ -1377,12 +1398,7 @@ export default class TeamRelayPlugin extends Plugin {
 					// Inbound polling only for folders present in the vault; the
 					// rest are checked against this list (v1.9).
 					if (share.kind === "folder" && this.inboundSyncPoller) {
-						this.inboundSyncPoller.track(
-							share.id,
-							share.serverId,
-							this.isShareFolderLocal(share.id, share.path),
-							share.web_content_updated_at,
-						);
+						this.trackFolderShare(share.id, share.serverId, share.path, share.web_content_updated_at);
 					}
 				}
 
@@ -1479,12 +1495,7 @@ export default class TeamRelayPlugin extends Plugin {
 					// Inbound polling only for folders present in the vault; the
 					// rest are checked against this list (v1.9).
 					if (share.kind === "folder" && this.inboundSyncPoller) {
-						this.inboundSyncPoller.track(
-							share.id,
-							defaultServerId,
-							this.isShareFolderLocal(share.id, share.path),
-							share.web_content_updated_at,
-						);
+						this.trackFolderShare(share.id, defaultServerId, share.path, share.web_content_updated_at);
 					}
 				}
 			} else {
@@ -1608,7 +1619,7 @@ export default class TeamRelayPlugin extends Plugin {
 						void folder.bringOnline();
 						relaySynced++;
 					} else {
-						this.inboundSyncPoller?.track(share.id, share.serverId, this.isShareFolderLocal(share.id, share.path), share.web_content_updated_at);
+						this.trackFolderShare(share.id, share.serverId, share.path, share.web_content_updated_at);
 					}
 				}
 			}
@@ -1976,6 +1987,9 @@ export default class TeamRelayPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
+				if (file instanceof TFolder && this.pathOnlyPolledShares.size > 0) {
+					this.inboundSyncPoller?.retainOnly(this.keepPollingShare);
+				}
 				if (file instanceof TFolder) {
 					const folder = this.shareRegistry.locate(
 						(folder) => folder.path === file.path,
