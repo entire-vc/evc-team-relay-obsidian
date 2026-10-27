@@ -14,6 +14,7 @@ import { describe, test, expect, beforeEach, afterEach, jest } from "@jest/globa
 import * as Y from "yjs";
 import { YSweetProvider } from "../src/client/provider";
 import { testGlobal } from "./mocks/testGlobal";
+import { resetConnectGate } from "../src/client/connectGate";
 
 // jest.setup.js aliases activeWindow -> global (a plain Node object), but
 // provider.ts's constructor calls activeWindow.addEventListener("unload", ...)
@@ -86,6 +87,7 @@ describe("YSweetProvider reconnect", () => {
 	beforeEach(() => {
 		jest.useFakeTimers();
 		MockWebSocket.instances = [];
+		resetConnectGate();
 	});
 
 	afterEach(() => {

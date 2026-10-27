@@ -62,6 +62,7 @@ import type { RelayCredentialCache } from "../src/RelayCredentialCache";
 import type { AuthSession } from "../src/AuthSession";
 import type { DocumentGrant } from "../src/relay/TokenShapes";
 import { testGlobal } from "./mocks/testGlobal";
+import { resetConnectGate } from "../src/client/connectGate";
 
 const grant = (token: string, expiryTime: number): DocumentGrant =>
 	({
@@ -95,6 +96,7 @@ describe("onclose reconnect never reuses an expired token", () => {
 	beforeEach(() => {
 		jest.useFakeTimers();
 		FakeWS.instances = [];
+		resetConnectGate();
 		(testGlobal as { WebSocket?: unknown }).WebSocket = FakeWS;
 	});
 	afterEach(() => {
