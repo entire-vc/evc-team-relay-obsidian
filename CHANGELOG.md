@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.27
+- Fixed: during a large import, an edit to a closed note could be reported as sent while its connection was still waiting to open, and then reached other devices only half a minute or more later. The plugin now waits until the connection is ready before sending the edit.
+
 ## 0.1.26
 - Fixed: an idle vault no longer re-checks every note with the server back to back. The background check of a shared folder now runs at most once every fifteen minutes, which sharply cuts the load one device puts on the server. Changes announced by other devices still arrive right away.
 
