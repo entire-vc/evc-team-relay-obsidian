@@ -33,7 +33,7 @@ jest.mock("src/logging", () => ({
 }));
 
 import { MockClock } from "./mocks/MockClock";
-import { CrdtBackgroundSyncPoller } from "src/CrdtBackgroundSyncPoller";
+import { CrdtBackgroundSyncPoller, PULL_DEADLINE_MS } from "src/CrdtBackgroundSyncPoller";
 import type { Document } from "src/Document";
 import type { VaultShare } from "src/VaultShare";
 
@@ -215,6 +215,8 @@ describe("CrdtBackgroundSyncPoller", () => {
 			timeProvider as any,
 			makeRegistry([folder]) as any,
 			20_000,
+			PULL_DEADLINE_MS,
+			0, // back-to-back sweep passes: this test is about per-tick re-checks
 		);
 		poller.start(); // immediate poll starts the still-pending call
 		expect(folder.transfers.pullIfUnchanged).toHaveBeenCalledTimes(1);
@@ -284,6 +286,8 @@ describe("CrdtBackgroundSyncPoller", () => {
 			timeProvider as any,
 			makeRegistry([folder]) as any,
 			30_000,
+			PULL_DEADLINE_MS,
+			0, // back-to-back sweep passes: this test is about per-tick re-checks
 		);
 		poller.start();
 		await flushPromises();
@@ -328,6 +332,8 @@ describe("CrdtBackgroundSyncPoller", () => {
 			timeProvider as any,
 			makeRegistry([folder]) as any,
 			30_000,
+			PULL_DEADLINE_MS,
+			0, // back-to-back sweep passes: this test is about per-tick re-checks
 		);
 		poller.start(); // immediate poll: 1 call
 		await flushPromises();

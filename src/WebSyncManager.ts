@@ -301,7 +301,7 @@ export class WebSyncManager {
 			// Try to get the slug from the share
 			const client = this.clientManager.getClient(shareInfo.serverId);
 			if (client) {
-				const share = await client.getShare(shareInfo.shareId);
+				const share = await this.clientManager.getShare(shareInfo.serverId, shareInfo.shareId);
 				if (share?.web_slug) {
 					shareInfo.webSlug = share.web_slug;
 				} else {
@@ -396,8 +396,11 @@ export class WebSyncManager {
 				return;
 			}
 
-			// Get share to find slug
-			const share = await client.getShare(shareInfo.shareId);
+			// Get share to find slug. Through the manager's cache, not the client:
+			// this runs on every debounced file sync, and InboundSyncPoller already
+			// refreshes that cache every 30s, so an uncached GET /v1/shares/{id}
+			// here only added load (alert 27.10).
+			const share = await this.clientManager.getShare(shareInfo.serverId, shareInfo.shareId);
 			if (!share?.web_slug) {
 				log("Share not found or missing web_slug", {
 					shareId: shareInfo.shareId,
