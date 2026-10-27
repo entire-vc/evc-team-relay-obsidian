@@ -293,6 +293,9 @@ export class VaultShare extends ProviderBacked {
 		});
 
 		this._localDb = this._openPersistence();
+		// Read the stored records the moment they load, before any server
+		// change can reach the index (bringOnline() waits for the same load).
+		if (!this.freshlyCreated) void this.recordsBeforeSync();
 
 		// TR-multi-server: `loginManager.isAuthenticated` only reflects the single
 		// legacy/active-server session. A relay-onprem folder knows which
@@ -500,7 +503,10 @@ export class VaultShare extends ProviderBacked {
 	/**
 	 * Persisted records, taken once the local store has loaded and before the
 	 * server's changes land: the only place an offline client can still see
-	 * old paths. Memoized, so startup uploads and the tree scan share one view.
+	 * old paths. Started from the constructor, and the folder connects only
+	 * after the same load (bringOnline()), so a large stored history cannot
+	 * lose that race. Memoized, so startup uploads and the tree scan share
+	 * one view.
 	 */
 	private recordsBeforeSync(): Promise<RecordSnapshot> {
 		return (this.recordsBeforeSyncTaken ??= this.awaitSynced().then(() => {
@@ -1199,14 +1205,20 @@ export class VaultShare extends ProviderBacked {
 		await this.scanFileTree(this.folderIndex);
 	}
 
-	bringOnline(): Promise<boolean> {
-		if (
+	async bringOnline(): Promise<boolean> {
+		if (!this.mayConnect()) return false;
+		// A server delete that lands before the stored records load hides the
+		// path from recordsBeforeSync(), and the old local copy is shared again.
+		await this.awaitSynced();
+		if (this.isTornDown || !this.mayConnect()) return false;
+		return super.bringOnline();
+	}
+
+	private mayConnect(): boolean {
+		return (
 			this.resourceAddress instanceof RemoteFolderAddress &&
 			(this.isOnline || this.wantsConnection)
-		) {
-			return super.bringOnline();
-		}
-		return Promise.resolve(false);
+		);
 	}
 
 	public get folderLabel(): string {
