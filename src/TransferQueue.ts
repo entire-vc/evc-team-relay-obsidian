@@ -188,6 +188,8 @@ export interface PullControl {
 	 */
 	expected?: () => string | undefined;
 	awaitContentMs?: number;
+	/** Called each time a pull waiting for announced text reconnects to ask the relay again. */
+	onReconnect?: () => void;
 }
 
 /** One relay probe: token + socket connect, then this connection's first sync. */
@@ -221,6 +223,8 @@ const PULL_CONNECT_TIMEOUT_MS = 15_000;
 const PULL_SYNC_GRACE_MS = 2_000;
 /** How often a pull waiting for announced text looks at it again. */
 const AWAIT_CONTENT_CHECK_MS = 250;
+/** How long a pull waits connected for announced text before it first reconnects to ask again; doubles after each. */
+const AWAIT_CONTENT_RECONNECT_MS = 4_000;
 /** probeRelay(): cap on each of its two phases. */
 const PROBE_PHASE_TIMEOUT_MS = 30_000;
 /**
@@ -1262,7 +1266,18 @@ export class TransferQueue extends Loggable {
 			// connected and let the relay push it, instead of disconnecting and
 			// paying for another connect on each re-check.
 			onPhase?.("await-content");
-			await this.awaitText(doc, control.expected, control.awaitContentMs, aborted);
+			const reconnect =
+				intent === "disconnected"
+					? async () => {
+							// An editor or an upload took the connection over meanwhile: not ours to drop.
+							if (doc.editLock || this.syncLane.inFlight.has(doc.entityGuid)) return;
+							control.onReconnect?.();
+							doc.goOffline();
+							if (!(await doc.bringOnline()) || aborted()) return;
+							await this.raceTimeout(doc.onceOnline(), PULL_CONNECT_TIMEOUT_MS);
+						}
+					: undefined;
+			await this.awaitText(doc, control.expected, control.awaitContentMs, aborted, reconnect);
 			if (aborted()) {
 				this.releasePulledDoc(doc, intent);
 				return { outcome: "aborted" };
@@ -1454,17 +1469,40 @@ export class TransferQueue extends Loggable {
 		return new Promise((resolve) => this.clock.scheduleTimeout(resolve, ms));
 	}
 
-	/** Resolves once `doc`'s text fingerprints to `expected()`, after `maxMs`, or on abort. */
+	/**
+	 * Resolves once `doc`'s text fingerprints to `expected()`, after `maxMs`, or on abort.
+	 *
+	 * Under load the relay can answer a connect from a room it is still
+	 * loading and then push nothing more to that connection (see
+	 * uploadDocumentViaSocket()). Measured on 0.1.24 under an 800-note bulk
+	 * load: three edits waited 20-38s connected for text the relay already
+	 * had, while a fresh connect synced in under half a second. So a pull
+	 * that owns its connection (`reconnect` set) asks again on a new one
+	 * when the text is still missing after AWAIT_CONTENT_RECONNECT_MS, then
+	 * after twice that, and so on: many stuck pulls must not pile connects
+	 * onto a relay that is already slow. No reconnect starts once the wait
+	 * has less than one interval left.
+	 */
 	private async awaitText(
 		doc: Document,
 		expected: () => string | undefined,
 		maxMs: number,
 		aborted: () => boolean,
+		reconnect?: () => Promise<void>,
 	): Promise<void> {
 		const until = this.clock.now() + maxMs;
+		let askedAt = this.clock.now();
+		let interval = AWAIT_CONTENT_RECONNECT_MS;
 		while (!aborted() && this.clock.now() < until) {
 			const want = expected();
 			if (want === undefined || textFingerprint(doc.content) === want) return;
+			const now = this.clock.now();
+			if (reconnect && now - askedAt >= interval && until - now >= interval) {
+				await reconnect();
+				askedAt = this.clock.now();
+				interval *= 2;
+				continue;
+			}
 			await this.delay(AWAIT_CONTENT_CHECK_MS);
 		}
 	}
