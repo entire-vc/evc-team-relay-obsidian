@@ -311,6 +311,28 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(tokenCalls() - before).toBeLessThanOrEqual(4);
 	});
 
+	test("documents with lapsed tokens restored from storage ask one at a time while another grant is current", async () => {
+		mockFetch.mockImplementation(() => respond(200));
+		const { cache, docIn } = build();
+		expect(await online(docIn("88888888-8888-4888-8888-8888888888a0"))).toBe(true);
+		const docs = [1, 2, 3, 4, 5, 6, 7].map((n) => `88888888-8888-4888-8888-8888888888a${n}`);
+		const ids = docs.map((d) => ResourceAddress.serialize(new RemoteDocumentAddress("relay-onprem", G, d)));
+		// As a restart restores them: tokens held before, now past their expiry.
+		const entries = (cache as unknown as { tokenEntries: Map<string, unknown> }).tokenEntries;
+		for (const id of ids) {
+			entries.set(id, { token: { url: "wss://relay.example.com", docId: id, token: "old", expiryTime: 1 }, friendlyName: id, expiryTime: 1, attempts: 0 });
+		}
+
+		mockFetch.mockImplementation(() => respondSlowly(401, 5_000));
+		maxInFlight = 0;
+		const before = tokenCalls();
+		for (const id of ids) void cache.getToken(id, id, () => {}, "server-a").catch(() => undefined);
+		await jest.advanceTimersByTimeAsync(10 * MINUTE);
+
+		expect(maxInFlight).toBe(1);
+		expect(tokenCalls() - before).toBeLessThanOrEqual(4);
+	});
+
 	test("a successful connect drops the retry an earlier refusal left waiting", async () => {
 		mockFetch.mockImplementation(() => respond(401));
 		const { cache, pb } = build();

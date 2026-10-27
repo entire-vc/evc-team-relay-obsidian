@@ -67,8 +67,9 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// sleep the share may have been revoked, so it is probed again first.
 	private grantedShares = new Map<string, number>();
 	private shareProbes = new Map<string, Promise<void>>();
-	// Documents that have held a token: asking again is a renewal, even once
-	// the cache has dropped the lapsed token before asking.
+	// Documents that have held a token (granted or restored from storage):
+	// asking again is a renewal, even once the cache has dropped the lapsed
+	// token before asking.
 	private heldDocuments = new Set<string>();
 	private accessListeners = new Set<(shareId: string) => void>();
 
@@ -173,6 +174,9 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		if (this.isRelayOnPremMode && onpremServerId) {
 			this.documentServerMap.set(documentId, onpremServerId);
 		}
+		// A token restored from storage counts as held too; the cache drops
+		// a lapsed one before asking, so note it while it is still here.
+		if (this.tokenEntries?.get(documentId)?.token) this.heldDocuments.add(documentId);
 		return super.acquireToken(documentId, friendlyName, callback);
 	}
 
