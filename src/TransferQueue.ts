@@ -19,6 +19,7 @@ import { AttachmentFile, isAttachmentFile } from "./AttachmentFile";
 import { applyDiffToYText, reconcileWithConflictCopy } from "./ytextDiff";
 import { hasPreservableContent, sameTextContent } from "./textEquivalence";
 import { waitForBufferFlush } from "./websocketFlush";
+import { textFingerprint } from "./docActivity";
 import {
 	claimInitIfUnclaimed,
 	wonInitClaim,
@@ -152,6 +153,7 @@ export type PullPhase =
 	| "connect"
 	| "await-online"
 	| "grace"
+	| "await-content"
 	| "compare"
 	| "preserve"
 	| "write";
@@ -160,6 +162,22 @@ export interface PullControl {
 	/** Once aborted, the pull writes nothing more and releases its connection. */
 	signal?: AbortSignal;
 	onPhase?: (phase: PullPhase) => void;
+	/**
+	 * The fingerprint an announcement says the text will have (read on every
+	 * check, so a newer announcement mid-pull replaces it). Set together with
+	 * `awaitContentMs`: the pull then stays connected until the text matches
+	 * instead of comparing what happens to be there after the grace window.
+	 */
+	expected?: () => string | undefined;
+	awaitContentMs?: number;
+}
+
+/** One relay probe: token + socket connect, then this connection's first sync. */
+export interface RelayProbeSample {
+	at: number;
+	connectMs: number;
+	syncMs: number;
+	ok: boolean;
 }
 
 export interface PullResult {
@@ -172,6 +190,10 @@ export interface PullResult {
 const PULL_CONNECT_TIMEOUT_MS = 15_000;
 /** pullIfUnchanged(): grace window after "connected" for the Yjs sync round-trip to land. */
 const PULL_SYNC_GRACE_MS = 2_000;
+/** How often a pull waiting for announced text looks at it again. */
+const AWAIT_CONTENT_CHECK_MS = 250;
+/** probeRelay(): cap on each of its two phases. */
+const PROBE_PHASE_TIMEOUT_MS = 30_000;
 /**
  * Outer safety bound on reconcileRelayContent()'s claim+settle fast path
  *. awaitReconcileSettled already has its own internal
@@ -445,6 +467,14 @@ export class TransferQueue extends Loggable {
 				candidates = runnable.filter((queued) => urgent(queued) && !this.hasActivePriority(lane, queued.vaultShare));
 				if (candidates.length === 0) break;
 			}
+			// While an edit is queued or running, an import (or any other
+			// background work) keeps at most one slot: measured on 0.1.15, the
+			// relay slowed to 16-19s per document under our own bulk traffic
+			// and the edits waited on the same relay.
+			if (this.hasUrgentWork(lane, runnable, urgent) && this.activeBackground(lane, urgent) >= 1) {
+				candidates = candidates.filter(urgent);
+				if (candidates.length === 0) break;
+			}
 			const item = this.nextRunnable(lane, candidates, urgent);
 
 			runnable.splice(runnable.indexOf(item), 1);
@@ -512,6 +542,27 @@ export class TransferQueue extends Loggable {
 			if (item.entityGuid === entityGuid) running = true;
 		});
 		return running;
+	}
+
+	private hasUrgentWork(
+		lane: QueueLaneState,
+		runnable: TransferTask[],
+		urgent: (item: TransferTask) => boolean,
+	): boolean {
+		if (runnable.some(urgent)) return true;
+		let found = false;
+		lane.active.each((item) => {
+			if (urgent(item)) found = true;
+		});
+		return found;
+	}
+
+	private activeBackground(lane: QueueLaneState, urgent: (item: TransferTask) => boolean): number {
+		let count = 0;
+		lane.active.each((item) => {
+			if (!urgent(item)) count++;
+		});
+		return count;
 	}
 
 	private hasActivePriority(lane: QueueLaneState, vaultShare: VaultShare): boolean {
@@ -1122,6 +1173,17 @@ export class TransferQueue extends Loggable {
 		}
 		onPhase?.("grace");
 		await this.delay(PULL_SYNC_GRACE_MS);
+		if (control.expected && control.awaitContentMs) {
+			// An announced change: its marker can beat the content to us. Stay
+			// connected and let the relay push it, instead of disconnecting and
+			// paying for another connect on each re-check.
+			onPhase?.("await-content");
+			await this.awaitText(doc, control.expected, control.awaitContentMs, aborted);
+			if (aborted()) {
+				this.releasePulledDoc(doc, intent);
+				return { outcome: "aborted" };
+			}
+		}
 
 		onPhase?.("compare");
 		const remoteText = doc.content;
@@ -1291,6 +1353,48 @@ export class TransferQueue extends Loggable {
 
 	private delay(ms: number): Promise<void> {
 		return new Promise((resolve) => this.clock.scheduleTimeout(resolve, ms));
+	}
+
+	/** Resolves once `doc`'s text fingerprints to `expected()`, after `maxMs`, or on abort. */
+	private async awaitText(
+		doc: Document,
+		expected: () => string | undefined,
+		maxMs: number,
+		aborted: () => boolean,
+	): Promise<void> {
+		const until = this.clock.now() + maxMs;
+		while (!aborted() && this.clock.now() < until) {
+			const want = expected();
+			if (want === undefined || textFingerprint(doc.content) === want) return;
+			await this.delay(AWAIT_CONTENT_CHECK_MS);
+		}
+	}
+
+	/**
+	 * Measures the relay alone: token + socket connect of `doc`, then the
+	 * first sync of that connection. Lets a load test tell a slow relay apart
+	 * from a client queueing problem. `undefined` when `doc` is already
+	 * connected (an open editor), since that would measure nothing.
+	 */
+	async probeRelay(doc: Document): Promise<RelayProbeSample | undefined> {
+		if (doc.connectionIntent !== "disconnected") return undefined;
+		const at = this.clock.now();
+		const online = doc.bringOnline().then((ok) => (ok ? doc.onceOnline().then(() => true) : false));
+		let connected = false;
+		try {
+			connected = (await this.raceTimeout(online, PROBE_PHASE_TIMEOUT_MS)) ?? false;
+			const connectedAt = this.clock.now();
+			const synced =
+				connected &&
+				(await this.raceTimeout(doc.onceFreshlySynced().then(() => true), PROBE_PHASE_TIMEOUT_MS)) === true;
+			return { at, connectMs: connectedAt - at, syncMs: this.clock.now() - connectedAt, ok: synced };
+		} finally {
+			// releasePulledDoc() leaves a document opened in the editor meanwhile (editLock) connected.
+			const release = () => this.releasePulledDoc(doc, "disconnected");
+			release();
+			// A connect that lands after the timeout must not stay open.
+			if (!connected) void online.then(release, () => undefined);
+		}
 	}
 
 	/**
