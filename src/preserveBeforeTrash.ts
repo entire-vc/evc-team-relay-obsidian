@@ -20,6 +20,7 @@
  * applies to canvas content for exactly this reason.
  */
 
+import type * as Y from "yjs";
 import { sameTextContent } from "./textEquivalence";
 import type { CanvasData } from "./HostCanvasView";
 import { deepValueEquals } from "./deepValueEquals";
@@ -52,6 +53,14 @@ export function findByPath<T extends PathHolder>(
 		}
 	}
 	return found;
+}
+
+/**
+ * Whether `doc` holds updates it cannot integrate yet: its local history is
+ * missing earlier changes, so what it shows is not what was last synced.
+ */
+export function hasHistoryGap(doc: Y.Doc): boolean {
+	return doc.store.pendingStructs !== null || doc.store.pendingDs !== null;
 }
 
 /**

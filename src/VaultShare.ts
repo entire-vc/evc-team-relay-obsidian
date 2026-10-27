@@ -75,6 +75,7 @@ import {
 } from "./serverRelocation";
 import {
 	findByPath,
+	hasHistoryGap,
 	hasUnsyncedEdit,
 	hasUnsyncedCanvasEdit,
 } from "./preserveBeforeTrash";
@@ -180,6 +181,8 @@ export class VaultShare extends ProviderBacked {
 	trackedEntries: Map<string, SyncableEntry>; // Maps guids to SharedDocs
 	pathSet: FileSet;
 	private awaitingDelete: Set<string> = new Set();
+	/** Paths a remote-delete cleanup is already trashing (overlapping tree scans). */
+	private trashingPaths?: Set<string>;
 	/** Prevent an upload already in flight from republishing a discarded entry. */
 	private deletedEntries: WeakSet<SyncableEntry> = new WeakSet();
 	private folderCreations = new Map<string, Set<Promise<TFolder>>>();
@@ -490,6 +493,22 @@ export class VaultShare extends ProviderBacked {
 	private lostClaimSettler = new LostClaimSettler((vpath, e) =>
 		this.warn(`Failed to settle the lost upload claim on ${vpath}`, e),
 	);
+	/** Paths this client had synced before this start's first fresh sync. */
+	private knownBeforeSync?: Set<string>;
+	private recordsBeforeSyncTaken?: Promise<RecordSnapshot>;
+
+	/**
+	 * Persisted records, taken once the local store has loaded and before the
+	 * server's changes land: the only place an offline client can still see
+	 * old paths. Memoized, so startup uploads and the tree scan share one view.
+	 */
+	private recordsBeforeSync(): Promise<RecordSnapshot> {
+		return (this.recordsBeforeSyncTaken ??= this.awaitSynced().then(() => {
+			const persisted = takeRecordSnapshot(this.folderIndex);
+			this.knownBeforeSync = new Set(persisted.keys());
+			return persisted;
+		}));
+	}
 
 	private awaitFolderTreeReady(): Promise<boolean> {
 		if (this.isTornDown) return Promise.resolve(false);
@@ -501,9 +520,7 @@ export class VaultShare extends ProviderBacked {
 				(async () => {
 					await this.awaitSynced();
 					if (!this.freshlyCreated && !this.isTornDown) {
-						// Persisted records, before the server's changes land: the only
-						// place an offline client can still see old paths.
-						const persisted = takeRecordSnapshot(this.folderIndex);
+						const persisted = await this.recordsBeforeSync();
 						await this.onceFreshlySynced();
 						await this.applyServerMoves(persisted);
 					}
@@ -610,6 +627,15 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	/**
+	 * A peer deleted `vpath` while this client was away, and the local file is
+	 * this client's old synced copy rather than a new note: publishing it again
+	 * would bring the note back everywhere. pruneUntrackedFiles() removes it.
+	 */
+	private removedWhileAway(vpath: string): boolean {
+		return this.knownBeforeSync?.has(vpath) === true && this.folderIndex.wasRemoved(vpath);
+	}
+
+	/**
 	 * @param allowMint Whether a local file with no existing folderIndex entry
 	 * may be minted a fresh guid this round. Pass `false` when the caller
 	 * couldn't confirm a fresh sync landed first (`_onReady()`'s 30s timeout,
@@ -627,7 +653,9 @@ export class VaultShare extends ProviderBacked {
 	 * non-timing-out wait for a fresh sync).
 	 */
 	private adoptLocalFiles = async (allowMint = true) => {
-		let syncTFiles = this.vaultFilesInScope();
+		let syncTFiles = this.vaultFilesInScope().filter(
+			(tfile) => !this.removedWhileAway(this.toVirtualPath(tfile.path)),
+		);
 		if (this.followedMoveSkips.size > 0) {
 			syncTFiles = syncTFiles.filter(
 				(tfile) => !isUnderSkippedPath(this.toVirtualPath(tfile.path), this.followedMoveSkips),
@@ -1640,6 +1668,9 @@ export class VaultShare extends ProviderBacked {
 		if (!(fileInFolder && isSyncableFile && !fileInMap && !filePending)) {
 			return null;
 		}
+		const trashing = (this.trashingPaths ??= new Set());
+		if (trashing.has(vpath)) return null;
+		trashing.add(vpath);
 
 		diffLog.push(`removed local copy of ${vpath} -- serverId no longer shares it`);
 		// A remote delete races with an offline local edit the same way
@@ -1665,7 +1696,11 @@ export class VaultShare extends ProviderBacked {
 				);
 				return;
 			}
-			return this.vaultApi.adapter.trashLocal(file.path);
+			return this.vaultApi.adapter.trashLocal(file.path).then(() => {
+				this.knownBeforeSync?.delete(vpath);
+			});
+		}).finally(() => {
+			trashing.delete(vpath);
 		});
 
 		return { kind: "delete", filePath: vpath, completion: promise };
@@ -1714,17 +1749,23 @@ export class VaultShare extends ProviderBacked {
 	 *   iteration = insertion order), which is the most-recently-created —
 	 *   i.e. the live one — but an old orphaned entry at the same path is
 	 *   still possible in principle; this doesn't attempt to prune it.
+	 * - An entry rebuilt from a local history with a gap in it (an offline
+	 *   restart, the gap only fills from the server) reads as empty. It is not
+	 *   the synced state, so a document compares against its stored sync base
+	 *   instead. Without one (and for canvases, which keep none) the empty read
+	 *   still differs from disk and a copy is kept: unsure means preserve.
 	 */
 	private async _preserveUnsyncedBeforeTrash<T extends Document | CanvasDocument, S>(
 		vpath: string,
 		find: (candidates: IterableIterator<SyncableEntry>, vpath: string) => T | undefined,
-		syncedContent: (item: T) => S,
+		syncedContent: (item: T) => S | Promise<S>,
 		diverged: (onDisk: string, synced: S) => boolean,
 	): Promise<boolean> {
 		const item = find(this.trackedEntries.values(), vpath);
 		if (!item) {
 			return true;
 		}
+		const synced = await syncedContent(item);
 
 		let onDiskContent: string;
 		try {
@@ -1734,7 +1775,7 @@ export class VaultShare extends ProviderBacked {
 			return false;
 		}
 
-		if (!diverged(onDiskContent, syncedContent(item))) {
+		if (!diverged(onDiskContent, synced)) {
 			return true; // matches the last known synced content — nothing to preserve
 		}
 
@@ -1763,7 +1804,7 @@ export class VaultShare extends ProviderBacked {
 			vpath,
 			(candidates, v) =>
 				findByPath(candidates, v, isDocument) as Document | undefined,
-			(doc) => doc.content,
+			async (doc) => (hasHistoryGap(doc.crdtDoc) ? await doc.getSyncBase() : undefined) ?? doc.content,
 			hasUnsyncedEdit,
 		);
 	}
@@ -2724,7 +2765,14 @@ export class VaultShare extends ProviderBacked {
 	 * a different Obsidian event.
 	 */
 	async claimAndUploadFile(tfile: TAbstractFile): Promise<void> {
+		// Local recovery copies stay local (GH #4) -- this handler also sees
+		// the ones this client writes itself.
+		if (isConflictCopyPath(tfile.path)) return;
 		const vpath = this.toVirtualPath(tfile.path);
+		// Startup "create" events can arrive before the tree scan has looked at
+		// the persisted records; take them first so the check below sees them.
+		if (!this.freshlyCreated && !this.knownBeforeSync) await this.recordsBeforeSync();
+		if (this.removedWhileAway(vpath)) return;
 		if (tfile instanceof TFolder) {
 			const pending = this.folderCreations?.get(vpath);
 			if (pending?.size) await Promise.allSettled(Array.from(pending));

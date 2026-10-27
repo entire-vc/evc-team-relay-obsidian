@@ -184,6 +184,15 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 	private _syncBase: string | undefined = undefined;
 
 	private _trimSize = COLD_START_COLLAPSE_AT;
+	/**
+	 * State the doc already held when this store attached (the provider seeds
+	 * the user mapping before a document opens its store). Yjs integrates a
+	 * client's updates only in clock order, so if the first stored update
+	 * starts past these clocks, every later local edit stays pending after an
+	 * offline restart and the text reads as empty. Written together with the
+	 * first update; dropped unwritten if nothing follows it.
+	 */
+	private _attachState: Uint8Array | null = null;
 	private _storeTimeoutId: number | null = null;
 	private readonly _storeDebounceMs = 1000;
 	private readonly _updateHandler: (update: Uint8Array, origin: unknown) => void;
@@ -195,6 +204,7 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 		super();
 		this.doc = doc;
 		this.name = name;
+		if (doc.store.clients.size > 0) this._attachState = Y.encodeStateAsUpdate(doc);
 
 		this.whenSynced = new Promise((resolve) => {
 			this.once("synced", () => resolve(this));
@@ -239,6 +249,10 @@ export class LocalDocumentStore extends ObservableV2<LocalDocumentStoreEvents> {
 		this._updateHandler = (update: Uint8Array, origin: unknown) => {
 			// Updates we replayed ourselves are already on disk.
 			if (this._destroyed || origin === this) return;
+			if (this._attachState) {
+				update = Y.mergeUpdates([this._attachState, update]);
+				this._attachState = null;
+			}
 			void this._dbref.then(() => {
 				if (this._destroyed || !this.db) return;
 				const [updates] = idb.transact(this.db, [UPDATES_STORE]);
