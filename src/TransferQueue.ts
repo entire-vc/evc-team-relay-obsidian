@@ -1380,21 +1380,21 @@ export class TransferQueue extends Loggable {
 		if (doc.connectionIntent !== "disconnected") return undefined;
 		const at = this.clock.now();
 		const online = doc.bringOnline().then((ok) => (ok ? doc.onceOnline().then(() => true) : false));
-		const connected = (await this.raceTimeout(online, PROBE_PHASE_TIMEOUT_MS)) ?? false;
-		// A connect that lands after the timeout must not stay open.
-		if (!connected) void online.then(() => this.releasePulledDoc(doc, "disconnected"), () => undefined);
-		const connectedAt = this.clock.now();
-		const synced =
-			connected &&
-			(await this.raceTimeout(doc.onceFreshlySynced().then(() => true), PROBE_PHASE_TIMEOUT_MS)) === true;
-		const sample = {
-			at,
-			connectMs: connectedAt - at,
-			syncMs: this.clock.now() - connectedAt,
-			ok: synced,
-		};
-		this.releasePulledDoc(doc, "disconnected");
-		return sample;
+		let connected = false;
+		try {
+			connected = (await this.raceTimeout(online, PROBE_PHASE_TIMEOUT_MS)) ?? false;
+			const connectedAt = this.clock.now();
+			const synced =
+				connected &&
+				(await this.raceTimeout(doc.onceFreshlySynced().then(() => true), PROBE_PHASE_TIMEOUT_MS)) === true;
+			return { at, connectMs: connectedAt - at, syncMs: this.clock.now() - connectedAt, ok: synced };
+		} finally {
+			// releasePulledDoc() leaves a document opened in the editor meanwhile (editLock) connected.
+			const release = () => this.releasePulledDoc(doc, "disconnected");
+			release();
+			// A connect that lands after the timeout must not stay open.
+			if (!connected) void online.then(release, () => undefined);
+		}
 	}
 
 	/**

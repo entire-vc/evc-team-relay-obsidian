@@ -41,7 +41,8 @@ class SteppingClock implements Clock {
 	/** Runs `promise` to completion, firing the earliest timer whenever nothing else is pending. */
 	async settle<T>(promise: Promise<T>): Promise<T> {
 		let done = false;
-		void promise.finally(() => (done = true));
+		const mark = () => (done = true);
+		promise.then(mark, mark);
 		for (let i = 0; i < 10_000; i++) {
 			await flushMacrotasks(3);
 			if (done) return promise;
@@ -183,6 +184,17 @@ describe("probeRelay", () => {
 		const sample = await clock.settle(makeQueue(clock).probeRelay(fakeDoc));
 		expect(sample).toMatchObject({ ok: true, connectMs: 0, syncMs: 700 });
 		expect(goOffline).toHaveBeenCalledTimes(1);
+	});
+
+	test("a connect that throws still leaves the document disconnected", async () => {
+		const clock = new SteppingClock();
+		const { fakeDoc, goOffline } = makeFakeDoc({
+			bringOnline: async () => {
+				throw new Error("socket");
+			},
+		});
+		await expect(clock.settle(makeQueue(clock).probeRelay(fakeDoc))).rejects.toThrow("socket");
+		expect(goOffline).toHaveBeenCalled();
 	});
 
 	test("a connect slower than the timeout is a failed sample, and its late socket is dropped too", async () => {

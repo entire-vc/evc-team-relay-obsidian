@@ -789,6 +789,66 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("once the announced text lands, the pull is back on the usual deadline and over the cap nothing new starts", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("a", 0, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		for (let i = 0; i < 3; i++) {
+			folder.trackedEntries.set(`a-${i}`, { __isDocument: true, isOnline: false, entityGuid: `a-${i}`, entryPath: `a/${i}.md` });
+		}
+		folder.announce("a-0", textFingerprint("first"));
+		await flushPromises();
+		held[0].control.onPhase?.("await-content");
+		folder.announce("a-1", textFingerprint("other"));
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["a-0", "a-1"]);
+
+		// a-0's text lands: it resumes on top of the one slot.
+		clock.setTime(t0 + 1_000);
+		held[0].control.onPhase?.("compare");
+		folder.announce("a-2", textFingerprint("third"));
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["a-0", "a-1"]);
+		// a-1 finishing doesn't free a slot: a-0 still holds one.
+		held[1].resolve({ outcome: "unchanged", remoteText: "other" });
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["a-0", "a-1"]);
+
+		clock.setTime(t0 + 1_000 + PULL_DEADLINE_MS + 1);
+		await flushPromises();
+		expect(held[0].control.signal?.aborted).toBe(true);
+		expect(startedGuids(pull)).toEqual(["a-0", "a-1", "a-2"]);
+		poller.destroy();
+	});
+
+	test("an announcement for the probed document is pulled once the probe is done", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("a", 1, pull, 3);
+		let releaseProbe: () => void = () => undefined;
+		const probeRelay = jest.fn(
+			() =>
+				new Promise<{ at: number; connectMs: number; syncMs: number; ok: boolean }>((resolve) => {
+					releaseProbe = () => resolve({ at: 0, connectMs: 1, syncMs: 1, ok: true });
+				}),
+		);
+		(folder.transfers as unknown as { probeRelay: typeof probeRelay }).probeRelay = probeRelay;
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.startRelayProbe("a/0.md", 10_000);
+		poller.start();
+		folder.announce("a-0", textFingerprint("edited"));
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual([]);
+
+		releaseProbe();
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["a-0"]);
+		expect(held[0].control.expected?.()).toBe(textFingerprint("edited"));
+		poller.destroy();
+	});
+
 	test("the relay probe times one control document every interval and keeps it out of the sweep", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);

@@ -264,7 +264,11 @@ export class CrdtBackgroundSyncPoller {
 	private preempted = 0;
 	private readonly outcomes: PollerStats["outcomes"] = {};
 	private readonly givenUpDocs: PollerStats["givenUp"] = [];
-	private probe?: { path: string; timer: number; guid?: string };
+	private probe?: { path: string; timer: number };
+	/** The document a relay probe has connected right now, across stop/start. */
+	private probing?: string;
+	/** Announced pulls that came up while their document was being probed. */
+	private readonly heldByProbe = new Map<string, { pull: PendingPull; lane: keyof ShareQueues }>();
 	private readonly probeSamples: RelayProbeSample[] = [];
 	private lastStatsLogAt = 0;
 	private destroyed = false;
@@ -304,7 +308,7 @@ export class CrdtBackgroundSyncPoller {
 			if (queues.sweep.size > 0) return;
 			const now = this.timeProvider.now();
 			for (const file of folder.trackedEntries.values()) {
-				if (!isDocument(file) || !this.canQueue(file)) continue;
+				if (!isDocument(file) || !this.canQueue(file) || file.entityGuid === this.probing) continue;
 				if (queues.priority.has(file.entityGuid) || queues.late.has(file.entityGuid)) continue;
 				queues.sweep.set(file.entityGuid, { folder, file, queuedAt: now, attempt: 0 });
 			}
@@ -326,7 +330,6 @@ export class CrdtBackgroundSyncPoller {
 	private canQueue(file: Document): boolean {
 		return (
 			!file.isOnline &&
-			this.probe?.guid !== file.entityGuid &&
 			!this.pulling.has(file.entityGuid) &&
 			!this.abandonedWrites.has(file.entityGuid)
 		);
@@ -455,7 +458,8 @@ export class CrdtBackgroundSyncPoller {
 	/** Whether a share that isn't importing has announced work queued or running. */
 	private editsWaiting(importing: Set<VaultShare>): boolean {
 		for (const [share, queues] of this.queues) {
-			if (!importing.has(share) && (queues.priority.size > 0 || queues.late.size > 0)) return true;
+			if (!share.isOnline || importing.has(share)) continue;
+			if (queues.priority.size > 0 || queues.late.size > 0) return true;
 		}
 		for (const inFlight of this.pulling.values()) {
 			if ((inFlight.announced || inFlight.late) && !importing.has(inFlight.pull.folder)) return true;
@@ -508,8 +512,11 @@ export class CrdtBackgroundSyncPoller {
 	}
 
 	/**
-	 * Starts queued pulls one at a time up to the cap, so the in-flight count
-	 * never exceeds it even mid-drain. Each completion (or deadline) re-enters
+	 * Starts queued pulls one at a time up to the cap. A pull waiting for
+	 * announced text (await-content) holds no slot; when its text lands it
+	 * finishes its compare/write on top of the cap, so the count can briefly
+	 * exceed the cap by at most MAX_AWAITING, and nothing new starts until it
+	 * is back under. Each completion (or deadline) re-enters
 	 * `drain()` to pick up the next waiting document immediately, rather than
 	 * leaving it stuck until the next 10s tick.
 	 */
@@ -539,6 +546,11 @@ export class CrdtBackgroundSyncPoller {
 			// Re-validated at start: the editor may have opened it, or another
 			// path may have started pulling it, while it sat in the queue.
 			if (!next.pull.folder.isOnline || !this.canQueue(next.pull.file)) continue;
+			if (next.pull.file.entityGuid === this.probing) {
+				// Picked up again once the probe disconnects (sweep pulls just wait for the next pass).
+				if (next.lane !== "sweep") this.heldByProbe.set(next.pull.file.entityGuid, next);
+				continue;
+			}
 			this.startPull(next.pull, next.lane, next.express);
 		}
 	}
@@ -605,6 +617,10 @@ export class CrdtBackgroundSyncPoller {
 			}
 			finish(undefined);
 		};
+		const rearm = (ms: number) => {
+			if (inFlight.deadline !== undefined) this.timeProvider.cancelTimeout(inFlight.deadline);
+			inFlight.deadline = this.timeProvider.scheduleTimeout(onDeadline, ms);
+		};
 		inFlight.deadline = this.timeProvider.scheduleTimeout(onDeadline, this.pullDeadlineMs);
 
 		inFlight.release = () => {
@@ -618,17 +634,18 @@ export class CrdtBackgroundSyncPoller {
 			.pullIfUnchanged(file, {
 				signal: controller.signal,
 				onPhase: (phase) => {
+					const wasAwaiting = inFlight.phase === "await-content";
 					inFlight.phase = phase;
-					if (phase === "await-content" && !settled) {
+					if (settled) return;
+					if (phase === "await-content") {
 						// Waiting for the relay to push the text is not stuck:
 						// give the wait its own budget, then the usual one.
-						if (inFlight.deadline !== undefined) this.timeProvider.cancelTimeout(inFlight.deadline);
-						inFlight.deadline = this.timeProvider.scheduleTimeout(
-							onDeadline,
-							AWAIT_CONTENT_MS + this.pullDeadlineMs,
-						);
+						rearm(AWAIT_CONTENT_MS + this.pullDeadlineMs);
 						// The slot is free while it waits.
 						this.drain();
+					} else if (wasAwaiting) {
+						// Back to the usual budget for compare/write.
+						rearm(this.pullDeadlineMs);
 					}
 				},
 				...(awaits
@@ -759,11 +776,12 @@ export class CrdtBackgroundSyncPoller {
 		this.probe = undefined;
 	}
 
-	private async runRelayProbe(probe: { path: string; guid?: string }): Promise<void> {
-		if (this.probe !== probe || probe.guid !== undefined) return;
+	private async runRelayProbe(probe: { path: string }): Promise<void> {
+		if (this.probe !== probe || this.probing !== undefined) return;
 		const found = this.findDocument(probe.path);
 		if (!found || this.pulling.has(found.file.entityGuid)) return;
-		probe.guid = found.file.entityGuid;
+		const guid = found.file.entityGuid;
+		this.probing = guid;
 		try {
 			const sample = await found.folder.transfers.probeRelay(found.file);
 			if (sample && this.probe === probe) {
@@ -773,7 +791,14 @@ export class CrdtBackgroundSyncPoller {
 		} catch (err: unknown) {
 			log("Relay probe failed", { path: probe.path, err });
 		} finally {
-			probe.guid = undefined;
+			this.probing = undefined;
+			const held = this.heldByProbe.get(guid);
+			this.heldByProbe.delete(guid);
+			if (held && !this.destroyed) {
+				const queues = this.queuesFor(held.pull.folder);
+				if (!queues.priority.has(guid) && !queues.late.has(guid)) queues[held.lane].set(guid, held.pull);
+				this.drain();
+			}
 		}
 	}
 
@@ -886,6 +911,7 @@ export class CrdtBackgroundSyncPoller {
 		this.queues.clear();
 		this.announcedWhilePulling.clear();
 		this.abandonedWrites.clear();
+		this.heldByProbe.clear();
 		log("CrdtBackgroundSyncPoller destroyed");
 	}
 }
