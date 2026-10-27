@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.23
+- Improved: the sync health check now records, for each recent edit to a closed note, how long it took to upload and how long the other device took to fetch it, so slow deliveries can be traced to their cause.
+
 ## 0.1.22
 - Fixed: during a large import, a folder whose notes are being edited is no longer mistaken for part of the import, so those edits are not held back behind it for up to a minute and a half. A connection attempt that hangs now gives up sooner when connections are normally fast.
 
