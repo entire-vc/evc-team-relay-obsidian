@@ -20,6 +20,7 @@ import { applyDiffToYText, reconcileWithConflictCopy } from "./ytextDiff";
 import { hasPreservableContent, sameTextContent } from "./textEquivalence";
 import { waitForBufferFlush } from "./websocketFlush";
 import { textFingerprint } from "./docActivity";
+import { hasHistoryGap } from "./preserveBeforeTrash";
 import {
 	claimInitIfUnclaimed,
 	wonInitClaim,
@@ -213,7 +214,14 @@ export interface RelayProbeSample {
 }
 
 export interface PullResult {
-	outcome: "flushed" | "unchanged" | "kept-local" | "no-base" | "connect-failed" | "aborted";
+	outcome:
+		| "flushed"
+		| "unchanged"
+		| "kept-local"
+		| "no-base"
+		| "history-gap"
+		| "connect-failed"
+		| "aborted";
 	/** The relay text the pull compared against, when it got that far. */
 	remoteText?: string;
 }
@@ -1301,6 +1309,15 @@ export class TransferQueue extends Loggable {
 		}
 
 		onPhase?.("compare");
+		if (hasHistoryGap(doc.crdtDoc)) {
+			// Updates are pending on changes this client never stored (an
+			// offline restart of the note's author): the text reads empty or
+			// partial until the relay sends the missing part. It is not what
+			// was last synced, so writing it would blank a full file for good.
+			this.log(`[pullIfUnchanged] history gap in ${doc.entryPath}; leaving the file as is`);
+			this.releasePulledDoc(doc, intent);
+			return { outcome: "history-gap" };
+		}
 		const remoteText = doc.content;
 		const vaultContentsAfter = await this.readVaultContents(doc);
 		if (aborted()) {

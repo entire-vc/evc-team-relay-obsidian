@@ -51,6 +51,7 @@ function makeFakeDoc(opts: { vault: string | null; remote: string; syncBase: str
 	Object.defineProperty(fakeDoc, "resourceAddress", { value: {} });
 	Object.defineProperty(fakeDoc, "awaitFirstSync", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "content", { get: () => state.remote });
+	Object.defineProperty(fakeDoc, "crdtDoc", { value: new Y.Doc() });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(fakeDoc, "bringOnline", { value: async () => true });
 	Object.defineProperty(fakeDoc, "onceOnline", { value: async () => {} });

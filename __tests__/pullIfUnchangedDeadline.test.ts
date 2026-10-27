@@ -9,6 +9,7 @@
  * with no recorded sync base.
  */
 
+import * as Y from "yjs";
 import { describe, test, expect, jest } from "@jest/globals";
 import type { Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
@@ -62,6 +63,7 @@ function makeFakeDoc(opts: FakeDocOptions = {}) {
 	Object.defineProperty(fakeDoc, "resourceAddress", { value: {} });
 	Object.defineProperty(fakeDoc, "awaitFirstSync", { value: opts.awaitFirstSync ?? (async () => {}) });
 	Object.defineProperty(fakeDoc, "content", { get: () => "relay content EDITED BY PEER" });
+	Object.defineProperty(fakeDoc, "crdtDoc", { value: new Y.Doc() });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(fakeDoc, "bringOnline", { value: opts.bringOnline ?? (async () => true) });
 	Object.defineProperty(fakeDoc, "onceOnline", { value: async () => {} });
