@@ -133,6 +133,21 @@ interface QueueLaneState {
 	reruns: number;
 }
 
+/**
+ * One priority upload (an edit to a closed note), for a load test to line up
+ * with when the other device got it. `endedAt` is wall-clock ms.
+ */
+export interface PriorityUploadTrace {
+	path: string;
+	endedAt: number;
+	waitMs: number;
+	runMs: number;
+	ok: boolean;
+	ranAsPriority: boolean;
+}
+
+const UPLOAD_TRACE_SAMPLES = 100;
+
 /** How many recent run durations `laneStats()` summarises per lane. */
 const DURATION_SAMPLES = 200;
 
@@ -249,6 +264,7 @@ export class TransferQueue extends Loggable {
 	public batches = new NotifierMap<VaultShare, TransferBatch>();
 
 	private syncLane: QueueLaneState;
+	private readonly uploadTrace: PriorityUploadTrace[] = [];
 	private downloadLane: QueueLaneState;
 
 	private paused = true;
@@ -317,6 +333,11 @@ export class TransferQueue extends Loggable {
 			void this.drainLane(this.downloadLane);
 			this.maybeLogLaneStats();
 		}, 1000);
+	}
+
+	/** The most recent priority uploads, newest last. */
+	priorityUploadTrace(): PriorityUploadTrace[] {
+		return [...this.uploadTrace];
 	}
 
 	/** Queue sizes per share, priority backlog, active count and oldest wait, per lane. */
@@ -502,16 +523,29 @@ export class TransferQueue extends Loggable {
 			lane.lastServed.set(item.vaultShare, ++this.serveSeq);
 
 			try {
+				let ok = false;
 				lane
 					.run(item)
 					.then(() => {
 						this.completeQueueItem(lane, item);
+						ok = true;
 					})
 					.catch((error: unknown) => {
 						this.failQueueItem(lane, item, error);
 					})
 					.finally(() => {
 						releaseTokens?.();
+						if (lane === this.syncLane && item.priority) {
+							this.uploadTrace.push({
+								path: item.absolutePath,
+								endedAt: Date.now(),
+								waitMs: startedAt - item.queuedAt,
+								runMs: this.clock.now() - startedAt,
+								ok,
+								ranAsPriority,
+							});
+							if (this.uploadTrace.length > UPLOAD_TRACE_SAMPLES) this.uploadTrace.shift();
+						}
 						lane.durations.push({ ms: this.clock.now() - startedAt, priority: ranAsPriority });
 						if (lane.durations.length > DURATION_SAMPLES) lane.durations.shift();
 						lane.active.delete(item);
