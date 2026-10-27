@@ -9,8 +9,12 @@ import {
 	connectEndpoint,
 	connectGateStats,
 	enqueueConnect,
+	ADAPTIVE_HANDSHAKE_SAMPLES,
 	HANDSHAKE_TIMEOUT_MS,
+	handshakeTimeoutMs,
 	MAX_HANDSHAKE_TIMEOUT_MS,
+	MIN_HANDSHAKE_TIMEOUT_MS,
+	recordHandshake,
 	resetConnectGate,
 } from "../src/client/connectGate";
 import { holdBackgroundTokens, resetTokenRequestClasses } from "../src/auth/tokenRequestClass";
@@ -261,5 +265,24 @@ describe("YSweetProvider through the gate", () => {
 		expect(last.closed).toBe(false);
 		await jest.advanceTimersByTimeAsync(1);
 		expect(last.closed).toBe(true);
+	});
+
+	test("once enough handshakes opened, a stuck one gives up after a few times their p95", async () => {
+		expect(handshakeTimeoutMs()).toBe(HANDSHAKE_TIMEOUT_MS);
+		for (let i = 0; i < ADAPTIVE_HANDSHAKE_SAMPLES; i++) recordHandshake(500);
+		expect(handshakeTimeoutMs()).toBe(2_000);
+		expect(connectGateStats().timeoutMs).toBe(2_000);
+		const p = make("stuck");
+		p.connect();
+		await jest.advanceTimersByTimeAsync(2_000);
+		expect(FakeWS.instances[0].closed).toBe(true);
+	});
+
+	test("the adaptive timeout stays within its floor and the default", () => {
+		for (let i = 0; i < ADAPTIVE_HANDSHAKE_SAMPLES; i++) recordHandshake(10);
+		expect(handshakeTimeoutMs()).toBe(MIN_HANDSHAKE_TIMEOUT_MS);
+		resetConnectGate();
+		for (let i = 0; i < ADAPTIVE_HANDSHAKE_SAMPLES; i++) recordHandshake(5_000);
+		expect(handshakeTimeoutMs()).toBe(HANDSHAKE_TIMEOUT_MS);
 	});
 });
