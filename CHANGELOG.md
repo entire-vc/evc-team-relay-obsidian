@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.29
+- Fixed: a note whose content reached the server a few seconds late could stay missing on another device for five minutes. The plugin now checks again after a few seconds, then waits longer between checks.
+- Fixed: shared folders that are not in this vault are no longer checked for changes every few seconds. They are checked when the share list loads. Once such a folder is downloaded, it is watched like any other.
+- Fixed: when the server refuses access to a share, the plugin no longer requests access again in a tight loop. It waits longer between attempts, and the folder shows that access was refused. Signing in again or "Sync all shares" retries right away.
+
 ## 0.1.28
 - Fixed: a note deleted on another device while this device was offline came back after this device restarted, on every device and as a new note. A note removed while you were away is now deleted locally after the restart and is no longer uploaded again.
 
