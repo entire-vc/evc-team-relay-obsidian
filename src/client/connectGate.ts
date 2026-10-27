@@ -26,7 +26,11 @@ export const HANDSHAKE_TIMEOUT_MS = 10_000;
  * the relay each held the queue for the full 10 s, which was the edits' wait.
  */
 export const ADAPTIVE_HANDSHAKE_SAMPLES = 20;
-export const MIN_HANDSHAKE_TIMEOUT_MS = 2_000;
+/**
+ * Only opened handshakes are sampled, so on a link that turns slow the timeout
+ * lags behind; this floor keeps one such first attempt from being cut short.
+ */
+export const MIN_HANDSHAKE_TIMEOUT_MS = 4_000;
 const HANDSHAKE_P95_FACTOR = 4;
 /** The timeout doubles after each timeout in a row, up to this, for slow links. */
 export const MAX_HANDSHAKE_TIMEOUT_MS = 60_000;

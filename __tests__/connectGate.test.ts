@@ -269,12 +269,14 @@ describe("YSweetProvider through the gate", () => {
 
 	test("once enough handshakes opened, a stuck one gives up after a few times their p95", async () => {
 		expect(handshakeTimeoutMs()).toBe(HANDSHAKE_TIMEOUT_MS);
-		for (let i = 0; i < ADAPTIVE_HANDSHAKE_SAMPLES; i++) recordHandshake(500);
-		expect(handshakeTimeoutMs()).toBe(2_000);
-		expect(connectGateStats().timeoutMs).toBe(2_000);
+		for (let i = 0; i < ADAPTIVE_HANDSHAKE_SAMPLES; i++) recordHandshake(1_500);
+		expect(handshakeTimeoutMs()).toBe(6_000);
+		expect(connectGateStats().timeoutMs).toBe(6_000);
 		const p = make("stuck");
 		p.connect();
-		await jest.advanceTimersByTimeAsync(2_000);
+		await jest.advanceTimersByTimeAsync(5_999);
+		expect(FakeWS.instances[0].closed).toBe(false);
+		await jest.advanceTimersByTimeAsync(1);
 		expect(FakeWS.instances[0].closed).toBe(true);
 	});
 
