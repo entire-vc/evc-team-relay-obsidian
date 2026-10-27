@@ -35,6 +35,7 @@ import {
 	type ConnectTicket,
 	enqueueConnect,
 	HANDSHAKE_TIMEOUT_MS,
+	MAX_HANDSHAKE_TIMEOUT_MS,
 	recordHandshake,
 	recordHandshakeTimeout,
 } from "./connectGate";
@@ -218,24 +219,53 @@ const setupWS = (provider: YSweetProvider): void => {
 
 	provider.connectTrace.queuedAt = Date.now();
 	provider.wsconnecting = true;
-	const cls = tokenRequestClass(provider.roomname);
-	provider.connectTicket = enqueueConnect(provider.url, cls, () => openWS(provider));
+	const ticket = enqueueConnect(
+		provider.url,
+		() => tokenRequestClass(provider.roomname),
+		(granted) => openWS(provider, granted),
+	);
+	// It may have started, and even finished, synchronously above.
+	if (!ticket.released) provider.connectTicket = ticket;
 };
 
-const releaseConnectTicket = (provider: YSweetProvider): void => {
-	if (provider.connectTicket === null) return;
-	const ticket = provider.connectTicket;
-	provider.connectTicket = null;
+/**
+ * Start gently and back off, so a server that is merely restarting is not
+ * hammered, and one that is down does not spin the client.
+ */
+const reconnectDelay = (provider: YSweetProvider): number =>
+	math.min(math.pow(2, provider.wsUnsuccessfulReconnects) * RECONNECT_BASE_MS, provider.maxBackoffTime);
+
+/** Frees `ticket`, and forgets it if it is still the provider's current one. */
+const releaseTicket = (provider: YSweetProvider, ticket: ConnectTicket): void => {
+	if (provider.connectTicket === ticket) provider.connectTicket = null;
 	ticket.release();
 };
 
-const openWS = (provider: YSweetProvider): void => {
+const releaseConnectTicket = (provider: YSweetProvider): void => {
+	if (provider.connectTicket !== null) releaseTicket(provider, provider.connectTicket);
+};
+
+const openWS = (provider: YSweetProvider, ticket: ConnectTicket): void => {
+	provider.connectTicket = ticket;
 	if (!provider.shouldConnect || provider.ws !== null) {
-		releaseConnectTicket(provider);
+		releaseTicket(provider, ticket);
 		provider.wsconnecting = false;
 		return;
 	}
-	const websocket = new provider._WS(provider.url);
+	let websocket: WebSocket;
+	try {
+		websocket = new provider._WS(provider.url);
+	} catch (error) {
+		releaseTicket(provider, ticket);
+		provider.wsconnecting = false;
+		provider.wsUnsuccessfulReconnects++;
+		provider.connectTrace.failedSockets++;
+		provider.emit("connection-error", [error as Event, provider]);
+		if (provider.canReconnect()) {
+			window.setTimeout(setupWS, reconnectDelay(provider), provider);
+		}
+		return;
+	}
 	const startedAt = Date.now();
 	provider.connectTrace.socketAt = startedAt;
 	provider.connectTrace.skipped = undefined;
@@ -247,12 +277,16 @@ const openWS = (provider: YSweetProvider): void => {
 
 	// A handshake stuck this long would hold every other socket to this
 	// server behind it: give up the turn and retry through onclose.
-	const handshakeTimer = window.setTimeout(() => {
-		if (provider.ws !== websocket || provider.wsconnected) return;
-		recordHandshakeTimeout();
-		releaseConnectTicket(provider);
-		websocket.close();
-	}, HANDSHAKE_TIMEOUT_MS);
+	const handshakeTimer = window.setTimeout(
+		() => {
+			if (provider.ws !== websocket || provider.wsconnected) return;
+			recordHandshakeTimeout();
+			provider.handshakeTimeoutsInRow++;
+			releaseTicket(provider, ticket);
+			websocket.close();
+		},
+		math.min(HANDSHAKE_TIMEOUT_MS * math.pow(2, provider.handshakeTimeoutsInRow), MAX_HANDSHAKE_TIMEOUT_MS),
+	);
 
 	let awarenessResendTimer: number | null = null;
 	const stopAwarenessResend = () => {
@@ -276,8 +310,11 @@ const openWS = (provider: YSweetProvider): void => {
 
 	websocket.onclose = (event: CloseEvent) => {
 		window.clearTimeout(handshakeTimer);
-		if (provider.ws === websocket) releaseConnectTicket(provider);
+		releaseTicket(provider, ticket);
 		stopAwarenessResend();
+		// A socket given up earlier (disconnect, timeout) closing after a newer
+		// one was queued or opened: the newer one owns the provider's state.
+		if (provider.ws !== websocket && (provider.ws !== null || provider.connectTicket !== null)) return;
 		provider.emit("connection-close", [event, provider]);
 		provider.ws = null;
 		provider.wsconnecting = false;
@@ -303,18 +340,13 @@ const openWS = (provider: YSweetProvider): void => {
 		}
 
 		if (!provider.canReconnect()) return;
-		// Start gently and back off, so a server that is merely restarting is
-		// not hammered, and one that is down does not spin the client.
-		const delay = math.min(
-			math.pow(2, provider.wsUnsuccessfulReconnects) * RECONNECT_BASE_MS,
-			provider.maxBackoffTime,
-		);
-		window.setTimeout(setupWS, delay, provider);
+		window.setTimeout(setupWS, reconnectDelay(provider), provider);
 	};
 
 	websocket.onopen = () => {
 		window.clearTimeout(handshakeTimer);
-		releaseConnectTicket(provider);
+		releaseTicket(provider, ticket);
+		provider.handshakeTimeoutsInRow = 0;
 		provider.connectTrace.openAt = Date.now();
 		recordHandshake(provider.connectTrace.openAt - startedAt);
 		provider.wsLastMessageReceived = time.getUnixTime();
@@ -417,6 +449,8 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 	connectTrace: ConnectTrace = { calledAt: 0, failedSockets: 0 };
 	/** Our place in connectGate while a socket waits for its turn or handshakes. */
 	connectTicket: ConnectTicket | null = null;
+	/** Handshakes given up in a row; each one doubles the next timeout. */
+	handshakeTimeoutsInRow = 0;
 	wsLastMessageReceived = 0;
 	shouldConnect: boolean;
 	maxConnectionErrors: number;

@@ -19,14 +19,18 @@ import { summarise, type WaitSummary } from "../waitSummary";
 export type ConnectClass = "normal" | "background";
 
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
+/** The timeout doubles after each timeout in a row, up to this, for slow links. */
+export const MAX_HANDSHAKE_TIMEOUT_MS = 60_000;
 
 export interface ConnectTicket {
 	/** Frees the slot, or leaves the queue if not started yet. Idempotent. */
 	release(): void;
+	readonly released: boolean;
 }
 
 interface Waiter {
-	cls: ConnectClass;
+	/** Read at each dispatch: a document can come into use while it waits. */
+	classify: () => ConnectClass;
 	queuedAt: number;
 	start: () => void;
 	released: boolean;
@@ -57,15 +61,26 @@ export function connectEndpoint(socketUrl: string): string {
 
 function dispatch(key: string, endpoint: Endpoint): void {
 	if (endpoint.busy !== null) return;
-	const at = endpoint.queue.findIndex((w) => w.cls === "normal");
-	const [next] = endpoint.queue.splice(at === -1 ? 0 : at, 1);
-	if (next === undefined) {
-		endpoints.delete(key);
-		return;
+	for (;;) {
+		const at = endpoint.queue.findIndex((w) => w.classify() === "normal");
+		const [next] = endpoint.queue.splice(at === -1 ? 0 : at, 1);
+		if (next === undefined) {
+			endpoints.delete(key);
+			return;
+		}
+		endpoint.busy = next;
+		record(waits[at === -1 ? "background" : "normal"], Date.now() - next.queuedAt);
+		try {
+			next.start();
+			return;
+		} catch (error) {
+			// The caller failed to start (a socket constructor throwing): never
+			// leave the endpoint held by it, move on to the next one.
+			next.released = true;
+			endpoint.busy = null;
+			console.error("[connectGate] a queued connection failed to start", error);
+		}
 	}
-	endpoint.busy = next;
-	record(waits[next.cls], Date.now() - next.queuedAt);
-	next.start();
 }
 
 /**
@@ -73,18 +88,22 @@ function dispatch(key: string, endpoint: Endpoint): void {
  * endpoint is free) once it is this one's turn; release the ticket when the
  * socket opens, closes, or is abandoned.
  */
-export function enqueueConnect(socketUrl: string, cls: ConnectClass, start: () => void): ConnectTicket {
+export function enqueueConnect(
+	socketUrl: string,
+	classify: () => ConnectClass,
+	start: (ticket: ConnectTicket) => void,
+): ConnectTicket {
 	const key = connectEndpoint(socketUrl);
 	let endpoint = endpoints.get(key);
 	if (endpoint === undefined) {
 		endpoint = { busy: null, queue: [] };
 		endpoints.set(key, endpoint);
 	}
-	const waiter: Waiter = { cls, queuedAt: Date.now(), start, released: false };
 	const own = endpoint;
-	own.queue.push(waiter);
-	dispatch(key, own);
-	return {
+	const ticket: ConnectTicket = {
+		get released() {
+			return waiter.released;
+		},
 		release() {
 			if (waiter.released) return;
 			waiter.released = true;
@@ -98,6 +117,10 @@ export function enqueueConnect(socketUrl: string, cls: ConnectClass, start: () =
 			}
 		},
 	};
+	const waiter: Waiter = { classify, queuedAt: Date.now(), start: () => start(ticket), released: false };
+	own.queue.push(waiter);
+	dispatch(key, own);
+	return ticket;
 }
 
 /** A handshake that opened, `ms` after it was started. */
