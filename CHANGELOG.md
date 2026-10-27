@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.22
+- Fixed: during a large import, a folder whose notes are being edited is no longer mistaken for part of the import, so those edits are not held back behind it for up to a minute and a half. A connection attempt that hangs now gives up sooner when connections are normally fast.
+
 ## 0.1.21
 - Fixed: during a large import or background sync, edits to closed notes and changes from other devices no longer wait up to half a minute to connect behind background connections. Connections for notes in use now go first, and a connection attempt that hangs is retried instead of holding up the rest.
 
