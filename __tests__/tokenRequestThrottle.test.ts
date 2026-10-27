@@ -22,6 +22,11 @@ import {
 	TOKEN_REQUESTS_PER_MINUTE_LIMITED,
 	TOKEN_RATE_LIMITED_HOLD_MS,
 } from "../src/auth/RelayOnPremTokenProvider";
+import {
+	holdBackgroundTokens,
+	resetTokenRequestClasses,
+	tokenWaitStats,
+} from "../src/auth/tokenRequestClass";
 
 const flush = async () => {
 	for (let i = 0; i < 5; i++) await Promise.resolve();
@@ -33,6 +38,50 @@ describe("TokenRequestThrottle", () => {
 	});
 	afterEach(() => {
 		jest.useRealTimers();
+	});
+
+	test("a request for an ordinary document goes ahead of queued background ones", async () => {
+		resetTokenRequestClasses();
+		const throttle = new TokenRequestThrottle();
+		const order: string[] = [];
+		const ask = (docId: string) => void throttle.acquire(docId).then(() => order.push(docId));
+		const releases = Array.from({ length: 30 }, (_, i) => holdBackgroundTokens(`bulk-${i}`));
+		for (let i = 0; i < 30; i++) ask(`bulk-${i}`);
+		await flush();
+		expect(order).toHaveLength(TOKEN_REQUEST_BURST);
+
+		ask("edit");
+		// Queued while background: once opened it goes ahead too.
+		releases[29]();
+		jest.advanceTimersByTime(Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE));
+		await flush();
+		expect(order.slice(TOKEN_REQUEST_BURST)).toEqual(["bulk-29"]);
+		jest.advanceTimersByTime(Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE));
+		await flush();
+		expect(order.slice(TOKEN_REQUEST_BURST)).toEqual(["bulk-29", "edit"]);
+
+		const waits = tokenWaitStats();
+		expect(waits.normal.count).toBe(2);
+		expect(waits.normal.max).toBeLessThanOrEqual(2 * Math.ceil(60_000 / TOKEN_REQUESTS_PER_MINUTE));
+		// The rest still comes, in order.
+		jest.advanceTimersByTime(60_000);
+		await flush();
+		expect(order.slice(TOKEN_REQUEST_BURST + 2)).toEqual(
+			Array.from({ length: 30 - TOKEN_REQUEST_BURST - 1 }, (_, i) => `bulk-${TOKEN_REQUEST_BURST + i}`),
+		);
+		releases.forEach((release) => release());
+		throttle.destroy();
+	});
+
+	test("a document stays background until its last holder lets go", () => {
+		resetTokenRequestClasses();
+		const first = holdBackgroundTokens("doc");
+		const second = holdBackgroundTokens("doc");
+		first();
+		first();
+		expect(tokenWaitStats().backgroundDocs).toBe(1);
+		second();
+		expect(tokenWaitStats().backgroundDocs).toBe(0);
 	});
 
 	function acquireMany(throttle: TokenRequestThrottle, n: number): { done: number } {

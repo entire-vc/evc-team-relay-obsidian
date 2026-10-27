@@ -27,6 +27,7 @@ import {
 	awaitClaimSettled,
 } from "./initContentClaim";
 import { claimReconcile, wonReconcileClaim, awaitReconcileSettled } from "./reconcileClaim";
+import { holdBackgroundTokens } from "./auth/tokenRequestClass";
 
 export interface TransferTask {
 	entityGuid: string;
@@ -483,6 +484,9 @@ export class TransferQueue extends Loggable {
 			item.taskStatus = "running";
 			const startedAt = this.clock.now();
 			const ranAsPriority = urgent(item);
+			// Background work lets edits and open documents get their relay
+			// tokens first (see tokenRequestClass.ts).
+			const releaseTokens = ranAsPriority ? undefined : holdBackgroundTokens(item.entityGuid);
 			lane.active.include(item);
 			lane.lastServed.set(item.vaultShare, ++this.serveSeq);
 
@@ -496,6 +500,7 @@ export class TransferQueue extends Loggable {
 						this.failQueueItem(lane, item, error);
 					})
 					.finally(() => {
+						releaseTokens?.();
 						lane.durations.push({ ms: this.clock.now() - startedAt, priority: ranAsPriority });
 						if (lane.durations.length > DURATION_SAMPLES) lane.durations.shift();
 						lane.active.delete(item);
@@ -508,6 +513,7 @@ export class TransferQueue extends Loggable {
 						}, 0);
 					});
 			} catch (error: unknown) {
+				releaseTokens?.();
 				item.taskStatus = "failed";
 				this.rejectWaiter(lane, item.entityGuid, error);
 				this.markGroupFailed(item.vaultShare, lane.startupFailureLabel, error);

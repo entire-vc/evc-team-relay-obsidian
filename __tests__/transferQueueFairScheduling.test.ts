@@ -14,6 +14,7 @@ import type { Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
 import type { VaultShare } from "../src/VaultShare";
+import { resetTokenRequestClasses, tokenRequestClass } from "../src/auth/tokenRequestClass";
 
 class ManualClock implements Clock {
 	time = 1_000;
@@ -182,6 +183,25 @@ describe("TransferQueue — fair, priority-aware lanes", () => {
 		await flushMacrotasks();
 		// No edit left: the import takes the lane back.
 		expect(started).toEqual(["Y:edit.md", "X:bulk0.md", "X:bulk1.md", "X:bulk2.md"]);
+	});
+
+	test("background uploads ask for relay tokens as background while they run; edits and imports' edits do not", async () => {
+		resetTokenRequestClasses();
+		const big = makeShare("Big");
+		const small = makeShare("Small");
+		queue.suspend();
+		for (let i = 0; i < 20; i++) void queue.enqueueUpload(makeDoc(big, `doc-${i}.md`), { priority: true });
+		void queue.enqueueUpload(makeDoc(small, "edit.md"), { priority: true });
+		queue.wake();
+		await flushMacrotasks();
+		expect(started).toEqual(["Small:edit.md", "Big:doc-0.md"]);
+		// An import written as priority still ranks as bulk.
+		expect(tokenRequestClass("Big:doc-0.md")).toBe("background");
+		expect(tokenRequestClass("Small:edit.md")).toBe("normal");
+
+		finish.get("Big:doc-0.md")?.();
+		await flushMacrotasks();
+		expect(tokenRequestClass("Big:doc-0.md")).toBe("normal");
 	});
 
 	test("the reserved slot serves a share with no priority item running", async () => {
