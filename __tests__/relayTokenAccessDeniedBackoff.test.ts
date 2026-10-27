@@ -28,7 +28,7 @@ const mockFetch = platformFetch as jest.MockedFunction<typeof platformFetch>;
 import { ProviderBacked } from "../src/ProviderBacked";
 import { RelayCredentialCache } from "../src/RelayCredentialCache";
 import { RelayOnPremTokenProvider } from "../src/auth/RelayOnPremTokenProvider";
-import { RemoteDocumentAddress, RemoteFolderAddress } from "../src/ResourceAddress";
+import { ResourceAddress, RemoteDocumentAddress, RemoteFolderAddress } from "../src/ResourceAddress";
 import type { IAuthProvider } from "../src/auth/IAuthProvider";
 import type { AuthSession } from "../src/AuthSession";
 import { MockClock } from "./mocks/MockClock";
@@ -261,6 +261,41 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		// refusal can cost that many requests before the share is backed off.
 		expect(tokenCalls() - granted).toBeLessThanOrEqual(3 + 3);
 		expect(docIn(docs[0]).accessDenied).toBe(true);
+	});
+
+	test("a refusal found by the renewal sweep reaches the folder badge", async () => {
+		mockFetch.mockImplementation(() => respond(200));
+		const { cache, clock, pb } = build();
+		expect(await online(pb)).toBe(true);
+		const states: string[] = [];
+		pb.subscribe({}, () => states.push(pb.accessDenied ? "no access" : "ok"));
+		states.length = 0;
+
+		mockFetch.mockImplementation(() => respond(401));
+		clock.setTime(clock.now() + 30_000);
+		cache.startSweeping();
+		for (let minute = 0; minute < 5; minute++) {
+			clock.setTime(clock.now() + MINUTE);
+			await jest.advanceTimersByTimeAsync(MINUTE);
+		}
+		cache.stopSweeping();
+
+		expect(states).toContain("no access");
+	});
+
+	test("a backed-off refresh reports its refusal asynchronously, so the renewal queue cannot recurse", async () => {
+		mockFetch.mockImplementation(() => respond(401));
+		const { cache, pb } = build();
+		await online(pb);
+		expect(pb.accessDenied).toBe(true);
+
+		const gated = (cache as unknown as { gatedRefresh: (id: string, ok: () => void, err: (e: Error) => void) => Promise<void> }).gatedRefresh;
+		const err = jest.fn();
+		void gated.call(cache, ResourceAddress.serialize(new RemoteFolderAddress("relay-onprem", G)), () => {}, err);
+		expect(err).not.toHaveBeenCalled();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(err).toHaveBeenCalledTimes(1);
 	});
 
 	test("a reset asks for write again after a share refused write", async () => {
