@@ -1272,6 +1272,47 @@ describe("InboundSyncPoller: shares checked from the share list", () => {
 		expect(store.get("s")).toBe("2026-06-08T11:00:00Z");
 	});
 
+	test("a check from the share list waits for a poll of the same share already running, and keeps its watermark", async () => {
+		const store = new Map<string, string>();
+		let releasePoll!: () => void;
+		const order: string[] = [];
+		const downloadShare = jest
+			.fn<() => Promise<"ran" | "skipped">>()
+			.mockImplementationOnce(() => {
+				order.push("poll-start");
+				return new Promise((resolve) => (releasePoll = () => { order.push("poll-end"); resolve("ran"); }));
+			})
+			.mockImplementation(async () => {
+				order.push("listed");
+				return "ran";
+			});
+		(clientManager.getShare as unknown as jest.Mock<() => Promise<unknown>>).mockResolvedValue(makeShare("2026-06-08T11:00:00Z"));
+		const poller = new InboundSyncPoller(
+			timeProvider,
+			clientManager as any,
+			webSyncManager as any,
+			{ downloadShare, isInboundWriting: () => false } as any,
+			30_000,
+			store,
+		);
+
+		poller.registerShare("s", SERVER_ID);
+		poller.start();
+		timeProvider.setTime(timeProvider.now() + 30_000);
+		await flushPromises();
+		expect(order).toEqual(["poll-start"]);
+
+		const listed = poller.checkListedShare("s", SERVER_ID, "2026-06-08T10:00:00Z");
+		await flushPromises();
+		expect(order).toEqual(["poll-start"]);
+		releasePoll();
+		await listed;
+
+		// The older listed timestamp is not downloaded over the poll's newer one.
+		expect(order).toEqual(["poll-start", "poll-end"]);
+		expect(store.get("s")).toBe("2026-06-08T11:00:00Z");
+	});
+
 	test("retainOnly stops polling the shares it rejects", async () => {
 		const poller = new InboundSyncPoller(
 			timeProvider,

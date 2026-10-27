@@ -816,7 +816,16 @@ export default class TeamRelayPlugin extends Plugin {
 			// registry; stop polling a share that no longer has a VaultShare
 			// or, for one polled by path alone, its folder.
 			this.register(
-				this.shareRegistry.on(() => this.inboundSyncPoller?.retainOnly(this.keepPollingShare)),
+				this.shareRegistry.on(() => {
+					// A share polled by path that now has a VaultShare follows the
+					// VaultShare from here on: disconnecting it stops the polling.
+					for (const shareId of [...this.pathOnlyPolledShares.keys()]) {
+						if (this.shareRegistry.locate((sf) => sf.entityGuid === shareId)) {
+							this.pathOnlyPolledShares.delete(shareId);
+						}
+					}
+					this.inboundSyncPoller?.retainOnly(this.keepPollingShare);
+				}),
 			);
 		}
 

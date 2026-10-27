@@ -24,7 +24,9 @@ interface WatchedShare {
 
 export class InboundSyncPoller {
 	private watchedShares: Map<string, WatchedShare> = new Map();
-	private listedChecks = new Map<string, Promise<void>>();
+	// The check running for a share, by the poll or from the share list;
+	// checks of one share run one after another.
+	private shareChecks = new Map<string, Promise<void>>();
 	private intervalId: number | null = null;
 	private polling = false;
 	private serverBackoff = new Map<string, { failures: number; retryAt: number }>();
@@ -83,11 +85,11 @@ export class InboundSyncPoller {
 		serverId: string,
 		listedUpdatedAt: string | null,
 	): Promise<void> {
-		const previous = this.listedChecks.get(shareId) ?? Promise.resolve();
+		const previous = this.shareChecks.get(shareId) ?? Promise.resolve();
 		const check = previous.then(() => this.runListedCheck(shareId, serverId, listedUpdatedAt));
-		this.listedChecks.set(shareId, check);
+		this.shareChecks.set(shareId, check);
 		void check.then(() => {
-			if (this.listedChecks.get(shareId) === check) this.listedChecks.delete(shareId);
+			if (this.shareChecks.get(shareId) === check) this.shareChecks.delete(shareId);
 		});
 		return check;
 	}
@@ -155,8 +157,13 @@ export class InboundSyncPoller {
 				const backoff = this.serverBackoff.get(info.serverId);
 				if (backoff && this.timeProvider.now() < backoff.retryAt) continue;
 				// A check from the share list is still running for it.
-				if (this.listedChecks.has(shareId)) continue;
-				if (await this._checkShare(shareId, info.serverId, info.lastUpdatedAt)) {
+				if (this.shareChecks.has(shareId)) continue;
+				const check = this._checkShare(shareId, info.serverId, info.lastUpdatedAt);
+				const lock = check.then(() => undefined);
+				this.shareChecks.set(shareId, lock);
+				const ok = await check;
+				if (this.shareChecks.get(shareId) === lock) this.shareChecks.delete(shareId);
+				if (ok) {
 					recoveredServers.add(info.serverId);
 				} else {
 					failedServers.add(info.serverId);
