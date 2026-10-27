@@ -102,6 +102,7 @@ import type { ShareRegistry, VaultShare } from "./VaultShare";
 import type { PullPhase, PullResult, RelayProbeSample } from "./TransferQueue";
 import { textFingerprint } from "./docActivity";
 import { namedLogger } from "./logging";
+import { holdBackgroundTokens, tokenWaitStats, type TokenWaitSummary } from "./auth/tokenRequestClass";
 
 const log = namedLogger("[CrdtBackgroundSyncPoller]");
 
@@ -192,6 +193,8 @@ interface InFlight {
 	release?: () => void;
 	/** Started with leave to wait for the announced text (see AWAIT_CONTENT_MS). */
 	awaits: boolean;
+	/** Ends this pull's background token class (set for sweep and import pulls). */
+	releaseTokens?: () => void;
 }
 
 export interface PollerStats {
@@ -227,6 +230,8 @@ export interface PollerStats {
 		syncMs: { p50: number; p95: number; max: number };
 		failed: number;
 	};
+	/** Relay-token waits in the request throttle, per class (tokenRequestClass.ts). */
+	tokenWait: { normal: TokenWaitSummary; background: TokenWaitSummary; backgroundDocs: number };
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -584,6 +589,9 @@ export class CrdtBackgroundSyncPoller {
 			awaits,
 		};
 		this.pulling.set(guid, inFlight);
+		// A sweep pull or one into an importing share lets edits get their
+		// relay tokens first (see tokenRequestClass.ts).
+		if (lane === "sweep" || this.importingShares().has(folder)) inFlight.releaseTokens = holdBackgroundTokens(guid);
 		const startedAt = this.timeProvider.now();
 		log("Re-checking unopened document for remote updates", {
 			path: file.entryPath,
@@ -596,6 +604,7 @@ export class CrdtBackgroundSyncPoller {
 		const finish = (result: PullResult | undefined, redrain = true) => {
 			if (settled) return;
 			settled = true;
+			inFlight.releaseTokens?.();
 			if (inFlight.deadline !== undefined) this.timeProvider.cancelTimeout(inFlight.deadline);
 			this.pulling.delete(guid);
 			if (!this.destroyed) {
@@ -860,6 +869,7 @@ export class CrdtBackgroundSyncPoller {
 			awaiting: [...this.pulling.values()].filter((inFlight) => inFlight.phase === "await-content").length,
 			importing: [...this.importingShares()].map((folder) => folder.path ?? folder.entityGuid),
 			relayProbe: this.relayProbeStats(),
+			tokenWait: tokenWaitStats(),
 		};
 	}
 
@@ -902,8 +912,9 @@ export class CrdtBackgroundSyncPoller {
 		}
 		// Aborting makes each in-flight pull drop the connection it opened as
 		// soon as its current await returns, and write nothing further.
-		for (const { controller, deadline, phase } of this.pulling.values()) {
+		for (const { controller, deadline, phase, releaseTokens } of this.pulling.values()) {
 			if (deadline !== undefined) this.timeProvider.cancelTimeout(deadline);
+			releaseTokens?.();
 			// Same point of no return as the deadline: a write in progress
 			// completes with its sync-base update; nothing else proceeds.
 			if (phase !== "write") controller.abort();

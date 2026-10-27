@@ -9,6 +9,7 @@ import { platformFetch } from "../platformFetch";
 import { namedLogger } from "../logging";
 import type { DocumentGrant, FileGrant } from "../relay/TokenShapes";
 import type { IAuthProvider } from "./IAuthProvider";
+import { recordTokenWait, tokenRequestClass, type TokenRequestClass } from "./tokenRequestClass";
 
 export interface RelayTokenRequest {
 	share_id: string;
@@ -83,7 +84,8 @@ export const TOKEN_RATE_LIMITED_MAX_HOLD_MS = 60 * 60_000;
 
 /**
  * Token bucket in front of POST /v1/tokens/relay: up to `burst` requests at
- * once, then `perMinute`, served FIFO.
+ * once, then `perMinute`, served FIFO, except that background requests (see
+ * tokenRequestClass.ts) go after every other waiting request.
  *
  * The control plane allows 300 req/min per user and share. This used to be
  * a fixed 25/min queue sized for the old 30/min limit, and under a bulk sync
@@ -98,7 +100,7 @@ export class TokenRequestThrottle {
 	private limitedUntil = 0;
 	private holdMs = TOKEN_RATE_LIMITED_HOLD_MS;
 	private destroyed = false;
-	private queue: Array<() => void> = [];
+	private queue: Array<{ cls: TokenRequestClass; queuedAt: number; resolve: () => void }> = [];
 	private timer: number | null = null;
 	private log = namedLogger("[TokenRequestThrottle]", "debug");
 
@@ -109,11 +111,17 @@ export class TokenRequestThrottle {
 		this.tokens = burst;
 	}
 
-	/** Resolves when it is this caller's turn to make a network request (FIFO). */
-	acquire(): Promise<void> {
+	/**
+	 * Resolves when it is this caller's turn to make a network request. The
+	 * class of `docId` is taken here and kept: a background pull that gave up
+	 * leaves its request queued, and it must not jump ahead of newer edits
+	 * once the hold is gone. (An open that joins such a request in flight
+	 * keeps its place too, behind the ordinary requests only.)
+	 */
+	acquire(docId?: string): Promise<void> {
 		if (this.destroyed) return Promise.resolve();
 		return new Promise((resolve) => {
-			this.queue.push(resolve);
+			this.queue.push({ cls: tokenRequestClass(docId), queuedAt: Date.now(), resolve });
 			if (this.timer === null) this.dispatch();
 		});
 	}
@@ -168,9 +176,11 @@ export class TokenRequestThrottle {
 		this.refill();
 		while (this.queue.length > 0 && this.tokens >= 1) {
 			this.tokens -= 1;
-			const next = this.queue.shift();
+			const first = this.queue.findIndex((waiter) => waiter.cls === "normal");
+			const [next] = this.queue.splice(first === -1 ? 0 : first, 1);
+			recordTokenWait(next.cls, Date.now() - next.queuedAt);
 			this.log(`dispatching token request (queue remaining: ${this.queue.length})`);
-			next?.();
+			next.resolve();
 		}
 		if (this.queue.length === 0) return;
 		const delay = Math.max(0, Math.ceil((1 - this.tokens) * this.intervalMs()));
@@ -187,8 +197,8 @@ export class TokenRequestThrottle {
 			this.timer = null;
 		}
 		// Drain any waiters so they are not leaked
-		for (const resolve of this.queue) {
-			resolve();
+		for (const waiter of this.queue) {
+			waiter.resolve();
 		}
 		this.queue = [];
 	}
@@ -283,7 +293,7 @@ export class RelayOnPremTokenProvider {
 		}
 
 		// Wait for our slot in the throttle queue before hitting the network
-		await this.throttle.acquire();
+		await this.throttle.acquire(docId);
 
 		try {
 			const response = await platformFetch(

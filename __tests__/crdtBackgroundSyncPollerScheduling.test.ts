@@ -43,6 +43,7 @@ import { textFingerprint, type RemoteActivityListener } from "src/docActivity";
 import type { Document } from "src/Document";
 import type { PullControl, PullResult } from "src/TransferQueue";
 import type { VaultShare } from "src/VaultShare";
+import { resetTokenRequestClasses, tokenRequestClass } from "src/auth/tokenRequestClass";
 
 const flushPromises = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
@@ -934,5 +935,28 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		expect(held.map((h) => h.control.signal?.aborted)).toEqual([true, true]);
 		expect(folder.listenerCount()).toBe(0);
 		expect(poller.stats().inflight).toBe(0);
+	});
+
+	test("sweep pulls ask for relay tokens as background, an announced pull does not", async () => {
+		resetTokenRequestClasses();
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("s", 100, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 60_000);
+		poller.start();
+		expect(startedGuids(pull)).toEqual(["s-0", "s-1", "s-2"]);
+		expect(["s-0", "s-1", "s-2"].map(tokenRequestClass)).toEqual(["background", "background", "background"]);
+
+		folder.announce("s-90", textFingerprint("edited"));
+		await flushPromises();
+		expect(startedGuids(pull)[3]).toBe("s-90");
+		expect(tokenRequestClass("s-90")).toBe("normal");
+
+		// A finished sweep pull gives its documents' class back.
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "" });
+		await flushPromises();
+		expect(tokenRequestClass("s-0")).toBe("normal");
+		poller.destroy();
+		expect(poller.stats().tokenWait.backgroundDocs).toBe(0);
 	});
 });
