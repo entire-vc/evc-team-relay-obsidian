@@ -96,6 +96,13 @@ function respondSlowly(status: number, latencyMs: number): Promise<Response> {
 	});
 }
 
+/** The `mode` each token request asked for, in order. */
+function tokenModes(): string[] {
+	return mockFetch.mock.calls
+		.filter(([url]) => String(url).endsWith("/v1/tokens/relay"))
+		.map(([, init]) => (JSON.parse(String((init as RequestInit).body)) as { mode: string }).mode);
+}
+
 function tokenCalls(): number {
 	return mockFetch.mock.calls.filter(([url]) => String(url).endsWith("/v1/tokens/relay")).length;
 }
@@ -108,9 +115,10 @@ async function online(pb: ProviderBacked): Promise<boolean> {
 }
 
 function build() {
+	const clock = new MockClock();
 	const cache = new RelayCredentialCache(
 		{ isAuthenticated: false } as unknown as AuthSession,
-		new MockClock(),
+		clock,
 		"vault",
 		3,
 		new Map([["server-a", new RelayOnPremTokenProvider({ controlPlaneUrl: "https://cp.example.com", authProvider })]]),
@@ -124,7 +132,7 @@ function build() {
 		{ getCurrentUserForServer: () => undefined, on: () => (() => {}) } as unknown as AuthSession,
 		"server-a",
 	);
-	return { cache, pb, docIn: (docGuid: string) => new ProviderBacked(
+	return { cache, clock, pb, docIn: (docGuid: string) => new ProviderBacked(
 		docGuid,
 		new RemoteDocumentAddress("relay-onprem", G, docGuid),
 		cache,
@@ -226,5 +234,61 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 
 		await online(pb);
 		expect(pb.accessDenied).toBe(false);
+	});
+
+	test.each([401, 403])("%i: the renewal sweep backs off too once a granted share is refused", async (status) => {
+		mockFetch.mockImplementation(() => respond(200));
+		const { cache, clock, docIn } = build();
+		const docs = [1, 2, 3, 4, 5, 6, 7].map((n) => `77777777-7777-4777-8777-77777777777${n}`);
+		for (const p of docs.map(docIn)) void p.bringOnline();
+		await jest.advanceTimersByTimeAsync(10_000);
+		const granted = tokenCalls();
+		expect(granted).toBeGreaterThanOrEqual(7);
+
+		// Access is revoked; tokens come up for renewal and the sweep runs every minute.
+		mockFetch.mockImplementation(() => respondSlowly(status, 5_000));
+		maxInFlight = 0;
+		// Off the sweep's minute grid, so a renewal comes up before the token lapses.
+		clock.setTime(clock.now() + 30_000);
+		cache.startSweeping();
+		for (let minute = 0; minute < 10; minute++) {
+			clock.setTime(clock.now() + MINUTE);
+			await jest.advanceTimersByTimeAsync(MINUTE);
+		}
+		cache.stopSweeping();
+
+		// The sweep refreshes up to maxConnections (3 here) at once, so the
+		// refusal can cost that many requests before the share is backed off.
+		expect(tokenCalls() - granted).toBeLessThanOrEqual(3 + 3);
+		expect(docIn(docs[0]).accessDenied).toBe(true);
+	});
+
+	test("a reset asks for write again after a share refused write", async () => {
+		mockFetch.mockImplementation(() => respond(403));
+		const { cache, pb } = build();
+		await online(pb);
+		expect(tokenModes()).toEqual(["write", "read"]);
+
+		mockFetch.mockImplementation(() => respond(200));
+		cache.clearAccessDenied();
+		await online(pb);
+
+		expect(tokenModes().slice(2)).toEqual(["write"]);
+	});
+
+	test("after a reset, a refusal is retried on the new window, not on the old long one", async () => {
+		mockFetch.mockImplementation(() => respond(401));
+		const { cache, pb } = build();
+		void pb.bringOnline();
+		// 2 + 4 + 8 minutes: the next automatic retry is now 16 minutes out.
+		await jest.advanceTimersByTimeAsync(15 * MINUTE);
+		const before = tokenCalls();
+
+		cache.clearAccessDenied();
+		await online(pb);
+		expect(tokenCalls()).toBe(before + 1);
+		// The share is refused again on a fresh window: 2 minutes, not 16.
+		await jest.advanceTimersByTimeAsync(3 * MINUTE);
+		expect(tokenCalls()).toBe(before + 2);
 	});
 });

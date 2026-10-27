@@ -402,6 +402,9 @@ export class ProviderBacked extends Loggable {
 			// A refused share (401/403) is not retried on the reconnect floor:
 			// wait out its backoff, which RelayCredentialCache keeps per share.
 			const retryAt = e instanceof RelayAccessDeniedError ? e.retryAt : undefined;
+			// A retry that was already waiting may belong to a window a reset
+			// has since cleared; the window this refusal returned decides.
+			if (retryAt !== undefined) this.reconnectGate.cancel();
 			const floor = Math.max(this._liveProvider.maxBackoffTime, (retryAt ?? 0) - Date.now());
 			this.reconnectGate.schedule(floor, () => {
 				void this.bringOnline();
