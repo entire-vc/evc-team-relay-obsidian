@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.25
+- Fixed: during a large import, a change from another device that the server was slow to hand over no longer sits unseen for up to forty seconds. The plugin now asks the server again after a few seconds.
+
 ## 0.1.24
 - Fixed: an edit to a closed note made while the note was briefly syncing in the background no longer waits up to a minute and a half to reach other devices. It is now sent right away.
 
