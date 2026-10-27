@@ -115,6 +115,8 @@ export class ProviderBacked extends Loggable {
 	crdtDoc: Y.Doc;
 	issuedToken: DocumentGrant;
 	_providerSynced: boolean = false;
+	/** How long the latest bringOnline() waited for its token (relay probe). */
+	lastTokenMs?: number;
 	private stateListeners: Map<unknown, Listener> = new Map();
 	private reconnectGate = new ReconnectGate();
 	private detachConnectionError: () => void;
@@ -373,8 +375,10 @@ export class ProviderBacked extends Loggable {
 		if (this.isOnline) {
 			return true;
 		}
+		const tokenFrom = Date.now();
 		try {
 			const clientToken = await this.requestProviderToken();
+			this.lastTokenMs = Date.now() - tokenFrom;
 			this.applyRefreshedToken(clientToken); // re-check: token may already be current at this point
 			this._liveProvider.connect();
 			this.broadcastState();
