@@ -257,9 +257,10 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		}
 		cache.stopSweeping();
 
-		// The sweep refreshes up to maxConnections (3 here) at once, so the
-		// refusal can cost that many requests before the share is backed off.
-		expect(tokenCalls() - granted).toBeLessThanOrEqual(3 + 3);
+		// The sweep refreshes up to maxConnections (3 here) at once; renewals
+		// of one share still ask one at a time.
+		expect(tokenCalls() - granted).toBeLessThanOrEqual(4);
+		expect(maxInFlight).toBe(1);
 		expect(docIn(docs[0]).accessDenied).toBe(true);
 	});
 

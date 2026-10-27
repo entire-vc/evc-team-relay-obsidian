@@ -185,8 +185,13 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		// per document reconnecting at once. The price is that a working
 		// share's first token of the session is awaited before its other
 		// documents ask; after that first grant they ask concurrently again.
+		// Renewals of tokens a document already holds always ask one at a
+		// time: nothing waits on them, and a share refused mid-session must
+		// not cost one request per renewal running at once.
+		const renewing = !!this.tokenEntries?.get(documentId)?.token;
+		const serialized = () => renewing || !this.grantedShares.has(shareId);
 		for (;;) {
-			const probe = this.grantedShares.has(shareId) ? undefined : this.shareProbes.get(shareId);
+			const probe = serialized() ? this.shareProbes.get(shareId) : undefined;
 			if (!probe) break;
 			await probe;
 		}
@@ -201,7 +206,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		}
 		let settle: (() => void) | undefined;
 		let probe: Promise<void> | undefined;
-		if (!this.grantedShares.has(shareId)) {
+		if (serialized()) {
 			probe = new Promise<void>((resolve) => (settle = resolve));
 			this.shareProbes.set(shareId, probe);
 		}
