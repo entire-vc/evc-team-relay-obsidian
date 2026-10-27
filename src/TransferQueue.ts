@@ -179,6 +179,15 @@ export interface RelayProbeSample {
 	connectMs: number;
 	syncMs: number;
 	ok: boolean;
+	/** Where the connect spent its time, in ms from `at`. */
+	phases?: {
+		tokenMs?: number;
+		connectCallMs?: number;
+		socketMs?: number;
+		openMs?: number;
+		skipped?: string;
+		failedSockets: number;
+	};
 }
 
 export interface PullResult {
@@ -1385,6 +1394,8 @@ export class TransferQueue extends Loggable {
 	async probeRelay(doc: Document): Promise<RelayProbeSample | undefined> {
 		if (doc.connectionIntent !== "disconnected") return undefined;
 		const at = this.clock.now();
+		// Socket timings are wall-clock (YSweetProvider.connectTrace).
+		const wallAt = Date.now();
 		const online = doc.bringOnline().then((ok) => (ok ? doc.onceOnline().then(() => true) : false));
 		let connected = false;
 		try {
@@ -1393,7 +1404,13 @@ export class TransferQueue extends Loggable {
 			const synced =
 				connected &&
 				(await this.raceTimeout(doc.onceFreshlySynced().then(() => true), PROBE_PHASE_TIMEOUT_MS)) === true;
-			return { at, connectMs: connectedAt - at, syncMs: this.clock.now() - connectedAt, ok: synced };
+			return {
+				at,
+				connectMs: connectedAt - at,
+				syncMs: this.clock.now() - connectedAt,
+				ok: synced,
+				phases: this.connectPhases(doc, wallAt),
+			};
 		} finally {
 			// releasePulledDoc() leaves a document opened in the editor meanwhile (editLock) connected.
 			const release = () => this.releasePulledDoc(doc, "disconnected");
@@ -1401,6 +1418,22 @@ export class TransferQueue extends Loggable {
 			// A connect that lands after the timeout must not stay open.
 			if (!connected) void online.then(release, () => undefined);
 		}
+	}
+
+	private connectPhases(doc: Document, startedAt: number): RelayProbeSample["phases"] {
+		const trace = doc._liveProvider?.connectTrace;
+		if (!trace) return undefined;
+		const since = (t?: number) => (t === undefined || t < startedAt ? undefined : t - startedAt);
+		// connect() was not called in this probe (the token request failed): the rest is an older attempt's.
+		if (trace.calledAt < startedAt) return { tokenMs: doc.lastTokenMs, failedSockets: 0 };
+		return {
+			tokenMs: doc.lastTokenMs,
+			connectCallMs: since(trace.calledAt),
+			socketMs: since(trace.socketAt),
+			openMs: since(trace.openAt),
+			skipped: trace.skipped,
+			failedSockets: trace.failedSockets,
+		};
 	}
 
 	/**

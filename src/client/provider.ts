@@ -198,10 +198,18 @@ const encodeAwarenessOf = (
  * is the single place a connection is born.
  */
 const setupWS = (provider: YSweetProvider): void => {
-	if (!provider.shouldConnect || provider.ws !== null) return;
-	if (!provider.beforeConnect()) return;
+	if (!provider.shouldConnect || provider.ws !== null) {
+		provider.connectTrace.skipped = provider.shouldConnect ? "socket-present" : "not-wanted";
+		return;
+	}
+	if (!provider.beforeConnect()) {
+		provider.connectTrace.skipped = "before-connect";
+		return;
+	}
 
 	const websocket = new provider._WS(provider.url);
+	provider.connectTrace.socketAt = Date.now();
+	provider.connectTrace.skipped = undefined;
 	websocket.binaryType = "arraybuffer";
 	provider.ws = websocket;
 	provider.wsconnecting = true;
@@ -251,6 +259,7 @@ const setupWS = (provider: YSweetProvider): void => {
 			]);
 		} else {
 			provider.wsUnsuccessfulReconnects++;
+			provider.connectTrace.failedSockets++;
 		}
 
 		if (!provider.canReconnect()) return;
@@ -264,6 +273,7 @@ const setupWS = (provider: YSweetProvider): void => {
 	};
 
 	websocket.onopen = () => {
+		provider.connectTrace.openAt = Date.now();
 		provider.wsLastMessageReceived = time.getUnixTime();
 		provider.wsconnecting = false;
 		provider.wsconnected = true;
@@ -322,6 +332,22 @@ export type YSweetProviderEvents = {
 	"connection-close": (event: CloseEvent, provider: YSweetProvider) => void;
 };
 
+/**
+ * Wall-clock timings of the latest connect() call, for the relay probe: a
+ * connect measured at 16s under load whose upgrade request reached the relay
+ * just as late could have waited anywhere before the socket opened.
+ */
+export interface ConnectTrace {
+	calledAt: number;
+	/** Why no socket was opened at that call (a later retry may open one). */
+	skipped?: "socket-present" | "not-wanted" | "before-connect";
+	/** The latest socket created since the call. */
+	socketAt?: number;
+	openAt?: number;
+	/** Sockets that closed before opening since the call. */
+	failedSockets: number;
+}
+
 export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 	maxBackoffTime: number;
 	bcChannel: string;
@@ -342,6 +368,8 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 	 * be swapped out while a send is in flight.
 	 */
 	ws: WebSocket | null = null;
+	/** Timings of the latest connect() (see ConnectTrace). */
+	connectTrace: ConnectTrace = { calledAt: 0, failedSockets: 0 };
 	wsLastMessageReceived = 0;
 	shouldConnect: boolean;
 	maxConnectionErrors: number;
@@ -504,8 +532,13 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 	connect(): void {
 		this.shouldConnect = true;
 		if (!this.wsconnected && this.ws === null) {
+			this.connectTrace = { calledAt: Date.now(), failedSockets: 0 };
 			setupWS(this);
 			this.connectBc();
+		} else if (!this.wsconnected) {
+			// Keep the in-flight socket's times and failures: they explain the wait.
+			this.connectTrace.calledAt = Date.now();
+			this.connectTrace.skipped = "socket-present";
 		}
 	}
 

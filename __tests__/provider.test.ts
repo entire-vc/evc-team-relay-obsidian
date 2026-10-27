@@ -200,4 +200,73 @@ describe("YSweetProvider reconnect", () => {
 		jest.advanceTimersByTime(10000);
 		expect(MockWebSocket.instances.length).toBe(countAtCap);
 	});
+
+	test("connectTrace records when the socket was created and opened, and failed attempts", () => {
+		const doc = new Y.Doc();
+		provider = new YSweetProvider("ws://relay.example.com", "room", doc, {
+			WebSocketPolyfill: MockWebSocket as unknown as typeof WebSocket,
+			maxBackoffTime: 1000,
+			disableBc: true,
+			connect: false,
+		});
+		const t0 = Date.now();
+		provider.connect();
+		expect(provider.connectTrace.calledAt).toBeGreaterThanOrEqual(t0);
+		expect(provider.connectTrace.socketAt).toBeGreaterThanOrEqual(t0);
+		latestSocket().failToConnect();
+		jest.advanceTimersByTime(5000);
+		latestSocket().succeed();
+		expect(provider.connectTrace.failedSockets).toBe(1);
+		expect(provider.connectTrace.openAt).toBeGreaterThanOrEqual(t0 + 5000);
+		expect(provider.connectTrace.skipped).toBeUndefined();
+	});
+
+	test("connectTrace names a connect() that opened nothing because the old socket was still there", () => {
+		const doc = new Y.Doc();
+		provider = new YSweetProvider("ws://relay.example.com", "room", doc, {
+			WebSocketPolyfill: MockWebSocket as unknown as typeof WebSocket,
+			disableBc: true,
+			connect: false,
+		});
+		provider.connect();
+		const sockets = MockWebSocket.instances.length;
+		provider.connect();
+		expect(MockWebSocket.instances.length).toBe(sockets);
+		expect(provider.connectTrace.skipped).toBe("socket-present");
+	});
+
+	test("connectTrace keeps the in-flight socket's failures when connect() finds it still connecting", () => {
+		const doc = new Y.Doc();
+		provider = new YSweetProvider("ws://relay.example.com", "room", doc, {
+			WebSocketPolyfill: MockWebSocket as unknown as typeof WebSocket,
+			maxBackoffTime: 1000,
+			disableBc: true,
+			connect: false,
+		});
+		provider.connect();
+		latestSocket().failToConnect();
+		jest.advanceTimersByTime(1000);
+		provider.connect();
+		expect(provider.connectTrace.skipped).toBe("socket-present");
+		expect(provider.connectTrace.failedSockets).toBe(1);
+		expect(provider.connectTrace.socketAt).toBeDefined();
+	});
+
+	test("connectTrace clears a skip once a retry opens a socket", () => {
+		const doc = new Y.Doc();
+		provider = new YSweetProvider("ws://relay.example.com", "room", doc, {
+			WebSocketPolyfill: MockWebSocket as unknown as typeof WebSocket,
+			maxBackoffTime: 1000,
+			disableBc: true,
+			connect: false,
+		});
+		provider.connect();
+		provider.connect();
+		expect(provider.connectTrace.skipped).toBe("socket-present");
+		latestSocket().failToConnect();
+		jest.advanceTimersByTime(1000);
+		expect(provider.connectTrace.skipped).toBeUndefined();
+		latestSocket().succeed();
+		expect(provider.connectTrace.openAt).toBeDefined();
+	});
 });
