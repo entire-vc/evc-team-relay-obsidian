@@ -67,6 +67,7 @@ function makeFakeDoc(opts: FakeDocOptions) {
 		},
 	});
 	Object.defineProperty(fakeDoc, "onceEverSynced", { value: async () => {} });
+	Object.defineProperty(fakeDoc, "onceFreshlySynced", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "connected" });
 	Object.defineProperty(fakeDoc, "bringOnline", { value: async () => true });
 	Object.defineProperty(fakeDoc, "_liveProvider", { value: { ws: null } });

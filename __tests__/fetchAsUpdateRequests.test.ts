@@ -53,6 +53,7 @@ function makeRelayLinkedDoc<T extends Document | CanvasDocument>(proto: object, 
 	Object.defineProperty(doc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(doc, "bringOnline", { value: async () => true });
 	Object.defineProperty(doc, "onceEverSynced", { value: async () => {} });
+	Object.defineProperty(doc, "onceFreshlySynced", { value: async () => {} });
 	Object.defineProperty(doc, "goOffline", { value: () => {} });
 	Object.defineProperty(doc, "getSyncBase", { value: async () => undefined });
 	Object.defineProperty(doc, "setSyncBase", { value: async () => {} });
