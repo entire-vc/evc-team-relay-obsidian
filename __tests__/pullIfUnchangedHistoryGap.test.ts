@@ -22,6 +22,7 @@ import * as Y from "yjs";
 import type { Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
+import { hasHistoryGap } from "../src/preserveBeforeTrash";
 
 /** Fires every timer on the next macrotask; `now()` only moves when a test moves it. */
 class InstantClock implements Clock {
@@ -408,6 +409,290 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(state.vault).toBe("local edit\n");
+	});
+});
+
+/** Clocks the user entry below takes. */
+const SEED_SIZE = 4;
+
+/** The user entry `PermanentUserData.setUserMapping` writes first in a fresh doc; returns its `ids` list. */
+function seedIdentity(doc: Y.Doc): Y.Array<number> {
+	const user = new Y.Map<unknown>();
+	user.set("ids", new Y.Array<number>());
+	user.set("ds", new Y.Array<Uint8Array>());
+	doc.getMap("users").set("ghost-account", user);
+	const ids = user.get("ids") as Y.Array<number>;
+	ids.push([doc.clientID]);
+	return ids;
+}
+
+/**
+ * A presence entry (the `users` map that `Y.PermanentUserData` keeps) whose
+ * first clocks never reached anyone: the later pushes into its `ids`/`ds`
+ * lists wait for them forever, while the text's history is complete.
+ */
+function presenceOnlyGap(opts: { deletePushed?: boolean } = {}): Uint8Array {
+	const ghost = new Y.Doc();
+	const ids = seedIdentity(ghost);
+	const seeded = Y.encodeStateVector(ghost);
+	ids.push([ghost.clientID + 1, ghost.clientID + 2]);
+	((ghost.getMap("users").get("ghost-account") as Y.Map<unknown>).get("ds") as Y.Array<Uint8Array>).push([
+		new Uint8Array([0, 1, 2]),
+	]);
+	if (opts.deletePushed) ids.delete(2, 1);
+	return Y.encodeStateAsUpdate(ghost, seeded);
+}
+
+/** A peer's complete doc with `text`, plus the presence entries nobody can integrate. */
+function docWithPresenceGap(text = FULL_TEXT, opts: { deletePushed?: boolean } = {}) {
+	const peer = new Y.Doc();
+	peer.getText("contents").insert(0, text);
+	const crdtDoc = new Y.Doc();
+	Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+	Y.applyUpdate(crdtDoc, presenceOnlyGap(opts));
+	return { crdtDoc, peer };
+}
+
+describe("a gap only in the presence map does not hold the text back", () => {
+	test("the presence entries stay pending while the text is complete", () => {
+		const { crdtDoc } = docWithPresenceGap(FULL_TEXT, { deletePushed: true });
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(crdtDoc.store.pendingDs).not.toBeNull();
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(false);
+	});
+
+	test.each([
+		["pending structs", {}],
+		["pending structs and deletes", { deletePushed: true }],
+	])("REGRESSION: a peer's edit to a closed note reaches disk (%s in users)", async (_label, opts) => {
+		const { crdtDoc, peer } = docWithPresenceGap(FULL_TEXT, opts);
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		// The peer edits the note while it is closed here; the pull's sync brings the edit.
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		fakeDoc.onceFreshlySynced = async () => Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+
+		const result = await makeQueue().pullIfUnchanged(fakeDoc);
+
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(result.outcome).toBe("flushed");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "PEER LINE\n" + FULL_TEXT);
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("PEER LINE\n" + FULL_TEXT);
+		expect(state.syncBase).toBe("PEER LINE\n" + FULL_TEXT);
+	});
+
+	test("upload reconciles a local file edit into a doc whose gap is only in users, as without a gap", async () => {
+		const local = FULL_TEXT + "LOCAL LINE\n";
+		const runUpload = async (crdtDoc: Y.Doc) => {
+			const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, local, FULL_TEXT);
+			await makeQueue().uploadDocumentViaSocket(fakeDoc);
+			return {
+				text: crdtDoc.getText("contents").toString(),
+				conflictCopies: writeConflictCopy.mock.calls.length,
+				syncBase: state.syncBase,
+			};
+		};
+		const gapFree = new Y.Doc();
+		gapFree.getText("contents").insert(0, FULL_TEXT);
+
+		const withPresenceGap = await runUpload(docWithPresenceGap().crdtDoc);
+
+		expect(withPresenceGap).toEqual(await runUpload(gapFree));
+		// Reconciled: the file's text reached the CRDT and is the recorded base.
+		expect(withPresenceGap.text).toContain("LOCAL LINE\n");
+		expect(withPresenceGap.syncBase).toBe(withPresenceGap.text);
+	});
+
+	test("the presence fixture has the layout PermanentUserData writes", () => {
+		const shape = (update: Uint8Array) =>
+			Y.decodeUpdate(update).structs.map((s) => {
+				const item = s as Y.Item;
+				const parent = item.parent as unknown;
+				return [
+					item.id.clock,
+					item.content.constructor.name,
+					parent instanceof Y.ID ? parent.clock : parent,
+					item.origin?.clock ?? null,
+					item.parentSub,
+				];
+			});
+		const real = new Y.Doc();
+		new Y.PermanentUserData(real).setUserMapping(real, real.clientID, "ghost-account");
+		const fixture = new Y.Doc();
+		seedIdentity(fixture);
+
+		expect(shape(Y.encodeStateAsUpdate(fixture))).toEqual(shape(Y.encodeStateAsUpdate(real)));
+	});
+
+	test("pending text from the same writer after its presence entry is still a gap", () => {
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		const seeded = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 1]);
+		ghost.getText("contents").insert(0, "GHOST TEXT\n");
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+});
+
+/** A missing range that is not a writer's identity seed may hold text: the text is not known complete. */
+describe("missing clocks outside an identity seed are a gap", () => {
+	/** `update` delivered on its own to a doc holding nothing else. */
+	const deliverOnly = (update: Uint8Array) => {
+		const doc = new Y.Doc();
+		Y.applyUpdate(doc, update);
+		return doc;
+	};
+
+	test("REGRESSION: a pending delete whose earlier clocks hold text", () => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "AB");
+		const before = Y.encodeStateVector(writer);
+		writer.getText("contents").delete(1, 1);
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, before));
+
+		expect(doc.store.pendingStructs).toBeNull();
+		expect(doc.store.pendingDs).not.toBeNull();
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("REGRESSION: a pending deleted change whose earlier clocks hold text", () => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "A");
+		const before = Y.encodeStateVector(writer);
+		writer.getText("contents").insert(1, "B");
+		writer.getText("contents").delete(1, 1);
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, before));
+
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("REGRESSION: a presence entry pending behind missing text", () => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "MISSING TEXT");
+		const before = Y.encodeStateVector(writer);
+		writer.getMap("users").set("account", new Uint8Array([1]));
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, before));
+
+		expect(doc.store.pendingStructs).not.toBeNull();
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("a seed-sized prefix of text before a presence entry is a gap", () => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "ABCD");
+		const before = Y.encodeStateVector(writer);
+		writer.getMap("users").set("account", new Uint8Array([1]));
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, before));
+
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("a delete of a seed clock is a gap", () => {
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		const seeded = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 1]);
+		ids.delete(0, 1);
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+
+	test("a seed-gap writer's change inside another writer's missing type is a gap", () => {
+		const other = new Y.Doc();
+		other.getText("contents").insert(0, "MISSING TEXT");
+		other.getMap("users").set("other-account", new Y.Array<Uint8Array>());
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		Y.applyUpdate(ghost, Y.encodeStateAsUpdate(other));
+		const before = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 1]);
+		((ghost.getMap("users").get("ghost-account") as Y.Map<unknown>).get("ds") as Y.Array<Uint8Array>).push([
+			new Uint8Array([0]),
+		]);
+		(ghost.getMap("users").get("other-account") as Y.Array<Uint8Array>).push([new Uint8Array([1])]);
+		const doc = deliverOnly(Y.encodeStateAsUpdate(ghost, before));
+
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test.each([1, 2, 3])("an identity seed written after a %i-character edit is a gap", (chars) => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "ABC".slice(0, chars));
+		// The seed's last clocks are all the relay ever got.
+		seedIdentity(writer);
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, Y.encodeStateVector(new Map([[writer.clientID, SEED_SIZE]]))));
+
+		expect(doc.store.pendingStructs?.missing).toEqual(new Map([[writer.clientID, SEED_SIZE - 1]]));
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("REGRESSION: a seed written after deleting the last of five characters is a gap", () => {
+		const writer = new Y.Doc();
+		const text = writer.getText("contents");
+		text.insert(0, "ABCDE");
+		text.delete(4, 1);
+		new Y.PermanentUserData(writer).setUserMapping(writer, writer.clientID, "late-account");
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, Y.encodeStateVector(new Map([[writer.clientID, SEED_SIZE]]))));
+
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("REGRESSION: mapping an account a peer already seeded, after a text edit, is a gap", () => {
+		const map = (doc: Y.Doc) => new Y.PermanentUserData(doc).setUserMapping(doc, doc.clientID, "same-account");
+		const peer = new Y.Doc();
+		map(peer);
+		const writer = new Y.Doc();
+		Y.applyUpdate(writer, Y.encodeStateAsUpdate(peer));
+		writer.getText("contents").insert(0, "ABC");
+		map(writer);
+		const before = Y.encodeStateVector(writer);
+		map(writer);
+		const doc = new Y.Doc();
+		Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(doc, Y.encodeStateAsUpdate(writer, before));
+
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("presence pushes into ids alone do not prove a seed: a gap", () => {
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		const seeded = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 1]);
+		ids.push([ghost.clientID + 2]);
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+
+	test("a hole after the seed is a gap", () => {
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		ids.push([ghost.clientID + 1]);
+		const middle = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 2]);
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, middle));
+
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
 	});
 });
 
