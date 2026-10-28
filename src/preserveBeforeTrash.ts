@@ -20,7 +20,7 @@
  * applies to canvas content for exactly this reason.
  */
 
-import type * as Y from "yjs";
+import * as Y from "yjs";
 import { sameTextContent } from "./textEquivalence";
 import type { CanvasData } from "./HostCanvasView";
 import { deepValueEquals } from "./deepValueEquals";
@@ -56,11 +56,102 @@ export function findByPath<T extends PathHolder>(
 }
 
 /**
- * Whether `doc` holds updates it cannot integrate yet: its local history is
- * missing earlier changes, so what it shows is not what was last synced.
+ * Whether `doc`'s text holds back updates it cannot integrate yet: its local
+ * history is missing earlier changes, so the text it shows is not what was
+ * last synced.
+ *
+ * Only pending changes that may belong to `textName` count. A writer whose
+ * first changes reached nobody leaves its later presence entries (the `users`
+ * map kept by `Y.PermanentUserData`) pending on every client for good; that
+ * gap never closes and never alters the text, so it must not hold the text
+ * back. A pending change counts unless it is shown to belong elsewhere: its
+ * parent chain resolves to another root, or its content is a kind a text
+ * never holds (this plugin's text holds no embedded types).
+ *
+ * Deleted changes do not count either: a pending deleted change (and
+ * `pendingDs`, which deletes changes this doc does not have yet) is not in
+ * the text now and arrives deleted, so the text already reads as it will
+ * once it arrives.
  */
-export function hasHistoryGap(doc: Y.Doc): boolean {
-	return doc.store.pendingStructs !== null || doc.store.pendingDs !== null;
+export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
+	const pending = doc.store.pendingStructs;
+	if (pending === null) return false;
+	const structs = Y.decodeUpdateV2(pending.update).structs;
+	const byClient = new Map<number, (Y.Item | Y.GC)[]>();
+	for (const struct of structs) {
+		if (struct instanceof Y.Skip) continue;
+		const list = byClient.get(struct.id.client) ?? [];
+		list.push(struct);
+		byClient.set(struct.id.client, list);
+	}
+	const findPending = (id: Y.ID): Y.Item | Y.GC | undefined =>
+		byClient
+			.get(id.client)
+			?.find((s) => s.id.clock <= id.clock && id.clock < s.id.clock + s.length);
+
+	const rootOfType = (type: Y.AbstractType<unknown>): string | undefined => {
+		let current = type;
+		while (current._item !== null) {
+			const parent = current._item.parent;
+			if (!(parent instanceof Y.AbstractType)) return undefined;
+			current = parent;
+		}
+		try {
+			return Y.findRootTypeKey(current);
+		} catch {
+			return undefined;
+		}
+	};
+
+	// Root name a pending struct belongs to, or undefined when it cannot be told.
+	const resolved = new Map<Y.Item | Y.GC, string | undefined>();
+	const rootOfId = (id: Y.ID, parentOf: boolean): string | undefined => {
+		if (id.clock < Y.getState(doc.store, id.client)) {
+			const item = Y.getItem(doc.store, id);
+			if (!(item instanceof Y.Item)) return undefined;
+			if (parentOf) {
+				return item.content instanceof Y.ContentType ? rootOfType(item.content.type) : undefined;
+			}
+			return item.parent instanceof Y.AbstractType ? rootOfType(item.parent) : undefined;
+		}
+		const struct = findPending(id);
+		if (struct === undefined) return undefined;
+		// A nested type's children name its root; anything else names nothing.
+		if (parentOf && !(struct instanceof Y.Item && struct.content instanceof Y.ContentType)) return undefined;
+		return rootOf(struct);
+	};
+	const rootOf = (struct: Y.Item | Y.GC): string | undefined => {
+		if (resolved.has(struct)) return resolved.get(struct);
+		resolved.set(struct, undefined); // cycle guard
+		let root: string | undefined;
+		if (struct instanceof Y.Item) {
+			const parent = struct.parent as unknown;
+			if (typeof parent === "string") root = parent;
+			else if (parent instanceof Y.ID) root = rootOfId(parent, true);
+			else {
+				const sibling = struct.origin ?? struct.rightOrigin;
+				if (sibling) root = rootOfId(sibling, false);
+			}
+		}
+		resolved.set(struct, root);
+		return root;
+	};
+
+	for (const list of byClient.values()) {
+		for (const struct of list) {
+			if (struct instanceof Y.GC || struct.content instanceof Y.ContentDeleted) continue;
+			const root = rootOf(struct);
+			if (root !== undefined && root !== textName) continue;
+			if (root === undefined && struct instanceof Y.Item && neverInText(struct.content)) continue;
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Content kinds a Y.Text never holds: list and map values. */
+function neverInText(content: Y.Item["content"]): boolean {
+	return content instanceof Y.ContentAny || content instanceof Y.ContentBinary || content instanceof Y.ContentJSON;
 }
 
 /**

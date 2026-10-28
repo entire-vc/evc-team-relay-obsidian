@@ -22,6 +22,7 @@ import * as Y from "yjs";
 import type { Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
+import { hasHistoryGap } from "../src/preserveBeforeTrash";
 
 /** Fires every timer on the next macrotask; `now()` only moves when a test moves it. */
 class InstantClock implements Clock {
@@ -395,5 +396,112 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(state.vault).toBe("local edit\n");
+	});
+});
+
+/**
+ * A presence entry (the `users` map that `Y.PermanentUserData` keeps) whose
+ * first clocks never reached anyone: the later pushes into its `ids`/`ds`
+ * lists wait for them forever, while the text's history is complete.
+ */
+function presenceOnlyGap(opts: { deletePushed?: boolean } = {}): Uint8Array {
+	const ghost = new Y.Doc();
+	const user = new Y.Map<unknown>();
+	user.set("ids", new Y.Array<number>());
+	user.set("ds", new Y.Array<Uint8Array>());
+	ghost.getMap("users").set("ghost-account", user);
+	const ids = user.get("ids") as Y.Array<number>;
+	ids.push([ghost.clientID]);
+	const seeded = Y.encodeStateVector(ghost);
+	ids.push([ghost.clientID + 1]);
+	(user.get("ds") as Y.Array<Uint8Array>).push([new Uint8Array([0, 1, 2])]);
+	if (opts.deletePushed) ids.delete(1, 1);
+	return Y.encodeStateAsUpdate(ghost, seeded);
+}
+
+/** A peer's complete doc with `text`, plus the presence entries nobody can integrate. */
+function docWithPresenceGap(text = FULL_TEXT, opts: { deletePushed?: boolean } = {}) {
+	const peer = new Y.Doc();
+	peer.getText("contents").insert(0, text);
+	const crdtDoc = new Y.Doc();
+	Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+	Y.applyUpdate(crdtDoc, presenceOnlyGap(opts));
+	return { crdtDoc, peer };
+}
+
+describe("a gap only in the presence map does not hold the text back", () => {
+	test("the presence entries stay pending while the text is complete", () => {
+		const { crdtDoc } = docWithPresenceGap(FULL_TEXT, { deletePushed: true });
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(crdtDoc.store.pendingDs).not.toBeNull();
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(false);
+	});
+
+	test.each([
+		["pending structs", {}],
+		["pending structs and deletes", { deletePushed: true }],
+	])("REGRESSION: a peer's edit to a closed note reaches disk (%s in users)", async (_label, opts) => {
+		const { crdtDoc, peer } = docWithPresenceGap(FULL_TEXT, opts);
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		// The peer edits the note while it is closed here; the pull's sync brings the edit.
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		fakeDoc.onceFreshlySynced = async () => Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+
+		const result = await makeQueue().pullIfUnchanged(fakeDoc);
+
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(result.outcome).toBe("flushed");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "PEER LINE\n" + FULL_TEXT);
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("PEER LINE\n" + FULL_TEXT);
+		expect(state.syncBase).toBe("PEER LINE\n" + FULL_TEXT);
+	});
+
+	test("upload reconciles a local file edit into a doc whose gap is only in users, as without a gap", async () => {
+		const local = FULL_TEXT + "LOCAL LINE\n";
+		const runUpload = async (crdtDoc: Y.Doc) => {
+			const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, local, FULL_TEXT);
+			await makeQueue().uploadDocumentViaSocket(fakeDoc);
+			return {
+				text: crdtDoc.getText("contents").toString(),
+				conflictCopies: writeConflictCopy.mock.calls.length,
+				syncBase: state.syncBase,
+			};
+		};
+		const gapFree = new Y.Doc();
+		gapFree.getText("contents").insert(0, FULL_TEXT);
+
+		const withPresenceGap = await runUpload(docWithPresenceGap().crdtDoc);
+
+		expect(withPresenceGap).toEqual(await runUpload(gapFree));
+		// Reconciled: the file's text reached the CRDT and is the recorded base.
+		expect(withPresenceGap.text).toContain("LOCAL LINE\n");
+		expect(withPresenceGap.syncBase).toBe(withPresenceGap.text);
+	});
+
+	test("a new presence entry pending behind the writer's lost clocks is not a gap", () => {
+		const ghost = new Y.Doc();
+		ghost.getMap("users").set("ghost-account", "seeded, never sent");
+		const seeded = Y.encodeStateVector(ghost);
+		ghost.getMap("users").set("second-account", new Y.Map<unknown>());
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(hasHistoryGap(crdtDoc)).toBe(false);
+	});
+
+	test("pending text from the same writer after its presence entry is still a gap", () => {
+		const ghost = new Y.Doc();
+		ghost.getMap("users").set("ghost-account", "seeded, never sent");
+		const seeded = Y.encodeStateVector(ghost);
+		ghost.getMap("users").set("other", new Uint8Array([1]));
+		ghost.getText("contents").insert(0, "GHOST TEXT\n");
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
 	});
 });
