@@ -1,7 +1,10 @@
 # Changelog
 
 ## 0.1.30
-- Fixed: after both devices restarted, a closed note could become empty on the device that created it, while the other device still had the full text. The plugin no longer writes a note to disk while part of its history is still missing.
+- Fixed: after both devices restarted, a closed note could become empty on the device that created it, while the other device still had the full text. The plugin now waits for missing text history before writing the note to disk; missing presence records no longer hold up text updates.
+- Fixed: a closed note could keep stale text after downloading an update even when it had no local edits. The downloaded text is now written to disk.
+- Fixed: text created on a device but never received by the server could remain unsent after a restart. The plugin now uploads the author's text while preserving notes deliberately cleared on another device.
+- Fixed: an older background download that was cancelled could close a newer download's connection and delay the update. Each download now closes only its own connection.
 - Fixed: a note deleted on one device could come back on every device, as a new note, after the other device restarted offline and then came back online. A shared folder now reads its stored records before it connects.
 - Fixed: a note edited while this device was offline could stay out of date for a minute or more after reconnecting. Changes announced during the offline period are now fetched as soon as the connection returns.
 - Fixed: when the server refuses access to a share, background token renewal no longer retries it every minute; it follows the same backoff as other requests. Shared folders removed from the vault are no longer checked for changes.
