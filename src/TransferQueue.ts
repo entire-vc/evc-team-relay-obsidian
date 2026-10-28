@@ -26,6 +26,7 @@ import {
 	wonInitClaim,
 	markInitDone,
 	awaitClaimSettled,
+	neverHeldText,
 } from "./initContentClaim";
 import { claimReconcile, wonReconcileClaim, awaitReconcileSettled } from "./reconcileClaim";
 import { holdBackgroundTokens } from "./auth/tokenRequestClass";
@@ -219,6 +220,7 @@ export interface PullResult {
 		| "unchanged"
 		| "kept-local"
 		| "no-base"
+		| "seed-local"
 		| "history-gap"
 		| "not-synced"
 		| "connect-failed"
@@ -1430,6 +1432,26 @@ export class TransferQueue extends Loggable {
 					return { outcome: "unchanged", remoteText };
 				}
 				await doc.vaultShare.ensureParentDir(doc.entryPath);
+			}
+			if (
+				syncBase === undefined &&
+				remoteText === "" &&
+				hasPreservableContent(vaultContentsAfter) &&
+				neverHeldText(doc.crdtDoc, doc.crdtDoc.getText("contents"))
+			) {
+				// The note reached the relay as an entry, its text never did:
+				// not one item, so no peer wrote or cleared it, and the file is
+				// the only copy of the text. A restart re-queues an upload only
+				// for a note the relay never acknowledged, so without this the
+				// text stayed on its author's disk and every other client kept
+				// the note empty (0.1.7 author, 58 chars, still missing on
+				// 0.1.30). The upload seeds it under the init claim.
+				this.log(`[pullIfUnchanged] relay never held text for ${doc.entryPath}; uploading the file`);
+				this.releasePulledDoc(doc, intent);
+				void this.enqueueUpload(doc, { priority: true }).catch((err: unknown) => {
+					this.warn("[pullIfUnchanged] queueing upload of the unseeded file failed", doc.entryPath, err);
+				});
+				return { outcome: "seed-local", remoteText };
 			}
 			if (syncBase === undefined && !missingOnDisk) {
 				// Never round-tripped through a successful upload cycle for

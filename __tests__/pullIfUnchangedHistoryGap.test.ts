@@ -397,3 +397,123 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		expect(state.vault).toBe("local edit\n");
 	});
 });
+
+/**
+ * The author's note reached the relay as a file entry only: its text never
+ * made it into the CRDT, on the author or on the relay. A restart re-queues
+ * an upload only for a note the relay never acknowledged, so the background
+ * pull is the one pass that still looks at it, and without a base it left
+ * the file alone. Every other client kept the note empty.
+ */
+describe("pullIfUnchanged — an author's text that never reached the relay is uploaded", () => {
+	const AUTHOR_TEXT = "TR acceptance entire-018-2014\nUnicode: café, заметка, 日本語\n";
+
+	/** The author's doc as stored: presence only, no text item ever, no init claim. */
+	function docWithoutText(): Y.Doc {
+		const doc = new Y.Doc();
+		doc.getMap("users").set("author", "presence");
+		return doc;
+	}
+
+	/** Mirrors every local update into a relay-side doc, like the provider would. */
+	function relayOf(crdtDoc: Y.Doc): Y.Doc {
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(crdtDoc));
+		crdtDoc.on("update", (update: Uint8Array) => Y.applyUpdate(relay, update));
+		return relay;
+	}
+
+	function queueRunningUploads() {
+		const queue = makeQueue();
+		const uploads: Promise<boolean>[] = [];
+		jest.mocked(queue.enqueueUpload).mockImplementation(async (doc) => {
+			uploads.push(queue.uploadDocumentViaSocket(doc as Document));
+		});
+		return { queue, uploads };
+	}
+
+	test("REGRESSION: a no-base author whose relay text never held an item uploads it in one pass", async () => {
+		const crdtDoc = docWithoutText();
+		const relay = relayOf(crdtDoc);
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue, uploads } = queueRunningUploads();
+
+		const pull = await queue.pullIfUnchanged(fakeDoc);
+		await Promise.all(uploads);
+
+		expect(pull.outcome).toBe("seed-local");
+		expect(uploads).toHaveLength(1);
+		// Disk = CRDT = relay = the author's text, and that is the agreed base.
+		expect(state.vault).toBe(AUTHOR_TEXT);
+		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT);
+		expect(relay.getText("contents").toString()).toBe(AUTHOR_TEXT);
+		expect(state.syncBase).toBe(AUTHOR_TEXT);
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+
+		// The next pass finds nothing to do.
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("unchanged");
+		await Promise.all(uploads);
+		expect(uploads).toHaveLength(1);
+		expect(relay.getText("contents").toString()).toBe(AUTHOR_TEXT);
+	});
+
+	test("a no-base doc whose text a peer cleared keeps the clear: nothing uploaded, file untouched", async () => {
+		// The relay held the text once and a peer deleted it: its items stay as tombstones.
+		const crdtDoc = docClearedByPeer();
+		const relay = relayOf(crdtDoc);
+		const { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state } = makeFakeDoc(
+			crdtDoc,
+			AUTHOR_TEXT,
+			undefined,
+		);
+		const { queue, uploads } = queueRunningUploads();
+
+		const pull = await queue.pullIfUnchanged(fakeDoc);
+		await Promise.all(uploads);
+
+		expect(pull.outcome).toBe("no-base");
+		expect(uploads).toHaveLength(0);
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+		expect(relay.getText("contents").toString()).toBe("");
+		expect(state.vault).toBe(AUTHOR_TEXT);
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(setSyncBase).not.toHaveBeenCalled();
+	});
+
+	test("a no-base doc with a history gap and no text item is not uploaded", async () => {
+		// The pending part may be the author's own text: an upload would double it.
+		const history = authorHistory(AUTHOR_TEXT);
+		const crdtDoc = docWithHistoryGap(history);
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue, uploads } = queueRunningUploads();
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		await Promise.all(uploads);
+
+		expect(uploads).toHaveLength(0);
+		expect(writeContents).not.toHaveBeenCalled();
+		Y.applyUpdate(crdtDoc, history.full);
+		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT);
+		expect(state.vault).toBe(AUTHOR_TEXT);
+	});
+
+	test("a no-base doc whose seed is already marked done is not uploaded again", async () => {
+		const crdtDoc = docWithoutText();
+		crdtDoc.getMap("meta").set("initDone", true);
+		const { fakeDoc } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue, uploads } = queueRunningUploads();
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		expect(uploads).toHaveLength(0);
+	});
+
+	test("an empty file on a no-base doc uploads nothing", async () => {
+		const { fakeDoc } = makeFakeDoc(docWithoutText(), "", undefined);
+		const { queue, uploads } = queueRunningUploads();
+
+		await queue.pullIfUnchanged(fakeDoc);
+		expect(uploads).toHaveLength(0);
+	});
+});
