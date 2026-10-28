@@ -230,3 +230,16 @@ export function wonInitClaim(ydoc: Y.Doc, text: Y.Text): boolean {
 export function markInitDone(ydoc: Y.Doc): void {
 	ydoc.getMap(META_MAP).set(DONE_KEY, true);
 }
+
+/**
+ * True iff the text was never seeded and never held a single item: no
+ * finished init, no live text and no tombstone. A synced doc that passes
+ * this has nothing a peer wrote or deleted, so the local file is the only
+ * copy of its text. A peer's clear does not pass: deleted items of a root
+ * type stay as tombstones (Yjs and the relay's yrs alike), only a deleted
+ * parent's children are collected. Only meaningful without a history gap:
+ * pending updates may hold items not integrated yet.
+ */
+export function neverHeldText(ydoc: Y.Doc, text: Y.Text): boolean {
+	return ydoc.getMap(META_MAP).get(DONE_KEY) !== true && text._start === null;
+}
