@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.30
+- Fixed: after both devices restarted, a closed note could become empty on the device that created it, while the other device still had the full text. The plugin no longer writes a note to disk while part of its history is still missing.
+- Fixed: a note deleted on one device could come back on every device, as a new note, after the other device restarted offline and then came back online. A shared folder now reads its stored records before it connects.
+- Fixed: a note edited while this device was offline could stay out of date for a minute or more after reconnecting. Changes announced during the offline period are now fetched as soon as the connection returns.
+- Fixed: when the server refuses access to a share, background token renewal no longer retries it every minute; it follows the same backoff as other requests. Shared folders removed from the vault are no longer checked for changes.
+
 ## 0.1.29
 - Fixed: a note whose content reached the server a few seconds late could stay missing on another device for five minutes. The plugin now checks again after a few seconds, then waits longer between checks.
 - Fixed: shared folders that are not in this vault are no longer checked for changes every few seconds. They are checked when the share list loads. Once such a folder is downloaded, it is watched like any other.
