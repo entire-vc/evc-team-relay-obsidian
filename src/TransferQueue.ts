@@ -228,6 +228,8 @@ export interface PullResult {
 	remoteText?: string;
 }
 
+/** Pull outcomes that saw the doc whole, synced and gap-free, and settled it. */
+const PULL_DECIDED = new Set<PullResult["outcome"]>(["flushed", "unchanged", "kept-local", "no-base"]);
 /** pullIfUnchanged(): cap on waiting for the socket to reach "connected". */
 const PULL_CONNECT_TIMEOUT_MS = 15_000;
 /** pullIfUnchanged(): grace window after "connected" for the Yjs sync round-trip to land. */
@@ -295,10 +297,11 @@ export class TransferQueue extends Loggable {
 	/** Pull connections left open for a queued upload, which then closes them. */
 	private readonly handedToUpload = new Set<string>();
 	/**
-	 * Documents seen with a history gap, keyed by guid: once the gap closes,
-	 * the text this client's own history held (null if it can't be read back).
+	 * Documents seen with a history gap, keyed by their Y.Doc: once the gap
+	 * closes, the text this client's own history held (null if it can't be
+	 * read back).
 	 */
-	private readonly gapLocalTexts = new Map<string, { localText?: string | null }>();
+	private readonly gapLocalTexts = new WeakMap<Y.Doc, { localText?: string | null }>();
 	private downloadLane: QueueLaneState;
 
 	private paused = true;
@@ -1253,7 +1256,9 @@ export class TransferQueue extends Loggable {
 	 */
 	async pullIfUnchanged(doc: Document, control: PullControl = {}): Promise<PullResult> {
 		try {
-			return await this.pullIfUnchangedOnce(doc, control);
+			const result = await this.pullIfUnchangedOnce(doc, control);
+			if (PULL_DECIDED.has(result.outcome)) this.retireGapLocalText(doc);
+			return result;
 		} finally {
 			// Every return releases the hold; this covers a throw.
 			this.pullHolds.delete(doc.entityGuid);
@@ -1384,7 +1389,7 @@ export class TransferQueue extends Loggable {
 				}
 				await doc.vaultShare.ensureParentDir(doc.entryPath);
 			}
-			const gapLocalText = this.takeGapLocalText(doc);
+			const gapLocalText = this.gapLocalText(doc);
 			// No base, but the gap that held back this doc's upload has just
 			// closed and the file holds exactly what this client's own history
 			// held: it is stale, not a local edit. The relay's text is that
@@ -1515,20 +1520,26 @@ export class TransferQueue extends Loggable {
 
 	/** Starts recording what `doc`'s own history holds, to be read back when its gap closes. */
 	private watchHistoryGap(doc: Document): void {
-		if (this.gapLocalTexts.has(doc.entityGuid)) return;
+		if (this.gapLocalTexts.has(doc.crdtDoc)) return;
 		const entry: { localText?: string | null } = {};
-		this.gapLocalTexts.set(doc.entityGuid, entry);
+		this.gapLocalTexts.set(doc.crdtDoc, entry);
 		watchHistoryGapClose(doc.crdtDoc, "contents", (localText) => {
 			entry.localText = localText ?? null;
 		});
 	}
 
-	/** The text `doc`'s history held when its gap closed, if one closed since it was seen; forgets it. */
-	private takeGapLocalText(doc: Document): string | undefined {
-		const entry = this.gapLocalTexts.get(doc.entityGuid);
-		if (entry === undefined || entry.localText === undefined) return undefined;
-		this.gapLocalTexts.delete(doc.entityGuid);
-		return entry.localText ?? undefined;
+	/** The text `doc`'s history held when its gap closed, if one closed since it was seen. */
+	private gapLocalText(doc: Document): string | undefined {
+		return this.gapLocalTexts.get(doc.crdtDoc)?.localText ?? undefined;
+	}
+
+	/**
+	 * Forgets the text of a closed gap once a pull has decided on the doc:
+	 * after that the file may be edited back to it, and must not then be
+	 * taken for stale. An aborted pull keeps it for the next one.
+	 */
+	private retireGapLocalText(doc: Document): void {
+		if (this.gapLocalTexts.get(doc.crdtDoc)?.localText !== undefined) this.gapLocalTexts.delete(doc.crdtDoc);
 	}
 
 	/** Drops the connection pullIfUnchanged() opened, unless the doc was already online or is being edited. */

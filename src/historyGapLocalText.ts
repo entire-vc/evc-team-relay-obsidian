@@ -15,13 +15,15 @@
 import * as Y from "yjs";
 import { hasHistoryGap } from "./preserveBeforeTrash";
 
-type DeleteSet = ReturnType<typeof Y.decodeUpdate>["ds"];
+type Range = { clock: number; len: number };
 
 /**
  * Calls `onClose` once, in the transaction that closes `ydoc`'s history gap,
  * with the text `ytextName` read as at the time of this call: this client's
  * stored updates, pending ones included. `undefined` if that text can't be
- * read back. Returns a function that stops watching.
+ * read back: some of it lies in history the stored updates build on but do
+ * not hold, so what this client saw of it is unknown. Returns a function that
+ * stops watching.
  */
 export function watchHistoryGapClose(
 	ydoc: Y.Doc,
@@ -29,40 +31,65 @@ export function watchHistoryGapClose(
 	onClose: (localText: string | undefined) => void,
 ): () => void {
 	const { structs, ds } = Y.decodeUpdate(Y.encodeStateAsUpdate(ydoc));
-	const known = new Map<number, number>();
+	const stored = new Map<number, Range[]>();
 	const strings = new Map<number, { clock: number; str: string }[]>();
+	// Per client, the clocks the stored updates build on: a client's clocks
+	// are contiguous, so a struct, reference or deletion at a clock implies
+	// every clock before it.
+	const ancestry = new Map<number, number>();
+	const needs = (id: Y.ID | null) => {
+		if (id && id.clock + 1 > (ancestry.get(id.client) ?? 0)) ancestry.set(id.client, id.clock + 1);
+	};
 	for (const struct of structs) {
 		if (struct instanceof Y.Skip) continue;
 		const { client, clock } = struct.id;
-		const end = clock + struct.length;
-		if (end > (known.get(client) ?? 0)) known.set(client, end);
-		if (struct instanceof Y.Item && struct.content instanceof Y.ContentString) {
-			const runs = strings.get(client) ?? [];
-			runs.push({ clock, str: struct.content.str });
-			strings.set(client, runs);
+		push(stored, client, { clock, len: struct.length });
+		needs(Y.createID(client, clock + struct.length - 1));
+		if (struct instanceof Y.Item) {
+			needs(struct.origin);
+			needs(struct.rightOrigin);
+			if (struct.parent instanceof Y.ID) needs(struct.parent);
+			if (struct.content instanceof Y.ContentString) {
+				push(strings, client, { clock, str: struct.content.str });
+			}
 		}
 	}
+	const deleted = new Map<number, Range[]>();
+	ds.clients.forEach((ranges, client) => {
+		for (const { clock, len } of ranges) {
+			push(deleted, client, { clock, len });
+			needs(Y.createID(client, clock + len - 1));
+		}
+	});
+	for (const map of [stored, deleted]) map.forEach((ranges) => ranges.sort((a, b) => a.clock - b.clock));
+	strings.forEach((runs) => runs.sort((a, b) => a.clock - b.clock));
+	const history: LocalHistory = { stored, deleted, strings, ancestry };
 	const handler = () => {
 		if (hasHistoryGap(ydoc)) return;
 		ydoc.off("afterTransaction", handler);
-		onClose(textAt(ydoc.getText(ytextName), known, ds, strings));
+		onClose(textAt(ydoc.getText(ytextName), history));
 	};
 	ydoc.on("afterTransaction", handler);
 	return () => ydoc.off("afterTransaction", handler);
 }
 
-function textAt(
-	ytext: Y.Text,
-	known: Map<number, number>,
-	ds: DeleteSet,
-	strings: Map<number, { clock: number; str: string }[]>,
-): string | undefined {
-	const deleted = new Map<number, { clock: number; len: number }[]>();
-	ds.clients.forEach((ranges, client) => deleted.set(client, [...ranges].sort((a, b) => a.clock - b.clock)));
-	strings.forEach((runs) => runs.sort((a, b) => a.clock - b.clock));
-	const visible = (client: number, clock: number) =>
-		clock < (known.get(client) ?? 0) &&
-		rangeAt(deleted.get(client), clock, (range) => range.len) === undefined;
+interface LocalHistory {
+	stored: Map<number, Range[]>;
+	deleted: Map<number, Range[]>;
+	strings: Map<number, { clock: number; str: string }[]>;
+	ancestry: Map<number, number>;
+}
+
+function push<T>(map: Map<number, T[]>, client: number, value: T): void {
+	const list = map.get(client);
+	if (list) list.push(value);
+	else map.set(client, [value]);
+}
+
+function textAt(ytext: Y.Text, history: LocalHistory): string | undefined {
+	const { stored, deleted, strings, ancestry } = history;
+	const has = (client: number, clock: number) =>
+		rangeAt(stored.get(client), clock, (range) => range.len) !== undefined;
 	const storedChar = (client: number, clock: number) => {
 		const run = rangeAt(strings.get(client), clock, (r) => r.str.length);
 		return run?.str[clock - run.clock];
@@ -73,9 +100,14 @@ function textAt(
 		if (live === undefined && !(item.content instanceof Y.ContentDeleted)) continue;
 		const { client, clock } = item.id;
 		for (let i = 0; i < item.length; i++) {
-			if (!visible(client, clock + i)) continue;
+			if (!has(client, clock + i)) {
+				// Built on, but not stored: this client saw it, and whether it
+				// deleted it is unknown.
+				if (clock + i < (ancestry.get(client) ?? 0)) return undefined;
+				continue;
+			}
+			if (rangeAt(deleted.get(client), clock + i, (range) => range.len) !== undefined) continue;
 			const char = live?.[i] ?? storedChar(client, clock + i);
-			// Collected, and not in this client's store either: unknown.
 			if (char === undefined) return undefined;
 			text += char;
 		}

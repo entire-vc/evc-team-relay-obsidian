@@ -388,6 +388,131 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		expect(state.syncBase).toBeUndefined();
 	});
 
+	test("a no-base doc whose stored history builds on text it does not hold is not taken for stale", async () => {
+		// "BASE" by one client, " tail" appended by another: only the second
+		// is stored, so what this client saw of "BASE" is unknown.
+		const base = new Y.Doc();
+		base.getText("contents").insert(0, "BASE");
+		const tail = new Y.Doc();
+		Y.applyUpdate(tail, Y.encodeStateAsUpdate(base));
+		const before = Y.encodeStateVector(tail);
+		tail.getText("contents").insert(4, " tail");
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(tail, before));
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		// Deleted "BASE" while the plugin was not running.
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, " tail", undefined);
+		const queue = makeQueue();
+
+		await queue.uploadDocumentViaSocket(fakeDoc);
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, Y.encodeStateAsUpdate(tail));
+		peer.getText("contents").insert(0, "PEER ");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		expect(crdtDoc.getText("contents").toString()).toBe("PEER BASE tail");
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe(" tail");
+	});
+
+	test("a no-base doc whose gap is only a deletion of text it does not hold is not taken for stale", async () => {
+		const author = new Y.Doc();
+		author.getText("contents").insert(0, "BASE");
+		const inserted = Y.encodeStateVector(author);
+		author.getText("contents").delete(0, 4);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(author, inserted));
+		expect(crdtDoc.store.pendingDs).not.toBeNull();
+		// Cleared while the plugin was not running.
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, "", undefined);
+		const queue = makeQueue();
+
+		await queue.uploadDocumentViaSocket(fakeDoc);
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, Y.encodeStateAsUpdate(author));
+		peer.getText("contents").insert(0, "PEER");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		expect(crdtDoc.getText("contents").toString()).toBe("PEER");
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(state.vault).toBe("");
+	});
+
+	test("once a pull sees the file in step, a later edit back to the old text is not taken for stale", async () => {
+		const history = authorHistory();
+		const crdtDoc = docWithHistoryGap(history);
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, FULL_TEXT, undefined);
+		const queue = makeQueue();
+
+		await queue.uploadDocumentViaSocket(fakeDoc);
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, history.full);
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		// The peer's text reached the file some other way.
+		state.vault = "PEER LINE\n" + FULL_TEXT;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("unchanged");
+
+		// Reverted while the plugin was not running; the peer edits again.
+		state.vault = FULL_TEXT;
+		peer.getText("contents").insert(0, "MORE\n");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(state.vault).toBe(FULL_TEXT);
+	});
+
+	test("a pull aborted after the gap closed leaves the next pull to deliver the peer's clear", async () => {
+		const history = authorHistory();
+		const crdtDoc = docWithHistoryGap(history);
+		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, undefined);
+		const queue = makeQueue();
+
+		await queue.uploadDocumentViaSocket(fakeDoc);
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, history.full);
+		peer.getText("contents").delete(0, peer.getText("contents").length);
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+
+		const controller = new AbortController();
+		const aborted = await queue.pullIfUnchanged(fakeDoc, {
+			signal: controller.signal,
+			onPhase: (phase) => {
+				if (phase === "sync-base") controller.abort();
+			},
+		});
+		expect(aborted.outcome).toBe("aborted");
+		expect(state.vault).toBe(FULL_TEXT);
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("flushed");
+		expect(state.vault).toBe("");
+		expect(state.syncBase).toBe("");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+	});
+
+	test("a doc recreated under the same guid while gapped converges on its own gap", async () => {
+		const queue = makeQueue();
+		const first = makeFakeDoc(docWithHistoryGap(), FULL_TEXT, undefined);
+		await queue.uploadDocumentViaSocket(first.fakeDoc);
+		first.fakeDoc.crdtDoc.destroy();
+
+		const history = authorHistory();
+		const crdtDoc = docWithHistoryGap(history);
+		const { fakeDoc, state } = makeFakeDoc(crdtDoc, FULL_TEXT, undefined);
+		await queue.uploadDocumentViaSocket(fakeDoc);
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, history.full);
+		peer.getText("contents").delete(0, peer.getText("contents").length);
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("flushed");
+		expect(state.vault).toBe("");
+	});
+
 	test("a peer's clear that lands while an upload is held back by a gap reaches disk", async () => {
 		const history = authorHistory();
 		const crdtDoc = docWithHistoryGap(history);
