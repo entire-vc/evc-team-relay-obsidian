@@ -38,8 +38,11 @@ export function watchHistoryGapClose(
 	// every clock before it.
 	const ancestry = new Map<number, number>();
 	const needs = (id: Y.ID | null) => extend(ancestry, id);
+	// A collected struct keeps no references: what it built on is unknown.
+	let refsLost = false;
 	for (const struct of structs) {
 		if (struct instanceof Y.Skip) continue;
+		if (struct instanceof Y.GC) refsLost = true;
 		const { client, clock } = struct.id;
 		push(stored, client, { clock, len: struct.length });
 		needs(Y.createID(client, clock + struct.length - 1));
@@ -65,8 +68,8 @@ export function watchHistoryGapClose(
 	const handler = () => {
 		if (hasHistoryGap(ydoc)) return;
 		ydoc.off("afterTransaction", handler);
-		expandAncestry(ydoc, ancestry);
-		onClose(textAt(ydoc.getText(ytextName), history));
+		const complete = !refsLost && expandAncestry(ydoc, ancestry);
+		onClose(complete ? textAt(ydoc.getText(ytextName), history) : undefined);
 	};
 	ydoc.on("afterTransaction", handler);
 	return () => ydoc.off("afterTransaction", handler);
@@ -96,9 +99,11 @@ function parentId(item: Y.Item): Y.ID | null {
  * Follows what the history this client built on but did not store builds on
  * in turn: the closed gap has brought those structs in, and their references
  * reach clocks this client also saw (a chain through another client's
- * mapping can lead back to text).
+ * mapping can lead back to text). False if the chain runs through a
+ * collected struct (a deleted nested type's content), whose references are
+ * gone: where it leads is unknown.
  */
-function expandAncestry(ydoc: Y.Doc, ancestry: Map<number, number>): void {
+function expandAncestry(ydoc: Y.Doc, ancestry: Map<number, number>): boolean {
 	const scanned = new Map<number, number>();
 	let grew = true;
 	while (grew) {
@@ -109,13 +114,16 @@ function expandAncestry(ydoc: Y.Doc, ancestry: Map<number, number>): void {
 			scanned.set(client, end);
 			for (const struct of ydoc.store.clients.get(client) ?? []) {
 				if (struct.id.clock >= end) break;
-				if (struct.id.clock + struct.length <= from || !(struct instanceof Y.Item)) continue;
+				if (struct.id.clock + struct.length <= from) continue;
+				if (struct instanceof Y.GC) return false;
+				if (!(struct instanceof Y.Item)) continue;
 				for (const id of [struct.origin, struct.rightOrigin, parentId(struct)]) {
 					if (extend(ancestry, id)) grew = true;
 				}
 			}
 		}
 	}
+	return true;
 }
 
 function push<T>(map: Map<number, T[]>, client: number, value: T): void {

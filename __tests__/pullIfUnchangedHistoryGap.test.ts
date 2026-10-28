@@ -456,6 +456,46 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		expect(state.vault).toBe("TAIL");
 	});
 
+	test("a no-base doc whose history chain runs through a collected nested type is not taken for stale", async () => {
+		// As above, but the chain lives in a nested list that a peer then
+		// deletes: its entries are collected and their references are gone.
+		const d = new Y.Doc();
+		d.getMap("m").set("list", new Y.Array<number>());
+		const b = new Y.Doc();
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(d));
+		b.getText("contents").insert(0, "TAIL");
+		const a = new Y.Doc();
+		Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+		a.getText("contents").insert(0, "BASE");
+		(a.getMap("m").get("list") as Y.Array<number>).push([1]);
+		const c = new Y.Doc();
+		Y.applyUpdate(c, Y.encodeStateAsUpdate(a));
+		(c.getMap("m").get("list") as Y.Array<number>).push([2]);
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(c));
+		(b.getMap("m").get("list") as Y.Array<number>).push([3]);
+		const onlyB = Y.decodeStateVector(Y.encodeStateVector(b));
+		onlyB.set(b.clientID, 0);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(d));
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(b, Y.encodeStateVector(onlyB)));
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, "TAIL", undefined);
+		const queue = makeQueue();
+
+		await queue.uploadDocumentViaSocket(fakeDoc);
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, Y.encodeStateAsUpdate(b));
+		peer.getMap("m").delete("list");
+		peer.getText("contents").insert(0, "PEER ");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		expect(crdtDoc.getText("contents").toString()).toBe("PEER BASETAIL");
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("TAIL");
+	});
+
 	test("a no-base doc whose gap is only a deletion of text it does not hold is not taken for stale", async () => {
 		const author = new Y.Doc();
 		author.getText("contents").insert(0, "BASE");
