@@ -39,6 +39,10 @@ interface FakeDocOptions {
 	vaultContents: string;
 	/** The last text this client recorded as agreeing with the relay on, or undefined if never set. */
 	initialBase: string | undefined;
+	/** Successive disk reads after the first; the last one repeats. Defaults to `vaultContents`. */
+	laterVaultReads?: string[];
+	/** Whether the note is being deleted. */
+	deletePending?: boolean;
 }
 
 function makeFakeDoc(opts: FakeDocOptions) {
@@ -49,6 +53,11 @@ function makeFakeDoc(opts: FakeDocOptions) {
 	const writeConflictCopy = jest
 		.fn<(doc: unknown, content: string, label: string) => Promise<string>>()
 		.mockResolvedValue("note (relay conflict TIMESTAMP).md");
+	const writeContents = jest
+		.fn<(doc: unknown, content: string) => Promise<void>>()
+		.mockResolvedValue(undefined);
+	const reads = [opts.vaultContents, ...(opts.laterVaultReads ?? [])];
+	let readCount = 0;
 
 	const fakeDoc = Object.create(Document.prototype) as Document;
 	Object.defineProperty(fakeDoc, "path", { value: "note.md" });
@@ -62,8 +71,10 @@ function makeFakeDoc(opts: FakeDocOptions) {
 	Object.defineProperty(fakeDoc, "vaultShare", {
 		value: {
 			workspaceId: "test-relay-id",
-			readContents: async () => opts.vaultContents,
+			readContents: async () => reads[Math.min(readCount++, reads.length - 1)],
 			writeConflictCopy,
+			writeContents,
+			isDeletePending: () => opts.deletePending ?? false,
 		},
 	});
 	Object.defineProperty(fakeDoc, "onceEverSynced", { value: async () => {} });
@@ -80,7 +91,7 @@ function makeFakeDoc(opts: FakeDocOptions) {
 		},
 	});
 
-	return { fakeDoc, ydoc, writeConflictCopy, getBase: () => base };
+	return { fakeDoc, ydoc, writeConflictCopy, writeContents, getBase: () => base };
 }
 
 function makeQueue(): TransferQueue {
@@ -159,5 +170,87 @@ describe("uploadDocumentViaSocket — sync-base gates the conflict-copy preserve
 
 		expect(writeConflictCopy).not.toHaveBeenCalled();
 		expect(getBase()).toBe("same everywhere");
+	});
+});
+
+describe("uploadDocumentViaSocket — relay moved, file still holds the agreed text", () => {
+	test("delivers the relay's text to disk instead of reverting the peer's edit", async () => {
+		// The receiver's echo upload of its own delivered write: the file
+		// holds the last agreed text, a peer's edit arrived while connecting.
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
+			syncedText: "a1-1 by A",
+			vaultContents: "a1-0",
+			initialBase: "a1-0",
+		});
+
+		const result = await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(result).toBe(true);
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(fakeDoc.content).toBe("a1-1 by A");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "a1-1 by A");
+		expect(getBase()).toBe("a1-1 by A");
+	});
+
+	test("a local edit made while connecting is reconciled, never overwritten", async () => {
+		const { fakeDoc, writeContents } = makeFakeDoc({
+			syncedText: "a1-1 by A",
+			vaultContents: "a1-0",
+			initialBase: "a1-0",
+			laterVaultReads: ["a1-0", "a1-0 typed on B"],
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeContents).not.toHaveBeenCalled();
+		// The relay moved too, so the safe path keeps the peer's text as a copy.
+		expect(fakeDoc.content).toBe("a1-0 typed on B");
+	});
+
+	test("REGRESSION: a file off the base still reconciles as a local edit", async () => {
+		const { fakeDoc, writeConflictCopy, writeContents } = makeFakeDoc({
+			syncedText: "base [peer edit]",
+			vaultContents: "base [my edit]",
+			initialBase: "base",
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(fakeDoc.content).toBe("base [my edit]");
+	});
+
+	test("a failed final read writes nothing and keeps the base at the disk text", async () => {
+		// readVaultContents() reads a failed read as "".
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
+			syncedText: "a1-1 by A",
+			vaultContents: "a1-0",
+			initialBase: "a1-0",
+			laterVaultReads: ["a1-0", ""],
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(fakeDoc.content).toBe("a1-1 by A");
+		// A base ahead of the disk would push the stale file over the peer next time.
+		expect(getBase()).toBe("a1-0");
+	});
+
+	test("a note being deleted is not written and its base stays", async () => {
+		const { fakeDoc, writeContents, getBase } = makeFakeDoc({
+			syncedText: "a1-1 by A",
+			vaultContents: "a1-0",
+			initialBase: "a1-0",
+			deletePending: true,
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(fakeDoc.content).toBe("a1-1 by A");
+		expect(getBase()).toBe("a1-0");
 	});
 });

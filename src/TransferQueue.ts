@@ -1172,12 +1172,17 @@ export class TransferQueue extends Loggable {
 		if (!usable) {
 			this.log(`[uploadDocumentViaSocket] history gap in ${doc.entryPath}; not reconciling yet`);
 		}
+		let baseSettled = false;
 		if (usable && isRelayOnPrem && isDocument(doc)) {
 			// Typing can continue while the provider connects. Compare the
 			// current disk and CRDT contents, not the pre-connection snapshots.
 			const currentVaultContents = await this.readVaultContents(doc);
 			if (currentVaultContents && !sameTextContent(doc.content, currentVaultContents)) {
-				await this.reconcileRelayContent(doc, currentVaultContents);
+				const localText = await this.deliverIfNoLocalEdit(doc, currentVaultContents);
+				baseSettled = localText === undefined;
+				if (localText !== undefined && !sameTextContent(doc.content, localText)) {
+					await this.reconcileRelayContent(doc, localText);
+				}
 			}
 		}
 
@@ -1188,7 +1193,11 @@ export class TransferQueue extends Loggable {
 		// (safe to apply without a conflict copy) apart from "the relay moved
 		// too" -- so it must be current before the NEXT sync, not
 		// just after this one happens to succeed cleanly.
-		if (usable && isRelayOnPrem && isDocument(doc)) {
+		// deliverIfNoLocalEdit() already recorded the text it wrote, or left
+		// the base alone when it could not write: the CRDT may have moved on
+		// since, and a base ahead of the disk would read the stale file as a
+		// local edit on the next sync and push it over the peer's text.
+		if (usable && isRelayOnPrem && isDocument(doc) && !baseSettled) {
 			await doc.setSyncBase(doc.content);
 		}
 
@@ -1203,6 +1212,52 @@ export class TransferQueue extends Loggable {
 			doc.vaultShare.credentialCache.dropFromQueue(ResourceAddress.serialize(doc.resourceAddress));
 		}
 		return true;
+	}
+
+	/**
+	 * The relay moved but this client did not: the file still holds the text
+	 * last agreed with the relay, so it carries no local edit. Write the
+	 * relay's text to disk instead of reconciling the file into the CRDT.
+	 *
+	 * Without this, an upload that only echoes this client's own delivered
+	 * write (the fetch's disk write fires "modify", which queues an upload)
+	 * and connects while a peer's edit lands read the stale file as a local
+	 * edit: reconcileRelayContent() saw the relay off the base, kept the
+	 * peer's edit only as a "relay conflict" copy and wrote the stale text
+	 * back into the CRDT, reverting the peer's edit for every participant,
+	 * its author's disk included. Live: 5 of 10 co-edit rounds with no pause
+	 * after the first sync.
+	 *
+	 * Returns undefined when the base is settled here: the text was
+	 * delivered, or the file could not be written (a failed read, a pending
+	 * delete) and the base stays where the disk is, for the next sync.
+	 * Otherwise there may be a local edit (no base, the file is off the base,
+	 * or it changed while this ran) and the latest file text is returned for
+	 * the caller to reconcile.
+	 *
+	 * An empty relay text is not delivered: it is also what a room that has
+	 * not loaded yet reads as, so it keeps the reconcile path it had before.
+	 * The re-read and the write leave the same small window as
+	 * pullIfUnchanged()'s flush; the adapter offers no compare-and-write.
+	 */
+	private async deliverIfNoLocalEdit(doc: Document, vaultContents: string): Promise<string | undefined> {
+		const base = await doc.getSyncBase();
+		if (base === undefined || !sameTextContent(vaultContents, base)) return vaultContents;
+		const remoteText = doc.content;
+		if (!hasPreservableContent(remoteText)) return vaultContents;
+		// The read above can be stale by now: never overwrite an edit made meanwhile.
+		const current = await this.readVaultContents(doc);
+		// "" is also a failed read: nothing safe to write or to record.
+		if (current === "") return undefined;
+		if (!sameTextContent(current, base)) return current;
+		// writeContents() skips a note being deleted but still resolves.
+		if (doc.vaultShare.isDeletePending(doc.entryPath)) return undefined;
+		await doc.vaultShare.writeContents(doc, remoteText);
+		await doc.setSyncBase(remoteText);
+		this.log(
+			`[uploadDocumentViaSocket] relay moved, no local edit in ${doc.entryPath}; delivered its text`,
+		);
+		return undefined;
 	}
 
 	/**
