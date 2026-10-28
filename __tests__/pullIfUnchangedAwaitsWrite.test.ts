@@ -87,6 +87,7 @@ function makeFakeDocWithDeferredWrite(events: string[]) {
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(fakeDoc, "bringOnline", { value: async () => true });
 	Object.defineProperty(fakeDoc, "onceOnline", { value: async () => {} });
+	Object.defineProperty(fakeDoc, "onceFreshlySynced", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "goOffline", {
 		value: () => {
 			events.push("goOffline");

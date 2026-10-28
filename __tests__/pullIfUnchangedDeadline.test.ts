@@ -67,6 +67,7 @@ function makeFakeDoc(opts: FakeDocOptions = {}) {
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(fakeDoc, "bringOnline", { value: opts.bringOnline ?? (async () => true) });
 	Object.defineProperty(fakeDoc, "onceOnline", { value: async () => {} });
+	Object.defineProperty(fakeDoc, "onceFreshlySynced", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "goOffline", { value: goOffline });
 	Object.defineProperty(fakeDoc, "getSyncBase", {
 		value: async () => ("syncBase" in opts ? opts.syncBase : "shared content"),

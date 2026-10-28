@@ -787,7 +787,11 @@ export class CrdtBackgroundSyncPoller {
 
 	private afterPull(pull: PendingPull, result: PullResult | undefined): void {
 		const guid = pull.file.entityGuid;
-		const ok = result !== undefined && result.outcome !== "connect-failed" && result.outcome !== "aborted";
+		const ok =
+			result !== undefined &&
+			result.outcome !== "connect-failed" &&
+			result.outcome !== "not-synced" &&
+			result.outcome !== "aborted";
 		if (ok) this.completed++;
 		else this.failed++;
 		const outcome = result?.outcome ?? "deadline";

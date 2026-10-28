@@ -55,6 +55,7 @@ function makeDoc() {
 	Object.defineProperty(doc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(doc, "bringOnline", { value: async () => true });
 	Object.defineProperty(doc, "onceOnline", { value: async () => {} });
+	Object.defineProperty(doc, "onceFreshlySynced", { value: async () => {} });
 	Object.defineProperty(doc, "goOffline", { value: goOffline });
 	Object.defineProperty(doc, "getSyncBase", { value: async () => "same" });
 	Object.defineProperty(doc, "setSyncBase", { value: async () => {} });

@@ -12,8 +12,9 @@
  *
  * A doc with a history gap does not show what was last synced: no pull,
  * fetch or upload may write that text to disk, seed the file into it or
- * record it as the sync base. A gap no sync closes (changes the relay never
- * received) is waited out for a bounded time only.
+ * record it as the sync base, however long the gap lasts. Nor may a pull
+ * write anything before its connection has completed a sync: until then
+ * the text is only what the local store held.
  */
 
 import { describe, test, expect, jest } from "@jest/globals";
@@ -165,27 +166,59 @@ describe("pullIfUnchanged — a doc with a history gap is never flushed to disk"
 		expect(result.remoteText).toBe(FULL_TEXT);
 	});
 
-	test("a gap no sync closes is waited out, then a peer's edit still reaches disk", async () => {
-		// This client's own changes the relay never received stay pending;
-		// a peer's edit is fully integrated next to them.
-		const crdtDoc = docWithHistoryGap(authorHistory("never sent\n"));
-		const peer = new Y.Doc();
-		peer.getText("contents").insert(0, "PEER EDIT\n");
-		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
-		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, "old\n", "old\n");
-		const clock = new InstantClock();
-		const queue = makeQueue(clock);
+	test.each([
+		["empty", authorHistory(), ""],
+		["shorter", authorHistory(), "PEER EDIT\n"],
+	])(
+		"a gap that outlasts any wait never overwrites the file with %s text",
+		async (_label, history, peerText) => {
+			// The relay syncs, but never sends the missing part.
+			const crdtDoc = docWithHistoryGap(history);
+			if (peerText) {
+				const peer = new Y.Doc();
+				peer.getText("contents").insert(0, peerText);
+				Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+			}
+			expect(crdtDoc.getText("contents").toString()).toBe(peerText);
+			const { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state } = makeFakeDoc(
+				crdtDoc,
+				FULL_TEXT,
+				FULL_TEXT,
+			);
+			const clock = new InstantClock();
+			const queue = makeQueue(clock);
 
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
-		clock.time += PATIENCE_MS - 1;
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+			for (const step of [0, PATIENCE_MS, PATIENCE_MS * 10]) {
+				clock.time += step;
+				expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+			}
+
+			expect(writeContents).not.toHaveBeenCalled();
+			expect(writeConflictCopy).not.toHaveBeenCalled();
+			expect(setSyncBase).not.toHaveBeenCalled();
+			expect(state.vault).toBe(FULL_TEXT);
+		},
+	);
+
+	test("without a completed sync an empty doc with no gap does not blank the file", async () => {
+		// Nothing pending, so no gap to detect: only this connection's sync can
+		// tell an empty local store from a note a peer cleared.
+		const crdtDoc = new Y.Doc();
+		const { fakeDoc, writeContents, setSyncBase, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		let syncCalls = 0;
+		fakeDoc.onceFreshlySynced = () => {
+			syncCalls++;
+			return new Promise<void>(() => {});
+		};
+
+		const result = await makeQueue().pullIfUnchanged(fakeDoc);
+
+		expect(syncCalls).toBe(1);
+		expect(result.outcome).toBe("not-synced");
+		expect(result.remoteText).toBeUndefined();
 		expect(writeContents).not.toHaveBeenCalled();
-
-		clock.time += 1;
-		const result = await queue.pullIfUnchanged(fakeDoc);
-
-		expect(result.outcome).toBe("flushed");
-		expect(state.vault).toBe("PEER EDIT\n");
+		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(state.vault).toBe(FULL_TEXT);
 	});
 
 	test("a file an earlier version already blanked gets the full text once the gap closes, with no editor open", async () => {
@@ -216,9 +249,9 @@ describe("pullIfUnchanged — a doc with a history gap is never flushed to disk"
 		const clock = new InstantClock();
 		const queue = makeQueue(clock);
 
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("not-synced");
 		clock.time += PATIENCE_MS * 3;
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("not-synced");
 
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(state.vault).toBe(FULL_TEXT);
@@ -241,7 +274,8 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		const crdtDoc = docWithHistoryGap(history);
 		const { fakeDoc, setSyncBase, writeConflictCopy } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
 
-		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+		// Not done: reported as unsynced so its retry stays scheduled.
+		expect(await makeQueue().uploadDocumentViaSocket(fakeDoc)).toBe(false);
 
 		expect(crdtDoc.getText("contents").toString()).toBe("");
 		expect(setSyncBase).not.toHaveBeenCalled();
@@ -249,6 +283,41 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		// Once the relay fills the gap the text is the author's, not doubled.
 		Y.applyUpdate(crdtDoc, history.full);
 		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+	});
+
+	test("an upload a gap held back, with no base yet, runs again once the gap closes and converges", async () => {
+		const history = authorHistory();
+		const crdtDoc = docWithHistoryGap(history);
+		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, undefined);
+		const queue = makeQueue();
+		const enqueueUpload = jest.mocked(queue.enqueueUpload);
+
+		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(false);
+		expect(state.syncBase).toBeUndefined();
+
+		// The upload's retries ran out. The relay then fills the gap, a peer
+		// has added a line meanwhile, and the next background pull finds no base.
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, history.full);
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		const remote = "PEER LINE\n" + FULL_TEXT;
+		expect(crdtDoc.getText("contents").toString()).toBe(remote);
+
+		const pull = await queue.pullIfUnchanged(fakeDoc);
+		expect(pull.outcome).toBe("no-base");
+		expect(enqueueUpload).toHaveBeenCalledTimes(1);
+
+		// What that queued upload runs: it now reconciles and records the base,
+		// after which the next pull finds disk, base and CRDT agreeing.
+		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
+		expect(state.syncBase).toBe(crdtDoc.getText("contents").toString());
+		const next = await queue.pullIfUnchanged(fakeDoc);
+		expect(["unchanged", "flushed"]).toContain(next.outcome);
+		expect(state.vault).toBe(crdtDoc.getText("contents").toString());
+		// The file wins with no base to compare against; the peer's text is kept in a copy.
+		expect(state.vault).toBe(FULL_TEXT);
+		expect(writeConflictCopy).toHaveBeenCalledWith(fakeDoc, remote, expect.any(String));
 	});
 
 	test("fetch holds back partial text of a gapped doc while retries remain", async () => {
