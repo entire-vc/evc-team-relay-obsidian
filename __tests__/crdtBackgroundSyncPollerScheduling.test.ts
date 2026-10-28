@@ -1018,6 +1018,45 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("a change announced while a share was offline is pulled as soon as it reconnects, not at the next sweep", async () => {
+		const pull = jest.fn<PullFn>().mockResolvedValue({ outcome: "unchanged", remoteText: "" });
+		const folder = makeFolder("s", 6, pull, 3);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 10_000);
+		poller.start();
+		for (let i = 0; i < 4; i++) await flushPromises();
+		expect(pull).toHaveBeenCalledTimes(6);
+
+		// The connection drops and a tick sees the share offline.
+		folder.isOnline = false;
+		clock.setTime(t0 + 10_000);
+		await flushPromises();
+		expect(folder.listenerCount()).toBe(1);
+
+		// On reconnect the folder sync replays the marker a peer wrote while
+		// this client was offline -- before the poller's next tick.
+		folder.isOnline = true;
+		folder.announce("s-4", textFingerprint("edited offline"));
+		await flushPromises();
+		expect(startedGuids(pull).slice(6)).toEqual(["s-4"]);
+		poller.destroy();
+		expect(folder.listenerCount()).toBe(0);
+	});
+
+	test("a share that leaves the registry drops its announcement listener", async () => {
+		const pull = jest.fn<PullFn>().mockResolvedValue({ outcome: "unchanged", remoteText: "" });
+		const folder = makeFolder("s", 1, pull, 3);
+		const folders = [folder];
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry(folders) as never, 10_000);
+		poller.start();
+		expect(folder.listenerCount()).toBe(1);
+
+		folders.length = 0;
+		clock.setTime(t0 + 10_000);
+		await flushPromises();
+		expect(folder.listenerCount()).toBe(0);
+		poller.destroy();
+	});
+
 	test("destroy() aborts in-flight pulls and drops announcement listeners", () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);
