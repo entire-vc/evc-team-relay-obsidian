@@ -214,24 +214,29 @@ const SEED_LAST_ID = 3;
  * pushes land on other clocks or carry other content, and the range is a gap.
  * A deleted change carries no content to check (a deleted character reads the
  * same), so one that refers into the range is a gap too.
+ *
+ * Only a delete set pushed into the `ds` list proves the seed: clock 2 is then
+ * a list this writer created, which only a seed at clock 0 does. A client id
+ * after clock 3 proves nothing on its own: a writer mapping an account whose
+ * entry a peer already wrote pushes one id into the peer's `ids`, which after
+ * three characters of text lands at clock 3 too.
  */
 function isIdentitySeedGap(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): boolean {
 	const inSeed = (id: Y.ID | null): id is Y.ID => id !== null && id.client === client && id.clock < SEED_CLOCKS;
-	let referred = false;
+	let deleteSetPushed = false;
 	for (const struct of structs) {
 		if (!(struct instanceof Y.Item)) continue;
 		const parent = struct.parent as unknown;
 		if (parent instanceof Y.ID && inSeed(parent)) {
 			if (parent.clock !== SEED_DS || !(struct.content instanceof Y.ContentBinary)) return false;
-			referred = true;
+			deleteSetPushed = true;
 		}
 		if (inSeed(struct.origin)) {
 			if (struct.origin.clock !== SEED_LAST_ID || !(struct.content instanceof Y.ContentAny)) return false;
-			referred = true;
 		}
 		if (inSeed(struct.rightOrigin)) return false;
 	}
-	return referred;
+	return deleteSetPushed;
 }
 
 /** Content kinds a Y.Text never holds: list and map values. */

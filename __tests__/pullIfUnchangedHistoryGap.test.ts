@@ -638,7 +638,25 @@ describe("missing clocks outside an identity seed are a gap", () => {
 		expect(hasHistoryGap(doc)).toBe(true);
 	});
 
-	test("presence pushes into ids alone still pass as a seed gap", () => {
+	test("REGRESSION: mapping an account a peer already seeded, after a text edit, is a gap", () => {
+		const map = (doc: Y.Doc) => new Y.PermanentUserData(doc).setUserMapping(doc, doc.clientID, "same-account");
+		const peer = new Y.Doc();
+		map(peer);
+		const writer = new Y.Doc();
+		Y.applyUpdate(writer, Y.encodeStateAsUpdate(peer));
+		writer.getText("contents").insert(0, "ABC");
+		map(writer);
+		const before = Y.encodeStateVector(writer);
+		map(writer);
+		const doc = new Y.Doc();
+		Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(doc, Y.encodeStateAsUpdate(writer, before));
+
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("presence pushes into ids alone do not prove a seed: a gap", () => {
 		const ghost = new Y.Doc();
 		const ids = seedIdentity(ghost);
 		const seeded = Y.encodeStateVector(ghost);
@@ -647,8 +665,8 @@ describe("missing clocks outside an identity seed are a gap", () => {
 		const { crdtDoc } = docWithPresenceGap();
 		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
 
-		expect(crdtDoc.store.pendingStructs).not.toBeNull();
-		expect(hasHistoryGap(crdtDoc)).toBe(false);
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
 	});
 
 	test("a hole after the seed is a gap", () => {
