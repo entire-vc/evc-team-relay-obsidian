@@ -605,6 +605,28 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 		expect(state.vault).toBe(AUTHOR_TEXT);
 	});
 
+	test("an edit upload requested after a failed seed attempt is not held to seeding", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const queue = await confirmUnseeded(fakeDoc);
+
+		fakeDoc.bringOnline = async () => false;
+		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(false);
+		fakeDoc.bringOnline = async () => true;
+		peerEdit(crdtDoc, (text) => text.insert(0, "PEER LINE\n"));
+		// The author edits the file: its upload is an ordinary request, queued and run here.
+		state.vault = AUTHOR_TEXT + "EDIT\n";
+		jest.mocked(queue.enqueueUpload).mockRestore();
+		const lane = queue as unknown as { pushToLane: () => Promise<void> };
+		jest.spyOn(lane, "pushToLane").mockResolvedValue(undefined);
+		await queue.enqueueUpload(fakeDoc);
+		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
+
+		// Reconciled as before the seed path existed: the edit is uploaded, the peer's text kept as a copy.
+		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT + "EDIT\n");
+		expect(writeConflictCopy).toHaveBeenCalled();
+	});
+
 	test("a seed is recorded as the base only while the CRDT still holds the file's text", async () => {
 		const crdtDoc = docWithoutText();
 		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);

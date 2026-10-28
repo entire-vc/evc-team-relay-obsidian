@@ -52,6 +52,12 @@ export interface EnqueueOptions {
 	 * it never waits behind a startup pass over hundreds of documents.
 	 */
 	priority?: boolean;
+	/**
+	 * Keeps a pending seed-only restriction (the upload of a note the relay
+	 * never held text for, and its retries). Any other upload request lifts
+	 * it: an edit made since is uploaded and reconciled as usual.
+	 */
+	seedOnly?: boolean;
 }
 
 /** Per-lane queue snapshot exposed by `TransferQueue.laneStats()`. */
@@ -790,6 +796,7 @@ export class TransferQueue extends Loggable {
 		item: AttachmentFile | Document | CanvasDocument,
 		options: EnqueueOptions = {},
 	): Promise<void> {
+		if (!options.seedOnly) this.seedOnlyUploads.delete(item.entityGuid);
 		if (this.syncLane.inFlight.has(item.entityGuid)) {
 			this.debug(`[enqueueUpload] Item ${item.entityGuid} already in progress, skipping`);
 			if (this.isRunning(this.syncLane, item.entityGuid)) {
@@ -902,6 +909,7 @@ export class TransferQueue extends Loggable {
 	private async enqueueInBatch(
 		item: Document | CanvasDocument | AttachmentFile,
 	): Promise<void> {
+		this.seedOnlyUploads.delete(item.entityGuid);
 		if (this.syncLane.inFlight.has(item.entityGuid)) {
 			this.debug(
 				`[enqueueInBatch] Item ${item.entityGuid} already in progress, skipping`,
@@ -1081,7 +1089,8 @@ export class TransferQueue extends Loggable {
 	 */
 	async uploadDocumentViaSocket(doc: Document | CanvasDocument): Promise<boolean> {
 		// Set by a pull that confirmed the note never held text (see pullIfUnchanged()).
-		// Kept until an attempt gets as far as deciding: a retry is seed-only too.
+		// Kept until an attempt gets as far as deciding: a retry is seed-only
+		// too, unless another upload request lifted it (see EnqueueOptions).
 		const seedOnly = this.seedOnlyUploads.has(doc.entityGuid);
 		// Wait for this item's OWN local persistence (IndexedDB) to finish
 		// loading before trusting anything read off its Y.Doc below. Without
@@ -1499,7 +1508,7 @@ export class TransferQueue extends Loggable {
 				this.seedOnlyUploads.add(doc.entityGuid);
 				this.log(`[pullIfUnchanged] relay never held text for ${doc.entryPath}; uploading the file`);
 				this.releasePulledDoc(doc, intent);
-				void this.enqueueUpload(doc, { priority: true }).catch((err: unknown) => {
+				void this.enqueueUpload(doc, { priority: true, seedOnly: true }).catch((err: unknown) => {
 					this.warn("[pullIfUnchanged] queueing upload of the unseeded file failed", doc.entryPath, err);
 				});
 				return { outcome: "seed-local", remoteText };
@@ -2271,6 +2280,7 @@ export class TransferQueue extends Loggable {
 		shouldFlush: () => boolean = () => true,
 	): Promise<boolean> {
 		try {
+			this.seedOnlyUploads.delete(doc.entityGuid);
 			const synced = await this.uploadDocumentViaSocket(doc);
 			if (synced && doc.vaultShare.folderIndex.tracks(doc.entryPath) && shouldFlush()) {
 				await flush();
@@ -2337,7 +2347,8 @@ export class TransferQueue extends Loggable {
 				return;
 			}
 			this.uploadRetryStats.retried++;
-			void this.enqueueUpload(doc, { priority }).catch((error: unknown) =>
+			// Still seed-only unless another request lifted it meanwhile.
+			void this.enqueueUpload(doc, { priority, seedOnly: true }).catch((error: unknown) =>
 				this.warn("[uploadRetry] failed for", doc.entryPath, error),
 			);
 		}, delay);
