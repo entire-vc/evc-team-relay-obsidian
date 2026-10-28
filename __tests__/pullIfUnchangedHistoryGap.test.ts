@@ -513,6 +513,49 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 		expect(writeConflictCopy).not.toHaveBeenCalled();
 	});
 
+	test("a peer's text that lands before the queued upload is not reconciled over", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state } = makeFakeDoc(
+			crdtDoc,
+			AUTHOR_TEXT,
+			undefined,
+		);
+		const { queue, clock } = queueRunningUploads();
+		jest.mocked(queue.enqueueUpload).mockResolvedValue(undefined);
+
+		await queue.pullIfUnchanged(fakeDoc);
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
+
+		const peer = new Y.Doc();
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		await queue.uploadDocumentViaSocket(fakeDoc);
+
+		expect(crdtDoc.getText("contents").toString()).toBe("PEER LINE\n");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(state.vault).toBe(AUTHOR_TEXT);
+	});
+
+	test("a pull in between that does not find the note unseeded restarts the wait", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue, uploads, clock } = queueRunningUploads();
+
+		await queue.pullIfUnchanged(fakeDoc);
+		clock.time += CONFIRM_MS;
+		fakeDoc.onceFreshlySynced = () => new Promise<void>(() => {});
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("not-synced");
+		fakeDoc.onceFreshlySynced = async () => {};
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
+		await Promise.all(uploads);
+		expect(uploads).toHaveLength(1);
+	});
+
 	test("a no-base doc whose text a peer cleared keeps the clear: nothing uploaded, file untouched", async () => {
 		// The relay held the text once and a peer deleted it: its items stay as tombstones.
 		const crdtDoc = docClearedByPeer();
