@@ -399,6 +399,9 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 	});
 });
 
+/** Clocks the user entry below takes. */
+const SEED_SIZE = 4;
+
 /** The user entry `PermanentUserData.setUserMapping` writes first in a fresh doc; returns its `ids` list. */
 function seedIdentity(doc: Y.Doc): Y.Array<number> {
 	const user = new Y.Map<unknown>();
@@ -609,6 +612,31 @@ describe("missing clocks outside an identity seed are a gap", () => {
 
 		expect(doc.getText("contents").toString()).toBe("");
 		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test.each([1, 2, 3])("an identity seed written after a %i-character edit is a gap", (chars) => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "ABC".slice(0, chars));
+		// The seed's last clocks are all the relay ever got.
+		seedIdentity(writer);
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, Y.encodeStateVector(new Map([[writer.clientID, SEED_SIZE]]))));
+
+		expect(doc.store.pendingStructs?.missing).toEqual(new Map([[writer.clientID, SEED_SIZE - 1]]));
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("presence pushes into ids alone still pass as a seed gap", () => {
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		const seeded = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 1]);
+		ids.push([ghost.clientID + 2]);
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(hasHistoryGap(crdtDoc)).toBe(false);
 	});
 
 	test("a hole after the seed is a gap", () => {

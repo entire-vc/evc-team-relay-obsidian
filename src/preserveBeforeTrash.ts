@@ -202,28 +202,37 @@ const SEED_CLOCKS = 4;
  * Layout of those clocks: 0 the user's map in `users`, 1 its `ids` list, 2 its
  * `ds` list, 3 the writer's client id pushed into `ids`.
  */
-const SEED_LISTS = new Set([1, 2]);
+const SEED_DS = 2;
 const SEED_LAST_ID = 3;
 
 /**
- * Whether `client`'s missing clocks 0..3 are its identity seed: pending
- * changes refer to them only as the seed's `ids`/`ds` lists (parent) or its
- * last `ids` entry (left neighbour), and at least one is a list's child.
+ * Whether `client`'s missing clocks 0..3 are its identity seed. Pending changes
+ * may refer to them only as a later seed would be referred to: a delete set
+ * pushed into the empty `ds` list (parent clock 2) or a client id pushed after
+ * the last `ids` entry (left neighbour clock 3). A seed written after an edit
+ * (the account resolved late) sits one clock or more further on, so the same
+ * pushes land on other clocks or carry other content, and the range is a gap.
  */
 function isIdentitySeedGap(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): boolean {
 	const inSeed = (id: Y.ID | null): id is Y.ID => id !== null && id.client === client && id.clock < SEED_CLOCKS;
-	let listChild = false;
+	const deleted = (item: Y.Item) => item.content instanceof Y.ContentDeleted;
+	let referred = false;
 	for (const struct of structs) {
 		if (!(struct instanceof Y.Item)) continue;
 		const parent = struct.parent as unknown;
 		if (parent instanceof Y.ID && inSeed(parent)) {
-			if (!SEED_LISTS.has(parent.clock)) return false;
-			listChild = true;
+			if (parent.clock !== SEED_DS || !(struct.content instanceof Y.ContentBinary || deleted(struct))) return false;
+			referred = true;
 		}
-		if (inSeed(struct.origin) && struct.origin.clock !== SEED_LAST_ID) return false;
+		if (inSeed(struct.origin)) {
+			if (struct.origin.clock !== SEED_LAST_ID || !(struct.content instanceof Y.ContentAny || deleted(struct))) {
+				return false;
+			}
+			referred = true;
+		}
 		if (inSeed(struct.rightOrigin)) return false;
 	}
-	return listChild;
+	return referred;
 }
 
 /** Content kinds a Y.Text never holds: list and map values. */
