@@ -37,9 +37,7 @@ export function watchHistoryGapClose(
 	// are contiguous, so a struct, reference or deletion at a clock implies
 	// every clock before it.
 	const ancestry = new Map<number, number>();
-	const needs = (id: Y.ID | null) => {
-		if (id && id.clock + 1 > (ancestry.get(id.client) ?? 0)) ancestry.set(id.client, id.clock + 1);
-	};
+	const needs = (id: Y.ID | null) => extend(ancestry, id);
 	for (const struct of structs) {
 		if (struct instanceof Y.Skip) continue;
 		const { client, clock } = struct.id;
@@ -48,7 +46,7 @@ export function watchHistoryGapClose(
 		if (struct instanceof Y.Item) {
 			needs(struct.origin);
 			needs(struct.rightOrigin);
-			if (struct.parent instanceof Y.ID) needs(struct.parent);
+			needs(parentId(struct));
 			if (struct.content instanceof Y.ContentString) {
 				push(strings, client, { clock, str: struct.content.str });
 			}
@@ -67,6 +65,7 @@ export function watchHistoryGapClose(
 	const handler = () => {
 		if (hasHistoryGap(ydoc)) return;
 		ydoc.off("afterTransaction", handler);
+		expandAncestry(ydoc, ancestry);
 		onClose(textAt(ydoc.getText(ytextName), history));
 	};
 	ydoc.on("afterTransaction", handler);
@@ -78,6 +77,45 @@ interface LocalHistory {
 	deleted: Map<number, Range[]>;
 	strings: Map<number, { clock: number; str: string }[]>;
 	ancestry: Map<number, number>;
+}
+
+/** Raises `ancestry` to cover `id`; true if it grew. */
+function extend(ancestry: Map<number, number>, id: Y.ID | null): boolean {
+	if (!id || id.clock + 1 <= (ancestry.get(id.client) ?? 0)) return false;
+	ancestry.set(id.client, id.clock + 1);
+	return true;
+}
+
+function parentId(item: Y.Item): Y.ID | null {
+	const parent = item.parent;
+	if (parent instanceof Y.ID) return parent;
+	return parent instanceof Y.AbstractType ? (parent._item?.id ?? null) : null;
+}
+
+/**
+ * Follows what the history this client built on but did not store builds on
+ * in turn: the closed gap has brought those structs in, and their references
+ * reach clocks this client also saw (a chain through another client's
+ * mapping can lead back to text).
+ */
+function expandAncestry(ydoc: Y.Doc, ancestry: Map<number, number>): void {
+	const scanned = new Map<number, number>();
+	let grew = true;
+	while (grew) {
+		grew = false;
+		for (const [client, end] of [...ancestry]) {
+			const from = scanned.get(client) ?? 0;
+			if (from >= end) continue;
+			scanned.set(client, end);
+			for (const struct of ydoc.store.clients.get(client) ?? []) {
+				if (struct.id.clock >= end) break;
+				if (struct.id.clock + struct.length <= from || !(struct instanceof Y.Item)) continue;
+				for (const id of [struct.origin, struct.rightOrigin, parentId(struct)]) {
+					if (extend(ancestry, id)) grew = true;
+				}
+			}
+		}
+	}
 }
 
 function push<T>(map: Map<number, T[]>, client: number, value: T): void {

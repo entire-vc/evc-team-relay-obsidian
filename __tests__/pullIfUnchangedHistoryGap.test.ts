@@ -417,6 +417,45 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		expect(state.vault).toBe(" tail");
 	});
 
+	test("a no-base doc whose stored history reaches text it does not hold through another client is not taken for stale", async () => {
+		// B typed "TAIL"; A put "BASE" before it, then appended to a list;
+		// C appended after A, B after C. Only B's structs are stored: they
+		// reach A's "BASE" only through C's entry, which is missing. No
+		// deletion names A either.
+		const b = new Y.Doc();
+		b.getText("contents").insert(0, "TAIL");
+		const a = new Y.Doc();
+		Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+		a.getText("contents").insert(0, "BASE");
+		a.getArray("chain").push([1]);
+		const c = new Y.Doc();
+		Y.applyUpdate(c, Y.encodeStateAsUpdate(a));
+		c.getArray("chain").push([2]);
+		Y.applyUpdate(b, Y.encodeStateAsUpdate(c));
+		b.getArray("chain").push([3]);
+		const allButB = Y.decodeStateVector(Y.encodeStateVector(b));
+		allButB.delete(b.clientID);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(b, Y.encodeStateVector(allButB)));
+		expect(crdtDoc.getText("contents").toString()).toBe("TAIL");
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		// Deleted "BASE" while the plugin was not running.
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, "TAIL", undefined);
+		const queue = makeQueue();
+
+		await queue.uploadDocumentViaSocket(fakeDoc);
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, Y.encodeStateAsUpdate(b));
+		peer.getText("contents").insert(0, "PEER ");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		expect(crdtDoc.getText("contents").toString()).toBe("PEER BASETAIL");
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("TAIL");
+	});
+
 	test("a no-base doc whose gap is only a deletion of text it does not hold is not taken for stale", async () => {
 		const author = new Y.Doc();
 		author.getText("contents").insert(0, "BASE");
