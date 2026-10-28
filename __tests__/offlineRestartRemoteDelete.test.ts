@@ -14,6 +14,8 @@ import { describe, test, expect, jest } from "@jest/globals";
 import * as Y from "yjs";
 import { TFile } from "obsidian";
 import { VaultShare } from "../src/VaultShare";
+import { ProviderBacked } from "../src/ProviderBacked";
+import { RemoteFolderAddress } from "../src/ResourceAddress";
 import { Document } from "../src/Document";
 import { CanvasDocument } from "../src/CanvasDocument";
 import { FolderIndex } from "../src/FolderIndex";
@@ -313,6 +315,43 @@ describe("offline restart after a remote delete", () => {
 			await upload;
 
 			expect(publishFile).not.toHaveBeenCalled();
+		});
+
+		test("the folder connects only after its stored records are read", async () => {
+			const client = new Client("TRDEL");
+			let loaded = (): void => {};
+			Object.assign(client.share, {
+				_resourceAddress: new RemoteFolderAddress("relay", "folder"),
+				_wantsConnection: true,
+				_localDb: { synced: false, once: (_event: string, cb: () => void) => (loaded = cb) },
+			});
+			Object.defineProperty(client.share, "isOnline", { value: false });
+			const connect = jest
+				.spyOn(ProviderBacked.prototype, "bringOnline")
+				.mockImplementation(async () => {
+					// The server's state, including the peer's delete, lands now.
+					deleteRemotely(client, "gone.md");
+					return true;
+				});
+			try {
+				const records = (client.share as unknown as {
+					recordsBeforeSync(): Promise<Map<string, unknown>>;
+				}).recordsBeforeSync();
+				const online = client.share.bringOnline();
+				await Promise.resolve();
+				expect(connect).not.toHaveBeenCalled();
+
+				// A large stored history loads after the connection was requested.
+				client.index.put("gone.md", makeDocumentRecord("guid-gone.md"));
+				loaded();
+				expect(await online).toBe(true);
+
+				expect(connect).toHaveBeenCalledTimes(1);
+				expect((await records).has("gone.md")).toBe(true);
+				expect(client.index.wasRemoved("gone.md")).toBe(true);
+			} finally {
+				connect.mockRestore();
+			}
 		});
 
 		test("a new local note at a path deleted before this client ever saw it is uploaded", async () => {
