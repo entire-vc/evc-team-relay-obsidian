@@ -97,7 +97,7 @@ function makeFakeDoc(crdtDoc: Y.Doc, vaultContents: string, syncBase: string | u
 	Object.defineProperty(fakeDoc, "awaitFirstSync", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "crdtDoc", { value: crdtDoc });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
-	Object.defineProperty(fakeDoc, "bringOnline", { value: async () => true, writable: true });
+	Object.defineProperty(fakeDoc, "bringOnline", { value: async () => true });
 	Object.defineProperty(fakeDoc, "onceOnline", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "onceEverSynced", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "onceFreshlySynced", { value: async () => {}, writable: true });
@@ -405,8 +405,9 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
  * pull is the one pass that still looks at it, and without a base it left
  * the file alone. Every other client kept the note empty.
  */
-describe("pullIfUnchanged — an author's text that never reached the relay is uploaded", () => {
+describe("pullIfUnchanged — an author's text that never reached the relay is seeded", () => {
 	const AUTHOR_TEXT = "TR acceptance entire-018-2014\nUnicode: café, заметка, 日本語\n";
+	const CONFIRM_MS = 60_000;
 
 	/** The author's doc as stored: presence only, no text item ever, no init claim. */
 	function docWithoutText(): Y.Doc {
@@ -423,132 +424,6 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 		return relay;
 	}
 
-	const CONFIRM_MS = 60_000;
-
-	function queueRunningUploads(clock = new InstantClock()) {
-		const queue = makeQueue(clock);
-		const uploads: Promise<boolean>[] = [];
-		jest.mocked(queue.enqueueUpload).mockImplementation(async (doc) => {
-			uploads.push(queue.uploadDocumentViaSocket(doc as Document));
-		});
-		return { queue, uploads, clock };
-	}
-
-	test("REGRESSION: a no-base author whose relay text never held an item uploads it on the confirming pass", async () => {
-		const crdtDoc = docWithoutText();
-		const relay = relayOf(crdtDoc);
-		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const { queue, uploads, clock } = queueRunningUploads();
-
-		// One connection proves nothing: a room still loading also reads empty.
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
-		expect(uploads).toHaveLength(0);
-		clock.time += CONFIRM_MS;
-
-		const pull = await queue.pullIfUnchanged(fakeDoc);
-		await Promise.all(uploads);
-
-		expect(pull.outcome).toBe("seed-local");
-		expect(uploads).toHaveLength(1);
-		// Disk = CRDT = relay = the author's text, and that is the agreed base.
-		expect(state.vault).toBe(AUTHOR_TEXT);
-		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT);
-		expect(relay.getText("contents").toString()).toBe(AUTHOR_TEXT);
-		expect(state.syncBase).toBe(AUTHOR_TEXT);
-		expect(writeContents).not.toHaveBeenCalled();
-		expect(writeConflictCopy).not.toHaveBeenCalled();
-
-		// The next pass finds nothing to do.
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("unchanged");
-		await Promise.all(uploads);
-		expect(uploads).toHaveLength(1);
-		expect(relay.getText("contents").toString()).toBe(AUTHOR_TEXT);
-	});
-
-	test("a confirmation that the relay contradicts in between starts over", async () => {
-		const crdtDoc = docWithoutText();
-		const { fakeDoc, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const { queue, uploads, clock } = queueRunningUploads();
-
-		await queue.pullIfUnchanged(fakeDoc);
-		// The loaded room turns out to hold a peer's text: not a seed case.
-		const peer = new Y.Doc();
-		peer.getText("contents").insert(0, "PEER LINE\n");
-		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
-		clock.time += CONFIRM_MS;
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
-		// The peer clears it again: tombstones remain, still not a seed case.
-		peer.getText("contents").delete(0, peer.getText("contents").length);
-		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
-		clock.time += CONFIRM_MS;
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
-		await Promise.all(uploads);
-
-		expect(uploads).toHaveLength(0);
-		expect(crdtDoc.getText("contents").toString()).toBe("");
-		expect(state.vault).toBe(AUTHOR_TEXT);
-	});
-
-	test("a peer's insert and clear that land before the queued upload are not undone", async () => {
-		const crdtDoc = docWithoutText();
-		const { fakeDoc, writeConflictCopy } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const { queue, clock } = queueRunningUploads();
-		const queued: Document[] = [];
-		jest.mocked(queue.enqueueUpload).mockImplementation(async (doc) => {
-			queued.push(doc as Document);
-		});
-
-		await queue.pullIfUnchanged(fakeDoc);
-		clock.time += CONFIRM_MS;
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
-		expect(queued).toHaveLength(1);
-
-		const peer = new Y.Doc();
-		peer.getText("contents").insert(0, "PEER LINE\n");
-		peer.getText("contents").delete(0, peer.getText("contents").length);
-		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
-		await queue.uploadDocumentViaSocket(fakeDoc);
-
-		expect(crdtDoc.getText("contents").toString()).toBe("");
-		expect(writeConflictCopy).not.toHaveBeenCalled();
-	});
-
-	test("a peer's text that lands before the queued upload is not reconciled over", async () => {
-		const crdtDoc = docWithoutText();
-		const { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state } = makeFakeDoc(
-			crdtDoc,
-			AUTHOR_TEXT,
-			undefined,
-		);
-		const { queue, clock } = queueRunningUploads();
-		jest.mocked(queue.enqueueUpload).mockResolvedValue(undefined);
-
-		await queue.pullIfUnchanged(fakeDoc);
-		clock.time += CONFIRM_MS;
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
-
-		const peer = new Y.Doc();
-		peer.getText("contents").insert(0, "PEER LINE\n");
-		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
-		await queue.uploadDocumentViaSocket(fakeDoc);
-
-		expect(crdtDoc.getText("contents").toString()).toBe("PEER LINE\n");
-		expect(writeConflictCopy).not.toHaveBeenCalled();
-		expect(writeContents).not.toHaveBeenCalled();
-		expect(setSyncBase).not.toHaveBeenCalled();
-		expect(state.vault).toBe(AUTHOR_TEXT);
-	});
-
-	/** Runs the two pulls that confirm the note unseeded, leaving its upload to the test. */
-	async function confirmUnseeded(fakeDoc: Document) {
-		const { queue, clock } = queueRunningUploads();
-		jest.mocked(queue.enqueueUpload).mockResolvedValue(undefined);
-		await queue.pullIfUnchanged(fakeDoc);
-		clock.time += CONFIRM_MS;
-		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
-		return queue;
-	}
-
 	/** Applies `edit` from a peer that has seen everything `crdtDoc` holds. */
 	function peerEdit(crdtDoc: Y.Doc, edit: (text: Y.Text) => void) {
 		const peer = new Y.Doc();
@@ -558,81 +433,118 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer, before));
 	}
 
-	test("a peer's text that lands while the upload reads the file is not reconciled over", async () => {
-		const crdtDoc = docWithoutText();
-		const { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state } = makeFakeDoc(
-			crdtDoc,
-			AUTHOR_TEXT,
-			undefined,
-		);
-		const queue = await confirmUnseeded(fakeDoc);
+	/** Runs the first pull, which only starts the wait, and moves the clock past it. */
+	async function firstPull(fakeDoc: Document) {
+		const clock = new InstantClock();
+		const queue = makeQueue(clock);
+		const first = await queue.pullIfUnchanged(fakeDoc);
+		clock.time += CONFIRM_MS;
+		return { queue, clock, first };
+	}
 
-		// The upload checks the text, then reads the file: the peer's text lands during that read.
+	/** Runs `edit` during the `nth` file read from now on. */
+	function duringRead(fakeDoc: Document, state: { vault: string }, nth: number, edit: () => void) {
 		let reads = 0;
 		fakeDoc.vaultShare.readContents = async () => {
-			if (++reads === 2) peerEdit(crdtDoc, (text) => text.insert(0, "PEER LINE\n"));
+			if (++reads === nth) edit();
 			return state.vault;
 		};
-		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
+		return () => reads;
+	}
 
-		expect(reads).toBeGreaterThanOrEqual(2);
-		expect(crdtDoc.getText("contents").toString()).toBe("PEER LINE\n");
-		expect(writeConflictCopy).not.toHaveBeenCalled();
+	test("REGRESSION: a no-base author whose relay text never held an item is seeded on the confirming pass", async () => {
+		const crdtDoc = docWithoutText();
+		const relay = relayOf(crdtDoc);
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+
+		// One connection proves nothing: a room still loading also reads empty.
+		const { queue, first } = await firstPull(fakeDoc);
+		expect(first.outcome).toBe("no-base");
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
+
+		// Disk = CRDT = relay = the author's text, and that is the agreed base.
+		expect(state.vault).toBe(AUTHOR_TEXT);
+		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT);
+		expect(relay.getText("contents").toString()).toBe(AUTHOR_TEXT);
+		expect(state.syncBase).toBe(AUTHOR_TEXT);
 		expect(writeContents).not.toHaveBeenCalled();
-		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(queue.enqueueUpload).not.toHaveBeenCalled();
+
+		// The next pass finds nothing to do.
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("unchanged");
+		expect(relay.getText("contents").toString()).toBe(AUTHOR_TEXT);
+	});
+
+	test("a confirmation that the relay contradicts in between starts over", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue, clock } = await firstPull(fakeDoc);
+
+		// The loaded room turns out to hold a peer's text: not a seed case.
+		peerEdit(crdtDoc, (text) => text.insert(0, "PEER LINE\n"));
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		// The peer clears it again: tombstones remain, still not a seed case.
+		peerEdit(crdtDoc, (text) => text.delete(0, text.length));
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+
+		expect(crdtDoc.getText("contents").toString()).toBe("");
 		expect(state.vault).toBe(AUTHOR_TEXT);
 	});
 
-	test("an upload that fails to connect leaves its retry seed-only", async () => {
+	test("a peer's insert and clear that land while the seed reads the file are not undone", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, writeConflictCopy, setSyncBase, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue } = await firstPull(fakeDoc);
+
+		// The pull reads the file twice before it decides; the seed's read is the third.
+		const reads = duringRead(fakeDoc, state, 3, () =>
+			peerEdit(crdtDoc, (text) => {
+				text.insert(0, "PEER LINE\n");
+				text.delete(0, text.length);
+			}),
+		);
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+
+		expect(reads()).toBeGreaterThanOrEqual(3);
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(state.vault).toBe(AUTHOR_TEXT);
+		expect(queue.enqueueUpload).not.toHaveBeenCalled();
+	});
+
+	test("a peer's text that lands while the seed reads the file is not reconciled over", async () => {
 		const crdtDoc = docWithoutText();
 		const { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state } = makeFakeDoc(
 			crdtDoc,
 			AUTHOR_TEXT,
 			undefined,
 		);
-		const queue = await confirmUnseeded(fakeDoc);
+		const { queue } = await firstPull(fakeDoc);
 
-		fakeDoc.bringOnline = async () => false;
-		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(false);
-		fakeDoc.bringOnline = async () => true;
-		peerEdit(crdtDoc, (text) => text.insert(0, "PEER LINE\n"));
-		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
+		duringRead(fakeDoc, state, 3, () => peerEdit(crdtDoc, (text) => text.insert(0, "PEER LINE\n")));
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
 
 		expect(crdtDoc.getText("contents").toString()).toBe("PEER LINE\n");
 		expect(writeConflictCopy).not.toHaveBeenCalled();
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(setSyncBase).not.toHaveBeenCalled();
 		expect(state.vault).toBe(AUTHOR_TEXT);
-	});
-
-	test("an edit upload requested after a failed seed attempt is not held to seeding", async () => {
-		const crdtDoc = docWithoutText();
-		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const queue = await confirmUnseeded(fakeDoc);
-
-		fakeDoc.bringOnline = async () => false;
-		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(false);
-		fakeDoc.bringOnline = async () => true;
-		peerEdit(crdtDoc, (text) => text.insert(0, "PEER LINE\n"));
-		// The author edits the file: its upload is an ordinary request, queued and run here.
-		state.vault = AUTHOR_TEXT + "EDIT\n";
-		jest.mocked(queue.enqueueUpload).mockRestore();
-		const lane = queue as unknown as { pushToLane: () => Promise<void> };
-		jest.spyOn(lane, "pushToLane").mockResolvedValue(undefined);
-		await queue.enqueueUpload(fakeDoc);
-		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
-
-		// Reconciled as before the seed path existed: the edit is uploaded, the peer's text kept as a copy.
-		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT + "EDIT\n");
-		expect(writeConflictCopy).toHaveBeenCalled();
+		expect(queue.enqueueUpload).not.toHaveBeenCalled();
 	});
 
 	test("a seed is recorded as the base only while the CRDT still holds the file's text", async () => {
 		const crdtDoc = docWithoutText();
 		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const queue = await confirmUnseeded(fakeDoc);
+		const { queue } = await firstPull(fakeDoc);
 
-		// A peer edits the seeded text while the upload reads the file to record the base.
+		// A peer edits the seeded text while the seed reads the file to record the base.
 		let edited = false;
 		fakeDoc.vaultShare.readContents = async () => {
 			if (!edited && crdtDoc.getText("contents").toString() === AUTHOR_TEXT) {
@@ -641,7 +553,7 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 			}
 			return state.vault;
 		};
-		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
 
 		expect(edited).toBe(true);
 		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT + "PEER LINE\n");
@@ -654,21 +566,19 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 	test("a pull in between that does not find the note unseeded restarts the wait", async () => {
 		const crdtDoc = docWithoutText();
 		const { fakeDoc } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const { queue, uploads, clock } = queueRunningUploads();
+		const { queue, clock } = await firstPull(fakeDoc);
 
-		await queue.pullIfUnchanged(fakeDoc);
-		clock.time += CONFIRM_MS;
 		fakeDoc.onceFreshlySynced = () => new Promise<void>(() => {});
 		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("not-synced");
 		fakeDoc.onceFreshlySynced = async () => {};
 		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		expect(crdtDoc.getText("contents").toString()).toBe("");
 		clock.time += CONFIRM_MS;
 		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
-		await Promise.all(uploads);
-		expect(uploads).toHaveLength(1);
+		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT);
 	});
 
-	test("a no-base doc whose text a peer cleared keeps the clear: nothing uploaded, file untouched", async () => {
+	test("a no-base doc whose text a peer cleared keeps the clear: nothing seeded, file untouched", async () => {
 		// The relay held the text once and a peer deleted it: its items stay as tombstones.
 		const crdtDoc = docClearedByPeer();
 		const relay = relayOf(crdtDoc);
@@ -677,59 +587,55 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 			AUTHOR_TEXT,
 			undefined,
 		);
-		const { queue, uploads, clock } = queueRunningUploads();
+		const { queue } = await firstPull(fakeDoc);
 
-		await queue.pullIfUnchanged(fakeDoc);
-		clock.time += CONFIRM_MS;
-		const pull = await queue.pullIfUnchanged(fakeDoc);
-		await Promise.all(uploads);
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
 
-		expect(pull.outcome).toBe("no-base");
-		expect(uploads).toHaveLength(0);
 		expect(crdtDoc.getText("contents").toString()).toBe("");
 		expect(relay.getText("contents").toString()).toBe("");
 		expect(state.vault).toBe(AUTHOR_TEXT);
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(writeConflictCopy).not.toHaveBeenCalled();
 		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(queue.enqueueUpload).not.toHaveBeenCalled();
 	});
 
-	test("a no-base doc with a history gap and no text item is not uploaded", async () => {
-		// The pending part may be the author's own text: an upload would double it.
+	test("a no-base doc with a history gap and no text item is not seeded", async () => {
+		// The pending part may be the author's own text: a seed would double it.
 		const history = authorHistory(AUTHOR_TEXT);
 		const crdtDoc = docWithHistoryGap(history);
 		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const { queue, uploads } = queueRunningUploads();
+		const clock = new InstantClock();
+		const queue = makeQueue(clock);
 
 		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
-		await Promise.all(uploads);
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
 
-		expect(uploads).toHaveLength(0);
 		expect(writeContents).not.toHaveBeenCalled();
+		expect(queue.enqueueUpload).not.toHaveBeenCalled();
 		Y.applyUpdate(crdtDoc, history.full);
 		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT);
 		expect(state.vault).toBe(AUTHOR_TEXT);
 	});
 
-	test("a no-base doc whose seed is already marked done is not uploaded again", async () => {
+	test("a no-base doc whose seed is already marked done is not seeded again", async () => {
 		const crdtDoc = docWithoutText();
 		crdtDoc.getMap("meta").set("initDone", true);
 		const { fakeDoc } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const { queue, uploads, clock } = queueRunningUploads();
+		const { queue } = await firstPull(fakeDoc);
 
-		await queue.pullIfUnchanged(fakeDoc);
-		clock.time += CONFIRM_MS;
 		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
-		expect(uploads).toHaveLength(0);
+		expect(crdtDoc.getText("contents").toString()).toBe("");
 	});
 
-	test("an empty file on a no-base doc uploads nothing", async () => {
-		const { fakeDoc } = makeFakeDoc(docWithoutText(), "", undefined);
-		const { queue, uploads, clock } = queueRunningUploads();
+	test("an empty file on a no-base doc seeds nothing", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc } = makeFakeDoc(crdtDoc, "", undefined);
+		const { queue } = await firstPull(fakeDoc);
 
 		await queue.pullIfUnchanged(fakeDoc);
-		clock.time += CONFIRM_MS;
-		await queue.pullIfUnchanged(fakeDoc);
-		expect(uploads).toHaveLength(0);
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+		expect(queue.enqueueUpload).not.toHaveBeenCalled();
 	});
 });
