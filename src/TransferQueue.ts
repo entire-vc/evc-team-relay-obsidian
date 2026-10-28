@@ -179,6 +179,9 @@ export type PullPhase =
 	| "preserve"
 	| "write";
 
+/** Identifies one pull's ownership of a note's connection. */
+type PullHold = Record<string, never>;
+
 export interface PullControl {
 	/** Once aborted, the pull writes nothing more and releases its connection. */
 	signal?: AbortSignal;
@@ -297,8 +300,11 @@ export class TransferQueue extends Loggable {
 
 	private syncLane: QueueLaneState;
 	private readonly uploadTrace: PriorityUploadTrace[] = [];
-	/** Documents a background pull connected and still holds. */
-	private readonly pullHolds = new Set<string>();
+	/**
+	 * Documents a background pull connected and still holds, with the pull
+	 * that owns the connection now: only that pull may close it.
+	 */
+	private readonly pullHolds = new Map<string, PullHold>();
 	/** Pull connections left open for a queued upload, which then closes them. */
 	private readonly handedToUpload = new Set<string>();
 	private downloadLane: QueueLaneState;
@@ -1313,11 +1319,12 @@ export class TransferQueue extends Loggable {
 		// Any pull that does not find the note unseeded again restarts its wait.
 		const unseededSince = this.unseededSince.get(doc.entityGuid);
 		this.unseededSince.delete(doc.entityGuid);
+		const hold: PullHold = {};
 		try {
-			return await this.pullIfUnchangedOnce(doc, control, unseededSince);
+			return await this.pullIfUnchangedOnce(doc, control, unseededSince, hold);
 		} finally {
 			// Every return releases the hold; this covers a throw.
-			this.pullHolds.delete(doc.entityGuid);
+			this.dropPullHold(doc, hold);
 		}
 	}
 
@@ -1325,6 +1332,7 @@ export class TransferQueue extends Loggable {
 		doc: Document,
 		control: PullControl,
 		unseededSince: number | undefined,
+		ownHold: PullHold,
 	): Promise<PullResult> {
 		const { signal, onPhase } = control;
 		// Every await below may outlive the caller's deadline:
@@ -1338,14 +1346,17 @@ export class TransferQueue extends Loggable {
 		onPhase?.("first-sync");
 		await doc.awaitFirstSync();
 		if (aborted()) return { outcome: "aborted" };
-		const intent = doc.connectionIntent;
+		// A pull aborted at its deadline may still hold the connection it
+		// opened: take it over, so that pull's late release leaves it alone.
+		const hold =
+			doc.connectionIntent === "disconnected" || this.pullHolds.has(doc.entityGuid) ? ownHold : undefined;
 		onPhase?.("connect");
-		if (intent === "disconnected") this.pullHolds.add(doc.entityGuid);
+		if (hold) this.pullHolds.set(doc.entityGuid, hold);
 		const connected = await doc.bringOnline();
 		if (!connected || aborted()) {
 			// bringOnline() can leave a retry scheduled (or, if it resolved
 			// late, an open socket); a background pull must not keep either.
-			this.releasePulledDoc(doc, intent);
+			this.releasePulledDoc(doc, hold);
 			if (!connected) this.warn("[pullIfUnchanged] connect failed for", doc.entryPath);
 			return { outcome: connected ? "aborted" : "connect-failed" };
 		}
@@ -1363,7 +1374,7 @@ export class TransferQueue extends Loggable {
 		onPhase?.("await-online");
 		await this.raceTimeout(doc.onceOnline(), PULL_CONNECT_TIMEOUT_MS);
 		if (aborted()) {
-			this.releasePulledDoc(doc, intent);
+			this.releasePulledDoc(doc, hold);
 			return { outcome: "aborted" };
 		}
 		onPhase?.("grace");
@@ -1374,10 +1385,15 @@ export class TransferQueue extends Loggable {
 			// paying for another connect on each re-check.
 			onPhase?.("await-content");
 			const reconnect =
-				intent === "disconnected"
+				hold !== undefined
 					? async () => {
-							// An editor or an upload took the connection over meanwhile: not ours to drop.
-							if (doc.editLock || this.syncLane.inFlight.has(doc.entityGuid)) return;
+							// An editor, an upload or a newer pull took the connection over meanwhile: not ours to drop.
+							if (
+								doc.editLock ||
+								this.syncLane.inFlight.has(doc.entityGuid) ||
+								this.pullHolds.get(doc.entityGuid) !== hold
+							)
+								return;
 							control.onReconnect?.();
 							doc.goOffline();
 							if (!(await doc.bringOnline()) || aborted()) return;
@@ -1386,7 +1402,7 @@ export class TransferQueue extends Loggable {
 					: undefined;
 			await this.awaitText(doc, control.expected, control.awaitContentMs, aborted, reconnect);
 			if (aborted()) {
-				this.releasePulledDoc(doc, intent);
+				this.releasePulledDoc(doc, hold);
 				return { outcome: "aborted" };
 			}
 		}
@@ -1398,12 +1414,12 @@ export class TransferQueue extends Loggable {
 		const synced =
 			(await this.raceTimeout(doc.onceFreshlySynced().then(() => true), PULL_CONNECT_TIMEOUT_MS)) === true;
 		if (aborted()) {
-			this.releasePulledDoc(doc, intent);
+			this.releasePulledDoc(doc, hold);
 			return { outcome: "aborted" };
 		}
 		if (!synced) {
 			this.log(`[pullIfUnchanged] no completed sync for ${doc.entryPath}; leaving the file as is`);
-			this.releasePulledDoc(doc, intent);
+			this.releasePulledDoc(doc, hold);
 			return { outcome: "not-synced" };
 		}
 		if (hasHistoryGap(doc.crdtDoc)) {
@@ -1412,13 +1428,13 @@ export class TransferQueue extends Loggable {
 			// until the relay sends the missing part. Not what was last synced,
 			// however long it lasts: writing it would blank a full file for good.
 			this.log(`[pullIfUnchanged] history gap in ${doc.entryPath}; leaving the file as is`);
-			this.releasePulledDoc(doc, intent);
+			this.releasePulledDoc(doc, hold);
 			return { outcome: "history-gap" };
 		}
 		const remoteText = doc.content;
 		const vaultContentsAfter = await this.readVaultContents(doc);
 		if (aborted()) {
-			this.releasePulledDoc(doc, intent);
+			this.releasePulledDoc(doc, hold);
 			return { outcome: "aborted" };
 		}
 		if (
@@ -1443,13 +1459,13 @@ export class TransferQueue extends Loggable {
 				// Never recreate a folder the user is deleting; otherwise a
 				// removed or renamed parent must exist before the write.
 				if (doc.vaultShare.isDeletePending(doc.entryPath)) {
-					this.releasePulledDoc(doc, intent);
+					this.releasePulledDoc(doc, hold);
 					return { outcome: "unchanged", remoteText };
 				}
 				await doc.vaultShare.ensureParentDir(doc.entryPath);
 			}
 			if (aborted()) {
-				this.releasePulledDoc(doc, intent);
+				this.releasePulledDoc(doc, hold);
 				return { outcome: "aborted" };
 			}
 			const unseeded =
@@ -1481,7 +1497,7 @@ export class TransferQueue extends Loggable {
 					const outcome = await this.seedUnseededText(doc, aborted, onPhase);
 					return { outcome, remoteText: doc.content };
 				} finally {
-					this.releasePulledDoc(doc, intent);
+					this.releasePulledDoc(doc, hold);
 				}
 			}
 			if (syncBase === undefined && !missingOnDisk) {
@@ -1489,11 +1505,11 @@ export class TransferQueue extends Loggable {
 				// this doc -- can't tell a genuine unsynced edit apart from
 				// our own in-flight seed racing this read. Leave
 				// it for uploadDocumentViaSocket() to reconcile properly.
-				this.releasePulledDoc(doc, intent);
+				this.releasePulledDoc(doc, hold);
 				return { outcome: "no-base", remoteText };
 			}
 			if (aborted()) {
-				this.releasePulledDoc(doc, intent);
+				this.releasePulledDoc(doc, hold);
 				return { outcome: "aborted" };
 			}
 			if (syncBase !== undefined && sameTextContent(remoteText, syncBase) && vaultContentsAfter !== "") {
@@ -1516,7 +1532,7 @@ export class TransferQueue extends Loggable {
 					`[pullIfUnchanged] relay unchanged since last sync for ${doc.entryPath}; ` +
 						`keeping local edit and queueing its upload`,
 				);
-				this.releasePulledDoc(doc, intent);
+				this.releasePulledDoc(doc, hold);
 				void this.enqueueUpload(doc, { priority: true }).catch((err: unknown) => {
 					this.warn("[pullIfUnchanged] queueing upload of local edit failed", doc.entryPath, err);
 				});
@@ -1553,7 +1569,7 @@ export class TransferQueue extends Loggable {
 			// Stop before overwriting: the vault file still holds the local
 			// text (and now a copy of it), so leaving it is always safe.
 			if (aborted()) {
-				this.releasePulledDoc(doc, intent);
+				this.releasePulledDoc(doc, hold);
 				return { outcome: "aborted" };
 			}
 			// Point of no return: the overwrite and the sync-base update below
@@ -1591,17 +1607,22 @@ export class TransferQueue extends Loggable {
 			// the receiver, from the second edit on.
 			await doc.setSyncBase(remoteText);
 			this.log(`[pullIfUnchanged] flushed remote update to disk for ${doc.entryPath}`);
-			this.releasePulledDoc(doc, intent);
+			this.releasePulledDoc(doc, hold);
 			return { outcome: "flushed", remoteText };
 		}
 
-		this.releasePulledDoc(doc, intent);
+		this.releasePulledDoc(doc, hold);
 		return { outcome: "unchanged", remoteText };
 	}
 
-	/** Drops the connection pullIfUnchanged() opened, unless the doc was already online or is being edited. */
-	private releasePulledDoc(doc: Document, intent: Document["connectionIntent"]): void {
-		if (intent !== "disconnected") return;
+	/**
+	 * Drops the connection pullIfUnchanged() opened, unless the doc was
+	 * already online, is being edited, or a newer pull took it over.
+	 */
+	private releasePulledDoc(doc: Document, hold: PullHold | undefined): void {
+		if (!hold) return;
+		const owner = this.pullHolds.get(doc.entityGuid);
+		if (owner && owner !== hold) return;
 		this.pullHolds.delete(doc.entityGuid);
 		if (doc.editLock) return;
 		if (this.syncLane.inFlight.has(doc.entityGuid)) {
@@ -1612,6 +1633,11 @@ export class TransferQueue extends Loggable {
 		}
 		doc.goOffline();
 		doc.vaultShare.credentialCache.dropFromQueue(ResourceAddress.serialize(doc.resourceAddress));
+	}
+
+	/** Ends `hold`, unless another pull owns the connection now. */
+	private dropPullHold(doc: Document, hold: PullHold): void {
+		if (this.pullHolds.get(doc.entityGuid) === hold) this.pullHolds.delete(doc.entityGuid);
 	}
 
 	/** Closes a pull connection handed to an upload that ended without closing it. */
@@ -1682,6 +1708,8 @@ export class TransferQueue extends Loggable {
 	 */
 	async probeRelay(doc: Document): Promise<RelayProbeSample | undefined> {
 		if (doc.connectionIntent !== "disconnected") return undefined;
+		const hold: PullHold = {};
+		this.pullHolds.set(doc.entityGuid, hold);
 		const at = this.clock.now();
 		// Socket timings are wall-clock (YSweetProvider.connectTrace).
 		const wallAt = Date.now();
@@ -1702,7 +1730,7 @@ export class TransferQueue extends Loggable {
 			};
 		} finally {
 			// releasePulledDoc() leaves a document opened in the editor meanwhile (editLock) connected.
-			const release = () => this.releasePulledDoc(doc, "disconnected");
+			const release = () => this.releasePulledDoc(doc, hold);
 			release();
 			// A connect that lands after the timeout must not stay open.
 			if (!connected) void online.then(release, () => undefined);
