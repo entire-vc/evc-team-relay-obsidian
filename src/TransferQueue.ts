@@ -21,6 +21,7 @@ import { hasPreservableContent, sameTextContent } from "./textEquivalence";
 import { waitForBufferFlush } from "./websocketFlush";
 import { textFingerprint } from "./docActivity";
 import { hasHistoryGap } from "./preserveBeforeTrash";
+import { watchHistoryGapClose } from "./historyGapLocalText";
 import {
 	claimInitIfUnclaimed,
 	wonInitClaim,
@@ -293,6 +294,11 @@ export class TransferQueue extends Loggable {
 	private readonly pullHolds = new Set<string>();
 	/** Pull connections left open for a queued upload, which then closes them. */
 	private readonly handedToUpload = new Set<string>();
+	/**
+	 * Documents seen with a history gap, keyed by guid: once the gap closes,
+	 * the text this client's own history held (null if it can't be read back).
+	 */
+	private readonly gapLocalTexts = new Map<string, { localText?: string | null }>();
 	private downloadLane: QueueLaneState;
 
 	private paused = true;
@@ -1171,6 +1177,7 @@ export class TransferQueue extends Loggable {
 		const usable = !(isRelayOnPrem && isDocument(doc)) || !hasHistoryGap(doc.crdtDoc);
 		if (!usable) {
 			this.log(`[uploadDocumentViaSocket] history gap in ${doc.entryPath}; not reconciling yet`);
+			this.watchHistoryGap(doc as Document);
 		}
 		if (usable && isRelayOnPrem && isDocument(doc)) {
 			// Typing can continue while the provider connects. Compare the
@@ -1340,6 +1347,7 @@ export class TransferQueue extends Loggable {
 			// until the relay sends the missing part. Not what was last synced,
 			// however long it lasts: writing it would blank a full file for good.
 			this.log(`[pullIfUnchanged] history gap in ${doc.entryPath}; leaving the file as is`);
+			this.watchHistoryGap(doc);
 			this.releasePulledDoc(doc, intent);
 			return { outcome: "history-gap" };
 		}
@@ -1376,7 +1384,21 @@ export class TransferQueue extends Loggable {
 				}
 				await doc.vaultShare.ensureParentDir(doc.entryPath);
 			}
-			if (syncBase === undefined && !missingOnDisk) {
+			const gapLocalText = this.takeGapLocalText(doc);
+			// No base, but the gap that held back this doc's upload has just
+			// closed and the file holds exactly what this client's own history
+			// held: it is stale, not a local edit. The relay's text is that
+			// history plus what peers did meanwhile, so it is delivered as is.
+			// An upload would reconcile the file over it instead: a peer's edit
+			// would go to a conflict copy and a clear would be undone.
+			const staleAfterGap =
+				syncBase === undefined &&
+				gapLocalText !== undefined &&
+				sameTextContent(vaultContentsAfter, gapLocalText);
+			if (staleAfterGap) {
+				this.log(`[pullIfUnchanged] history gap closed for ${doc.entryPath}; file is stale, taking the relay's text`);
+			}
+			if (syncBase === undefined && !missingOnDisk && !staleAfterGap) {
 				// Never round-tripped through a successful upload cycle for
 				// this doc -- can't tell a genuine unsynced edit apart from
 				// our own in-flight seed racing this read. Leave
@@ -1489,6 +1511,24 @@ export class TransferQueue extends Loggable {
 
 		this.releasePulledDoc(doc, intent);
 		return { outcome: "unchanged", remoteText };
+	}
+
+	/** Starts recording what `doc`'s own history holds, to be read back when its gap closes. */
+	private watchHistoryGap(doc: Document): void {
+		if (this.gapLocalTexts.has(doc.entityGuid)) return;
+		const entry: { localText?: string | null } = {};
+		this.gapLocalTexts.set(doc.entityGuid, entry);
+		watchHistoryGapClose(doc.crdtDoc, "contents", (localText) => {
+			entry.localText = localText ?? null;
+		});
+	}
+
+	/** The text `doc`'s history held when its gap closed, if one closed since it was seen; forgets it. */
+	private takeGapLocalText(doc: Document): string | undefined {
+		const entry = this.gapLocalTexts.get(doc.entityGuid);
+		if (entry === undefined || entry.localText === undefined) return undefined;
+		this.gapLocalTexts.delete(doc.entityGuid);
+		return entry.localText ?? undefined;
 	}
 
 	/** Drops the connection pullIfUnchanged() opened, unless the doc was already online or is being edited. */

@@ -310,18 +310,83 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 			Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
 			expect(crdtDoc.getText("contents").toString()).toBe(remote);
 
+			await queue.pullIfUnchanged(fakeDoc);
+			await Promise.all(uploads);
+
+			expect(uploads).toHaveLength(0);
+			expect(crdtDoc.getText("contents").toString()).toBe(remote);
+			expect(writeConflictCopy).not.toHaveBeenCalled();
+			// Only the peer's text reaches the file, never the stale one back.
+			for (const [, written] of writeContents.mock.calls) expect(written).toBe(remote);
+		},
+	);
+
+	test.each([
+		["clear", (text: Y.Text) => text.delete(0, text.length), ""],
+		["edit", (text: Y.Text) => text.insert(0, "PEER LINE\n"), "PEER LINE\n" + FULL_TEXT],
+	])(
+		"a no-base doc converges on a peer's %s in one background pull once its gap closes",
+		async (_label, peerChange, remote) => {
+			// The upload was held back by the gap; the file still holds what this
+			// client's own history held, so it is stale, not a local edit.
+			const history = authorHistory();
+			const crdtDoc = docWithHistoryGap(history);
+			const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, undefined);
+			const queue = makeQueue();
+			const uploads: Promise<boolean>[] = [];
+			jest.mocked(queue.enqueueUpload).mockImplementation(async (doc) => {
+				uploads.push(queue.uploadDocumentViaSocket(doc as Document));
+			});
+
+			await queue.uploadDocumentViaSocket(fakeDoc);
+
+			const peer = new Y.Doc();
+			Y.applyUpdate(peer, history.full);
+			peerChange(peer.getText("contents"));
+			Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+
 			const pull = await queue.pullIfUnchanged(fakeDoc);
 			await Promise.all(uploads);
 
-			expect(pull.outcome).toBe("no-base");
-			expect(uploads).toHaveLength(0);
+			expect(pull.outcome).toBe("flushed");
 			expect(crdtDoc.getText("contents").toString()).toBe(remote);
-			expect(writeContents).not.toHaveBeenCalled();
+			expect(state.vault).toBe(remote);
+			expect(state.syncBase).toBe(remote);
 			expect(writeConflictCopy).not.toHaveBeenCalled();
-			// The local file is left as it was, for the next upload to take.
-			expect(state.vault).toBe(FULL_TEXT);
+			expect(writeContents).toHaveBeenCalledTimes(1);
+
+			// The next cycle finds nothing to do and puts nothing stale back.
+			expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("unchanged");
+			await queue.uploadDocumentViaSocket(fakeDoc);
+			expect(crdtDoc.getText("contents").toString()).toBe(remote);
+			expect(state.vault).toBe(remote);
 		},
 	);
+
+	test("a no-base doc whose file was edited apart from its history is left for the upload to reconcile", async () => {
+		// Edited while the plugin was not running: the file is not what this
+		// client's history held, so it may carry work the relay never saw.
+		const history = authorHistory();
+		const crdtDoc = docWithHistoryGap(history);
+		const offlineEdit = FULL_TEXT + "Offline line\n";
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, offlineEdit, undefined);
+		const queue = makeQueue();
+
+		await queue.uploadDocumentViaSocket(fakeDoc);
+
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, history.full);
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+
+		const pull = await queue.pullIfUnchanged(fakeDoc);
+
+		expect(pull.outcome).toBe("no-base");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe(offlineEdit);
+		expect(state.syncBase).toBeUndefined();
+	});
 
 	test("a peer's clear that lands while an upload is held back by a gap reaches disk", async () => {
 		const history = authorHistory();
