@@ -39,6 +39,7 @@
  * real wall-clock timing.
  */
 
+import * as Y from "yjs";
 import { describe, test, expect, jest } from "@jest/globals";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
@@ -71,6 +72,7 @@ function makeFakeDoc(opts: FakeDocOptions) {
 	Object.defineProperty(fakeDoc, "resourceAddress", { value: {} });
 	Object.defineProperty(fakeDoc, "awaitFirstSync", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "content", { get: () => remoteText });
+	Object.defineProperty(fakeDoc, "crdtDoc", { value: new Y.Doc() });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(fakeDoc, "bringOnline", {
 		value: async () => {

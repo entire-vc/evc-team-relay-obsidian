@@ -21,6 +21,7 @@
  * manually-resolved deferred promise so the test can assert on ordering.
  */
 
+import * as Y from "yjs";
 import { describe, test, expect, jest } from "@jest/globals";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
@@ -53,6 +54,7 @@ function makeFakeDocWithDeferredWrite(events: string[]) {
 	// Content is already present on the very first bringOnline() -- no
 	// retry needed, isolates this test to the flush-ordering question.
 	Object.defineProperty(fakeDoc, "content", { get: () => "real content from the relay" });
+	Object.defineProperty(fakeDoc, "crdtDoc", { value: new Y.Doc() });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(fakeDoc, "bringOnline", { value: async () => true });
 	Object.defineProperty(fakeDoc, "onceEverSynced", { value: async () => {} });

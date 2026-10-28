@@ -16,6 +16,7 @@
  * accepting a genuinely empty note stays at least as long as before.
  */
 
+import * as Y from "yjs";
 import { describe, test, expect, jest } from "@jest/globals";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
@@ -44,6 +45,7 @@ function makeLateDoc(clock: MockClock, readyAt: number) {
 	Object.defineProperty(fakeDoc, "resourceAddress", { value: {} });
 	Object.defineProperty(fakeDoc, "awaitFirstSync", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "content", { get: () => remoteText });
+	Object.defineProperty(fakeDoc, "crdtDoc", { value: new Y.Doc() });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(fakeDoc, "bringOnline", {
 		value: async () => {

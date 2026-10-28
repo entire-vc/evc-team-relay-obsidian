@@ -17,6 +17,7 @@
  * load test can tell relay latency from client scheduling.
  */
 
+import * as Y from "yjs";
 import { describe, test, expect, jest } from "@jest/globals";
 import type { Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
@@ -81,6 +82,7 @@ function makeFakeDoc(
 	Object.defineProperty(fakeDoc, "resourceAddress", { value: {} });
 	Object.defineProperty(fakeDoc, "awaitFirstSync", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "content", { get: () => content });
+	Object.defineProperty(fakeDoc, "crdtDoc", { value: new Y.Doc() });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(fakeDoc, "bringOnline", { value: bringOnline });
 	Object.defineProperty(fakeDoc, "onceOnline", { value: async () => {} });

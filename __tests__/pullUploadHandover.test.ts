@@ -4,6 +4,7 @@
  * an upload that is still on its connection.
  */
 
+import * as Y from "yjs";
 import { describe, test, expect, jest } from "@jest/globals";
 import type { Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
@@ -50,9 +51,11 @@ function makeDoc() {
 	Object.defineProperty(doc, "resourceAddress", { value: {} });
 	Object.defineProperty(doc, "awaitFirstSync", { value: async () => {} });
 	Object.defineProperty(doc, "content", { get: () => "same" });
+	Object.defineProperty(doc, "crdtDoc", { value: new Y.Doc() });
 	Object.defineProperty(doc, "connectionIntent", { get: () => "disconnected" });
 	Object.defineProperty(doc, "bringOnline", { value: async () => true });
 	Object.defineProperty(doc, "onceOnline", { value: async () => {} });
+	Object.defineProperty(doc, "onceFreshlySynced", { value: async () => {} });
 	Object.defineProperty(doc, "goOffline", { value: goOffline });
 	Object.defineProperty(doc, "getSyncBase", { value: async () => "same" });
 	Object.defineProperty(doc, "setSyncBase", { value: async () => {} });
