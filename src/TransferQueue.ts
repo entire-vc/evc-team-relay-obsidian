@@ -26,6 +26,7 @@ import {
 	wonInitClaim,
 	markInitDone,
 	awaitClaimSettled,
+	neverHeldText,
 } from "./initContentClaim";
 import { claimReconcile, wonReconcileClaim, awaitReconcileSettled } from "./reconcileClaim";
 import { holdBackgroundTokens } from "./auth/tokenRequestClass";
@@ -219,6 +220,7 @@ export interface PullResult {
 		| "unchanged"
 		| "kept-local"
 		| "no-base"
+		| "seed-local"
 		| "history-gap"
 		| "not-synced"
 		| "connect-failed"
@@ -235,6 +237,12 @@ const PULL_SYNC_GRACE_MS = 2_000;
 const AWAIT_CONTENT_CHECK_MS = 250;
 /** How long a pull waits connected for announced text before it first reconnects to ask again; doubles after each. */
 const AWAIT_CONTENT_RECONNECT_MS = 4_000;
+/**
+ * pullIfUnchanged(): how long a note must keep reading as never seeded, across
+ * separate connections, before its file is seeded into the relay. A room the
+ * relay is still loading answers the sync empty, so one connection proves nothing.
+ */
+const UNSEEDED_CONFIRM_MS = 60_000;
 /** probeRelay(): cap on each of its two phases. */
 const PROBE_PHASE_TIMEOUT_MS = 30_000;
 /**
@@ -299,6 +307,8 @@ export class TransferQueue extends Loggable {
 	private serveSeq = 0;
 	private lastStatsLogAt = 0;
 	private uploadRetries = new Map<string, { attempt: number; timer?: number }>();
+	/** When a pull first found a note never seeded, by guid (see UNSEEDED_CONFIRM_MS). */
+	private unseededSince = new Map<string, number>();
 	private uploadRetryStats = { failed: 0, retried: 0, gaveUp: 0 };
 
 	teardowns: Unsubscriber[] = [];
@@ -1300,15 +1310,22 @@ export class TransferQueue extends Loggable {
 	 * check against.
 	 */
 	async pullIfUnchanged(doc: Document, control: PullControl = {}): Promise<PullResult> {
+		// Any pull that does not find the note unseeded again restarts its wait.
+		const unseededSince = this.unseededSince.get(doc.entityGuid);
+		this.unseededSince.delete(doc.entityGuid);
 		try {
-			return await this.pullIfUnchangedOnce(doc, control);
+			return await this.pullIfUnchangedOnce(doc, control, unseededSince);
 		} finally {
 			// Every return releases the hold; this covers a throw.
 			this.pullHolds.delete(doc.entityGuid);
 		}
 	}
 
-	private async pullIfUnchangedOnce(doc: Document, control: PullControl): Promise<PullResult> {
+	private async pullIfUnchangedOnce(
+		doc: Document,
+		control: PullControl,
+		unseededSince: number | undefined,
+	): Promise<PullResult> {
 		const { signal, onPhase } = control;
 		// Every await below may outlive the caller's deadline:
 		// once `signal` is aborted the caller has already freed this pull's
@@ -1430,6 +1447,42 @@ export class TransferQueue extends Loggable {
 					return { outcome: "unchanged", remoteText };
 				}
 				await doc.vaultShare.ensureParentDir(doc.entryPath);
+			}
+			if (aborted()) {
+				this.releasePulledDoc(doc, intent);
+				return { outcome: "aborted" };
+			}
+			const unseeded =
+				syncBase === undefined &&
+				remoteText === "" &&
+				hasPreservableContent(vaultContentsAfter) &&
+				neverHeldText(doc.crdtDoc, doc.crdtDoc.getText("contents"));
+			const confirmed =
+				unseeded &&
+				unseededSince !== undefined &&
+				this.clock.now() - unseededSince >= UNSEEDED_CONFIRM_MS;
+			if (unseeded && !confirmed) {
+				this.unseededSince.set(doc.entityGuid, unseededSince ?? this.clock.now());
+			}
+			if (confirmed) {
+				// The note reached the relay as an entry, its text never did:
+				// not one item, so no peer wrote or cleared it, and the file is
+				// the only copy of the text. A restart re-queues an upload only
+				// for a note the relay never acknowledged, so without this the
+				// text stayed on its author's disk and every other client kept
+				// the note empty (0.1.7 author, 58 chars, still missing on
+				// 0.1.30). Only once a later pull, on its own connection, still
+				// finds it so: see UNSEEDED_CONFIRM_MS. Seeded here, on this
+				// pull's connection, not by a queued upload: an upload would
+				// reconcile whatever a peer wrote meanwhile.
+				// Released however the seed ends: a rejected base write must
+				// not leave this pull's connection open.
+				try {
+					const outcome = await this.seedUnseededText(doc, aborted, onPhase);
+					return { outcome, remoteText: doc.content };
+				} finally {
+					this.releasePulledDoc(doc, intent);
+				}
 			}
 			if (syncBase === undefined && !missingOnDisk) {
 				// Never round-tripped through a successful upload cycle for
@@ -1740,6 +1793,51 @@ export class TransferQueue extends Loggable {
 			}
 			return false;
 		}
+	}
+
+	/**
+	 * Seeds the file into a note whose relay text never held an item, on the
+	 * connection of the pull that confirmed it (see pullIfUnchanged()). Only
+	 * seeds: under the init claim, and only if the text still never held an
+	 * item once the claim settled and the file was read. A peer's text or
+	 * clear that arrived meanwhile is left as it is, file included. Like the
+	 * rest of the pull it writes nothing once `aborted()`; the insert is its
+	 * point of no return ("write" phase), so the caller's deadline cannot
+	 * free the slot for another pull while it still holds the connection.
+	 */
+	private async seedUnseededText(
+		doc: Document,
+		aborted: () => boolean,
+		onPhase: PullControl["onPhase"],
+	): Promise<"seed-local" | "no-base" | "aborted"> {
+		const text = doc.crdtDoc.getText("contents");
+		claimInitIfUnclaimed(doc.crdtDoc, doc._liveProvider.awareness);
+		await awaitClaimSettled(doc.crdtDoc, { socket: doc._liveProvider.ws });
+		if (aborted()) return "aborted";
+		const fileContents = await this.readVaultContents(doc);
+		if (aborted()) return "aborted";
+		if (
+			!hasPreservableContent(fileContents) ||
+			!neverHeldText(doc.crdtDoc, text) ||
+			hasHistoryGap(doc.crdtDoc) ||
+			!wonInitClaim(doc.crdtDoc, text)
+		) {
+			this.log(`[pullIfUnchanged] ${doc.entryPath} is no longer unseeded; not seeding it`);
+			return "no-base";
+		}
+		onPhase?.("write");
+		this.log(`[pullIfUnchanged] relay never held text for ${doc.entryPath}; seeding the file`);
+		text.insert(0, fileContents);
+		markInitDone(doc.crdtDoc);
+		await waitForBufferFlush(doc._liveProvider.ws);
+		// The seeded text is what the file and the relay agreed on, even if a
+		// peer has edited it since: the next pull applies that edit as a diff
+		// against it. Without a base every later pull stops at "no-base" and
+		// the file never gets the peer's edit. A file changed meanwhile is a
+		// local edit, not that agreement: no base then.
+		const diskContents = await this.readVaultContents(doc);
+		if (sameTextContent(fileContents, diskContents)) await doc.setSyncBase(fileContents);
+		return "seed-local";
 	}
 
 	/**
