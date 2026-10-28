@@ -78,6 +78,12 @@ jobs:
           else
             echo 'exists=false' >> "$GITHUB_OUTPUT"
           fi
+      - name: Stamp the release version for the build (local tag, pushed only after the byte check)
+        # esbuild embeds `git describe --tags` into main.js; without the tag the
+        # build would report the previous release. ci.yml's candidate job stamps
+        # the same way, so both builds produce the same bytes.
+        if: steps.dispatch.outputs.exists != 'true'
+        run: git tag "${{ inputs.version }}"
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -110,7 +116,7 @@ jobs:
                   raise SystemExit('built artifact differs from accepted bytes: ' + name)
           print('Accepted artifact digests match')
           PY_DIGEST
-      - name: Create + push release tag as CI identity (workflow_dispatch, new tag only)
+      - name: Push the release tag (workflow_dispatch, new tag only)
         # Only after build and accepted-byte checks; the manifest was restored from the commit.
         if: github.event_name == 'workflow_dispatch' && steps.dispatch.outputs.exists != 'true'
         run: |
@@ -123,9 +129,7 @@ jobs:
             echo "::error::Bump manifest.json to $TAG on this branch (normal PR/merge) first, then dispatch again."
             exit 1
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "$TAG"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "${{ inputs.candidate_sha }}"
           git push origin "$TAG"
       - name: Attest build provenance (main.js, styles.css)
         uses: actions/attest-build-provenance@v4

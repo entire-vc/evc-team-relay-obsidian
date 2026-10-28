@@ -42,3 +42,71 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+
+  # Release candidate bytes for batched acceptance. Built once per push to main
+  # with the same steps as release.yml, so the stable build of the accepted SHA
+  # must reproduce these digests. No tag is pushed and nothing is published.
+  candidate:
+    name: Release candidate bundle
+    if: github.event_name == 'push'
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Stamp the manifest version for the build (local tag, never pushed)
+        id: stamp
+        run: |
+          set -eu
+          VERSION=$(node -p "require('./manifest.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            if [ "$(git rev-parse "refs/tags/$VERSION^{commit}")" != "$GITHUB_SHA" ]; then
+              echo "::notice::$VERSION is already tagged on another commit; this push is not a candidate"
+              echo "candidate=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            git tag "$VERSION"
+          fi
+          echo "candidate=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v7
+        if: steps.stamp.outputs.candidate == 'true'
+        with:
+          node-version: '22'
+      - if: steps.stamp.outputs.candidate == 'true'
+        run: npm ci
+      - if: steps.stamp.outputs.candidate == 'true'
+        run: npm run build
+      - name: Restore committed manifest.json and record digests
+        if: steps.stamp.outputs.candidate == 'true'
+        env:
+          VERSION: ${{ steps.stamp.outputs.version }}
+        run: |
+          set -eu
+          git checkout HEAD -- manifest.json
+          test "$(node -p "require('./manifest.json').version")" = "$VERSION"
+          mkdir candidate
+          cp main.js manifest.json styles.css candidate/
+          cd candidate
+          sha256sum main.js manifest.json styles.css > SHA256SUMS
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          names = ('main.js', 'manifest.json', 'styles.css')
+          Path('candidate.json').write_text(json.dumps({
+              'version': os.environ['VERSION'],
+              'candidate_sha': os.environ['GITHUB_SHA'],
+              'run_url': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'artifacts': {n: hashlib.sha256(Path(n).read_bytes()).hexdigest() for n in names},
+          }, indent=2) + '\n')
+          PY
+          cat SHA256SUMS candidate.json
+      - uses: actions/upload-artifact@v7
+        if: steps.stamp.outputs.candidate == 'true'
+        with:
+          name: team-relay-candidate-${{ steps.stamp.outputs.version }}-${{ github.sha }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 90
