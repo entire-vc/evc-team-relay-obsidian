@@ -1167,7 +1167,9 @@ export class TransferQueue extends Loggable {
 		// A doc with a history gap shows empty or partial text: reconciling
 		// would seed the file into it (duplicated once the gap closes) and
 		// record that text as the agreed base.
-		// Not done: the upload reports failure so its retry stays scheduled.
+		// Not retried: a retry that runs after a peer's edit or clear would
+		// reconcile the stale file over it. The doc is remembered instead, and
+		// the pull whose sync closes the gap hands it back (see pullIfUnchanged()).
 		const usable = !(isRelayOnPrem && isDocument(doc)) || !hasHistoryGap(doc.crdtDoc);
 		if (!usable) {
 			this.log(`[uploadDocumentViaSocket] history gap in ${doc.entryPath}; not reconciling yet`);
@@ -1205,7 +1207,7 @@ export class TransferQueue extends Loggable {
 			doc.goOffline();
 			doc.vaultShare.credentialCache.dropFromQueue(ResourceAddress.serialize(doc.resourceAddress));
 		}
-		return usable;
+		return true;
 	}
 
 	/**
@@ -1386,8 +1388,8 @@ export class TransferQueue extends Loggable {
 				// it for uploadDocumentViaSocket() to reconcile properly.
 				this.releasePulledDoc(doc, intent);
 				if (this.gapDeferredUploads.delete(doc.entityGuid)) {
-					// A history gap held that upload back and its retries may
-					// have run out meanwhile: the gap is closed now, run it.
+					// A history gap held that upload back: the gap is closed
+					// now, run it.
 					void this.enqueueUpload(doc, { priority: true }).catch((err: unknown) => {
 						this.warn("[pullIfUnchanged] queueing upload after history gap failed", doc.entryPath, err);
 					});

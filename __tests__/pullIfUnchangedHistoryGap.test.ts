@@ -274,8 +274,7 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		const crdtDoc = docWithHistoryGap(history);
 		const { fakeDoc, setSyncBase, writeConflictCopy } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
 
-		// Not done: reported as unsynced so its retry stays scheduled.
-		expect(await makeQueue().uploadDocumentViaSocket(fakeDoc)).toBe(false);
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
 
 		expect(crdtDoc.getText("contents").toString()).toBe("");
 		expect(setSyncBase).not.toHaveBeenCalled();
@@ -292,10 +291,10 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		const queue = makeQueue();
 		const enqueueUpload = jest.mocked(queue.enqueueUpload);
 
-		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(false);
+		await queue.uploadDocumentViaSocket(fakeDoc);
 		expect(state.syncBase).toBeUndefined();
 
-		// The upload's retries ran out. The relay then fills the gap, a peer
+		// The relay then fills the gap, a peer
 		// has added a line meanwhile, and the next background pull finds no base.
 		const peer = new Y.Doc();
 		Y.applyUpdate(peer, history.full);
@@ -318,6 +317,37 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		// The file wins with no base to compare against; the peer's text is kept in a copy.
 		expect(state.vault).toBe(FULL_TEXT);
 		expect(writeConflictCopy).toHaveBeenCalledWith(fakeDoc, remote, expect.any(String));
+	});
+
+	test("a peer's clear that lands while an upload is held back by a gap reaches disk", async () => {
+		const history = authorHistory();
+		const crdtDoc = docWithHistoryGap(history);
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		const queue = makeQueue();
+		const internals = queue as unknown as {
+			uploadDocument: (doc: Document, priority: boolean) => Promise<void>;
+			uploadRetryStats: { failed: number };
+		};
+
+		await internals.uploadDocument(fakeDoc, false);
+		// No retry is left to reconcile the stale file over what comes next.
+		expect(internals.uploadRetryStats.failed).toBe(0);
+
+		// A peer clears the note; the relay fills the gap along with it.
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, history.full);
+		peer.getText("contents").delete(0, peer.getText("contents").length);
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+
+		const result = await queue.pullIfUnchanged(fakeDoc);
+
+		expect(result.outcome).toBe("flushed");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("");
+		expect(state.syncBase).toBe("");
+		expect(crdtDoc.getText("contents").toString()).toBe("");
 	});
 
 	test("fetch holds back partial text of a gapped doc while retries remain", async () => {
