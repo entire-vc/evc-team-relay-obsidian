@@ -212,22 +212,21 @@ const SEED_LAST_ID = 3;
  * the last `ids` entry (left neighbour clock 3). A seed written after an edit
  * (the account resolved late) sits one clock or more further on, so the same
  * pushes land on other clocks or carry other content, and the range is a gap.
+ * A deleted change carries no content to check (a deleted character reads the
+ * same), so one that refers into the range is a gap too.
  */
 function isIdentitySeedGap(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): boolean {
 	const inSeed = (id: Y.ID | null): id is Y.ID => id !== null && id.client === client && id.clock < SEED_CLOCKS;
-	const deleted = (item: Y.Item) => item.content instanceof Y.ContentDeleted;
 	let referred = false;
 	for (const struct of structs) {
 		if (!(struct instanceof Y.Item)) continue;
 		const parent = struct.parent as unknown;
 		if (parent instanceof Y.ID && inSeed(parent)) {
-			if (parent.clock !== SEED_DS || !(struct.content instanceof Y.ContentBinary || deleted(struct))) return false;
+			if (parent.clock !== SEED_DS || !(struct.content instanceof Y.ContentBinary)) return false;
 			referred = true;
 		}
 		if (inSeed(struct.origin)) {
-			if (struct.origin.clock !== SEED_LAST_ID || !(struct.content instanceof Y.ContentAny || deleted(struct))) {
-				return false;
-			}
+			if (struct.origin.clock !== SEED_LAST_ID || !(struct.content instanceof Y.ContentAny)) return false;
 			referred = true;
 		}
 		if (inSeed(struct.rightOrigin)) return false;

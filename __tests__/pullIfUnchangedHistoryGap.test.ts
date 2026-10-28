@@ -422,11 +422,11 @@ function presenceOnlyGap(opts: { deletePushed?: boolean } = {}): Uint8Array {
 	const ghost = new Y.Doc();
 	const ids = seedIdentity(ghost);
 	const seeded = Y.encodeStateVector(ghost);
-	ids.push([ghost.clientID + 1]);
+	ids.push([ghost.clientID + 1, ghost.clientID + 2]);
 	((ghost.getMap("users").get("ghost-account") as Y.Map<unknown>).get("ds") as Y.Array<Uint8Array>).push([
 		new Uint8Array([0, 1, 2]),
 	]);
-	if (opts.deletePushed) ids.delete(1, 1);
+	if (opts.deletePushed) ids.delete(2, 1);
 	return Y.encodeStateAsUpdate(ghost, seeded);
 }
 
@@ -622,6 +622,18 @@ describe("missing clocks outside an identity seed are a gap", () => {
 		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, Y.encodeStateVector(new Map([[writer.clientID, SEED_SIZE]]))));
 
 		expect(doc.store.pendingStructs?.missing).toEqual(new Map([[writer.clientID, SEED_SIZE - 1]]));
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("REGRESSION: a seed written after deleting the last of five characters is a gap", () => {
+		const writer = new Y.Doc();
+		const text = writer.getText("contents");
+		text.insert(0, "ABCDE");
+		text.delete(4, 1);
+		new Y.PermanentUserData(writer).setUserMapping(writer, writer.clientID, "late-account");
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, Y.encodeStateVector(new Map([[writer.clientID, SEED_SIZE]]))));
+
 		expect(doc.getText("contents").toString()).toBe("");
 		expect(hasHistoryGap(doc)).toBe(true);
 	});
