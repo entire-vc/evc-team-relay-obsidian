@@ -338,6 +338,8 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		[401, 40_000],
 		[403, 40_000],
 		[401, 100_000],
+		[401, 200_000],
+		[403, 200_000],
 	])("%i answered after %i ms: a refused share still asks one at a time, at most 4 requests in 10 minutes", async (status, latency) => {
 		// Slower than the token request timeout: the timed-out request is
 		// still in flight, so the share must not ask again until it is done.
@@ -372,9 +374,18 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(String(nextError)).toMatch(/timed out; next try in/);
 		expect(tokenCalls()).toBe(1);
 
+		// The backoff is over but the request is still in flight: still no second request.
 		await jest.advanceTimersByTimeAsync(2 * MINUTE);
+		let laterError: unknown;
+		void cache.getToken(later, later, () => {}, "server-a").catch((e: unknown) => (laterError = e));
+		await jest.advanceTimersByTimeAsync(3_000);
+		expect(String(laterError)).toMatch(/still in flight/);
+		expect(tokenCalls()).toBe(1);
+
+		// Past the abandon cap the share goes back on the network.
+		await jest.advanceTimersByTimeAsync(12 * MINUTE);
 		let granted = false;
-		void cache.getToken(later, later, () => (granted = true), "server-a");
+		void cache.getToken(next, next, () => (granted = true), "server-a");
 		await jest.advanceTimersByTimeAsync(3_000);
 		expect(granted).toBe(true);
 		expect(tokenCalls()).toBe(2);

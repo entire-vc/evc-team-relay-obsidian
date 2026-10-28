@@ -104,6 +104,13 @@ export class RelayAccessDeniedError extends Error {
 export const RELAY_TOKEN_TIMEOUT_MS = 30_000;
 
 /**
+ * How long a timed-out request keeps its share off the network while it may
+ * still be in flight. requestUrl normally settles well before this; the cap
+ * only stops a request that never settles from blocking its share for good.
+ */
+export const RELAY_TOKEN_ABANDON_MS = 10 * 60_000;
+
+/**
  * POST /v1/tokens/relay did not answer within RELAY_TOKEN_TIMEOUT_MS.
  * requestUrl cannot be cancelled, so the request may still be in flight and
  * may still reach the control plane; callers keep the share off the network
@@ -280,6 +287,12 @@ export class RelayOnPremTokenProvider {
 	 * the next refresh asks for write again.
 	 */
 	private refusedShares = new Set<string>();
+	/**
+	 * Token requests still on the network, by share. A request that timed out
+	 * stays here until requestUrl itself settles, so the share's next request
+	 * cannot overlap it however long the backoff in front of it is.
+	 */
+	private sharesOnNetwork = new Map<string, Promise<Response>>();
 
 	/** Forget which shares (or this one share) refused a write token, so the next request asks for write again. */
 	clearRefused(folderId?: string): void {
@@ -350,6 +363,11 @@ export class RelayOnPremTokenProvider {
 		await this.throttle.acquire(docId);
 
 		try {
+			if (this.sharesOnNetwork.has(folderId)) {
+				throw new RelayTokenTimeoutError(
+					`Token request for doc ${docId} not sent: an earlier request for share ${folderId} is still in flight`,
+				);
+			}
 			const fetched = platformFetch(
 				`${this.normalizedUrl}/v1/tokens/relay`,
 				{
@@ -361,6 +379,13 @@ export class RelayOnPremTokenProvider {
 					body: JSON.stringify(request),
 				}
 			);
+			this.sharesOnNetwork.set(folderId, fetched);
+			const abandon = window.setTimeout(() => offNetwork(), RELAY_TOKEN_ABANDON_MS);
+			const offNetwork = () => {
+				window.clearTimeout(abandon);
+				if (this.sharesOnNetwork.get(folderId) === fetched) this.sharesOnNetwork.delete(folderId);
+			};
+			fetched.then(offNetwork, offNetwork);
 			// Timed from here, not from the throttle wait above: only the
 			// network may stall the request.
 			let timer: number | undefined;
@@ -372,6 +397,8 @@ export class RelayOnPremTokenProvider {
 					)), RELAY_TOKEN_TIMEOUT_MS);
 				}),
 			]).finally(() => window.clearTimeout(timer));
+			// Settled: clear now, before the read retry below asks again.
+			offNetwork();
 
 			if (response.status === 429) {
 				// Parse Retry-After header (seconds) if present, default 60 s

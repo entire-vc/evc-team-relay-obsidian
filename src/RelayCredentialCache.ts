@@ -191,7 +191,8 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		// (control plane p99 about 230 ms, 27.10).
 		// A request that times out on the network (RelayTokenTimeoutError)
 		// may still be in flight, so its share is backed off below rather
-		// than asked again at once.
+		// than asked again at once, and the provider sends nothing for that
+		// share until the old request has settled.
 		for (;;) {
 			const probe = this.shareProbes.get(shareId);
 			if (!probe) break;
