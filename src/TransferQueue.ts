@@ -291,8 +291,6 @@ export class TransferQueue extends Loggable {
 	private readonly uploadTrace: PriorityUploadTrace[] = [];
 	/** Documents a background pull connected and still holds. */
 	private readonly pullHolds = new Set<string>();
-	/** Docs whose upload a history gap held back; the next pull that sees the gap closed re-queues it. */
-	private readonly gapDeferredUploads = new Set<string>();
 	/** Pull connections left open for a queued upload, which then closes them. */
 	private readonly handedToUpload = new Set<string>();
 	private downloadLane: QueueLaneState;
@@ -1168,14 +1166,11 @@ export class TransferQueue extends Loggable {
 		// would seed the file into it (duplicated once the gap closes) and
 		// record that text as the agreed base.
 		// Not retried: a retry that runs after a peer's edit or clear would
-		// reconcile the stale file over it. The doc is remembered instead, and
-		// the pull whose sync closes the gap hands it back (see pullIfUnchanged()).
+		// reconcile the stale file over it. The pull whose sync closes the gap
+		// delivers the relay's text instead (see pullIfUnchanged()).
 		const usable = !(isRelayOnPrem && isDocument(doc)) || !hasHistoryGap(doc.crdtDoc);
 		if (!usable) {
 			this.log(`[uploadDocumentViaSocket] history gap in ${doc.entryPath}; not reconciling yet`);
-			this.gapDeferredUploads.add(doc.entityGuid);
-		} else {
-			this.gapDeferredUploads.delete(doc.entityGuid);
 		}
 		if (usable && isRelayOnPrem && isDocument(doc)) {
 			// Typing can continue while the provider connects. Compare the
@@ -1387,13 +1382,6 @@ export class TransferQueue extends Loggable {
 				// our own in-flight seed racing this read. Leave
 				// it for uploadDocumentViaSocket() to reconcile properly.
 				this.releasePulledDoc(doc, intent);
-				if (this.gapDeferredUploads.delete(doc.entityGuid)) {
-					// A history gap held that upload back: the gap is closed
-					// now, run it.
-					void this.enqueueUpload(doc, { priority: true }).catch((err: unknown) => {
-						this.warn("[pullIfUnchanged] queueing upload after history gap failed", doc.entryPath, err);
-					});
-				}
 				return { outcome: "no-base", remoteText };
 			}
 			if (aborted()) {

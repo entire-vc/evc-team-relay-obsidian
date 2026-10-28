@@ -284,40 +284,44 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
 	});
 
-	test("an upload a gap held back, with no base yet, runs again once the gap closes and converges", async () => {
-		const history = authorHistory();
-		const crdtDoc = docWithHistoryGap(history);
-		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, undefined);
-		const queue = makeQueue();
-		const enqueueUpload = jest.mocked(queue.enqueueUpload);
+	test.each([
+		["clear", (text: Y.Text) => text.delete(0, text.length), ""],
+		["edit", (text: Y.Text) => text.insert(0, "PEER LINE\n"), "PEER LINE\n" + FULL_TEXT],
+	])(
+		"a no-base doc whose gap closes keeps a peer's %s: nothing is written over it, no conflict copy",
+		async (_label, peerChange, remote) => {
+			const history = authorHistory();
+			const crdtDoc = docWithHistoryGap(history);
+			const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, undefined);
+			const queue = makeQueue();
+			// Whatever the pull queues really runs, so a stale-file reconcile would show.
+			const uploads: Promise<boolean>[] = [];
+			jest.mocked(queue.enqueueUpload).mockImplementation(async (doc) => {
+				uploads.push(queue.uploadDocumentViaSocket(doc as Document));
+			});
 
-		await queue.uploadDocumentViaSocket(fakeDoc);
-		expect(state.syncBase).toBeUndefined();
+			await queue.uploadDocumentViaSocket(fakeDoc);
+			expect(state.syncBase).toBeUndefined();
 
-		// The relay then fills the gap, a peer
-		// has added a line meanwhile, and the next background pull finds no base.
-		const peer = new Y.Doc();
-		Y.applyUpdate(peer, history.full);
-		peer.getText("contents").insert(0, "PEER LINE\n");
-		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
-		const remote = "PEER LINE\n" + FULL_TEXT;
-		expect(crdtDoc.getText("contents").toString()).toBe(remote);
+			// The relay fills the gap together with the peer's change.
+			const peer = new Y.Doc();
+			Y.applyUpdate(peer, history.full);
+			peerChange(peer.getText("contents"));
+			Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+			expect(crdtDoc.getText("contents").toString()).toBe(remote);
 
-		const pull = await queue.pullIfUnchanged(fakeDoc);
-		expect(pull.outcome).toBe("no-base");
-		expect(enqueueUpload).toHaveBeenCalledTimes(1);
+			const pull = await queue.pullIfUnchanged(fakeDoc);
+			await Promise.all(uploads);
 
-		// What that queued upload runs: it now reconciles and records the base,
-		// after which the next pull finds disk, base and CRDT agreeing.
-		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
-		expect(state.syncBase).toBe(crdtDoc.getText("contents").toString());
-		const next = await queue.pullIfUnchanged(fakeDoc);
-		expect(["unchanged", "flushed"]).toContain(next.outcome);
-		expect(state.vault).toBe(crdtDoc.getText("contents").toString());
-		// The file wins with no base to compare against; the peer's text is kept in a copy.
-		expect(state.vault).toBe(FULL_TEXT);
-		expect(writeConflictCopy).toHaveBeenCalledWith(fakeDoc, remote, expect.any(String));
-	});
+			expect(pull.outcome).toBe("no-base");
+			expect(uploads).toHaveLength(0);
+			expect(crdtDoc.getText("contents").toString()).toBe(remote);
+			expect(writeContents).not.toHaveBeenCalled();
+			expect(writeConflictCopy).not.toHaveBeenCalled();
+			// The local file is left as it was, for the next upload to take.
+			expect(state.vault).toBe(FULL_TEXT);
+		},
+	);
 
 	test("a peer's clear that lands while an upload is held back by a gap reaches disk", async () => {
 		const history = authorHistory();
