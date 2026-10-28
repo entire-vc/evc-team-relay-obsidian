@@ -1172,15 +1172,15 @@ export class TransferQueue extends Loggable {
 		if (!usable) {
 			this.log(`[uploadDocumentViaSocket] history gap in ${doc.entryPath}; not reconciling yet`);
 		}
-		let delivered = false;
+		let baseSettled = false;
 		if (usable && isRelayOnPrem && isDocument(doc)) {
 			// Typing can continue while the provider connects. Compare the
 			// current disk and CRDT contents, not the pre-connection snapshots.
 			const currentVaultContents = await this.readVaultContents(doc);
 			if (currentVaultContents && !sameTextContent(doc.content, currentVaultContents)) {
 				const localText = await this.deliverIfNoLocalEdit(doc, currentVaultContents);
-				delivered = localText === undefined;
-				if (localText && !sameTextContent(doc.content, localText)) {
+				baseSettled = localText === undefined;
+				if (localText !== undefined && !sameTextContent(doc.content, localText)) {
 					await this.reconcileRelayContent(doc, localText);
 				}
 			}
@@ -1193,10 +1193,11 @@ export class TransferQueue extends Loggable {
 		// (safe to apply without a conflict copy) apart from "the relay moved
 		// too" -- so it must be current before the NEXT sync, not
 		// just after this one happens to succeed cleanly.
-		// deliverIfNoLocalEdit() already recorded the text it wrote: the
-		// CRDT may have moved on since, and a base ahead of the disk would
-		// read the delivered file as a local edit on the next sync.
-		if (usable && isRelayOnPrem && isDocument(doc) && !delivered) {
+		// deliverIfNoLocalEdit() already recorded the text it wrote, or left
+		// the base alone when it could not write: the CRDT may have moved on
+		// since, and a base ahead of the disk would read the stale file as a
+		// local edit on the next sync and push it over the peer's text.
+		if (usable && isRelayOnPrem && isDocument(doc) && !baseSettled) {
 			await doc.setSyncBase(doc.content);
 		}
 
@@ -1227,9 +1228,17 @@ export class TransferQueue extends Loggable {
 	 * its author's disk included. Live: 5 of 10 co-edit rounds with no pause
 	 * after the first sync.
 	 *
-	 * Returns undefined once delivered. Otherwise there may be a local edit
-	 * (no base, the file is off the base, or it changed while this ran) and
-	 * the latest file text is returned for the caller to reconcile.
+	 * Returns undefined when the base is settled here: the text was
+	 * delivered, or the file could not be written (a failed read, a pending
+	 * delete) and the base stays where the disk is, for the next sync.
+	 * Otherwise there may be a local edit (no base, the file is off the base,
+	 * or it changed while this ran) and the latest file text is returned for
+	 * the caller to reconcile.
+	 *
+	 * An empty relay text is not delivered: it is also what a room that has
+	 * not loaded yet reads as, so it keeps the reconcile path it had before.
+	 * The re-read and the write leave the same small window as
+	 * pullIfUnchanged()'s flush; the adapter offers no compare-and-write.
 	 */
 	private async deliverIfNoLocalEdit(doc: Document, vaultContents: string): Promise<string | undefined> {
 		const base = await doc.getSyncBase();
@@ -1238,7 +1247,11 @@ export class TransferQueue extends Loggable {
 		if (!hasPreservableContent(remoteText)) return vaultContents;
 		// The read above can be stale by now: never overwrite an edit made meanwhile.
 		const current = await this.readVaultContents(doc);
+		// "" is also a failed read: nothing safe to write or to record.
+		if (current === "") return undefined;
 		if (!sameTextContent(current, base)) return current;
+		// writeContents() skips a note being deleted but still resolves.
+		if (doc.vaultShare.isDeletePending(doc.entryPath)) return undefined;
 		await doc.vaultShare.writeContents(doc, remoteText);
 		await doc.setSyncBase(remoteText);
 		this.log(

@@ -41,6 +41,8 @@ interface FakeDocOptions {
 	initialBase: string | undefined;
 	/** Successive disk reads after the first; the last one repeats. Defaults to `vaultContents`. */
 	laterVaultReads?: string[];
+	/** Whether the note is being deleted. */
+	deletePending?: boolean;
 }
 
 function makeFakeDoc(opts: FakeDocOptions) {
@@ -72,6 +74,7 @@ function makeFakeDoc(opts: FakeDocOptions) {
 			readContents: async () => reads[Math.min(readCount++, reads.length - 1)],
 			writeConflictCopy,
 			writeContents,
+			isDeletePending: () => opts.deletePending ?? false,
 		},
 	});
 	Object.defineProperty(fakeDoc, "onceEverSynced", { value: async () => {} });
@@ -216,5 +219,38 @@ describe("uploadDocumentViaSocket — relay moved, file still holds the agreed t
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
 		expect(fakeDoc.content).toBe("base [my edit]");
+	});
+
+	test("a failed final read writes nothing and keeps the base at the disk text", async () => {
+		// readVaultContents() reads a failed read as "".
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
+			syncedText: "a1-1 by A",
+			vaultContents: "a1-0",
+			initialBase: "a1-0",
+			laterVaultReads: ["a1-0", ""],
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(fakeDoc.content).toBe("a1-1 by A");
+		// A base ahead of the disk would push the stale file over the peer next time.
+		expect(getBase()).toBe("a1-0");
+	});
+
+	test("a note being deleted is not written and its base stays", async () => {
+		const { fakeDoc, writeContents, getBase } = makeFakeDoc({
+			syncedText: "a1-1 by A",
+			vaultContents: "a1-0",
+			initialBase: "a1-0",
+			deletePending: true,
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(fakeDoc.content).toBe("a1-1 by A");
+		expect(getBase()).toBe("a1-0");
 	});
 });
