@@ -1172,7 +1172,7 @@ export class TransferQueue extends Loggable {
 		// A doc with a history gap shows empty or partial text: reconciling
 		// would seed the file into it (duplicated once the gap closes) and
 		// record that text as the agreed base.
-		const usable = !(isRelayOnPrem && isDocument(doc)) || this.historyUsable(doc);
+		const usable = !(isRelayOnPrem && isDocument(doc)) || this.historyUsable(doc, true);
 		if (!usable) {
 			this.log(`[uploadDocumentViaSocket] history gap in ${doc.entryPath}; not reconciling yet`);
 		}
@@ -1324,18 +1324,23 @@ export class TransferQueue extends Loggable {
 		}
 
 		onPhase?.("compare");
+		let synced = true;
 		if (hasHistoryGap(doc.crdtDoc)) {
 			// Updates are pending on changes this client never stored (the
 			// note's author after a restart): the text reads empty or partial
 			// until the relay sends the missing part, which this connection's
 			// sync normally does.
-			await this.raceTimeout(doc.onceFreshlySynced(), PULL_CONNECT_TIMEOUT_MS);
+			synced =
+				(await this.raceTimeout(
+					doc.onceFreshlySynced().then(() => true),
+					PULL_CONNECT_TIMEOUT_MS,
+				)) === true;
 			if (aborted()) {
 				this.releasePulledDoc(doc, intent);
 				return { outcome: "aborted" };
 			}
 		}
-		if (!this.historyUsable(doc)) {
+		if (!this.historyUsable(doc, synced)) {
 			// Not what was last synced: writing it would blank a full file for good.
 			this.log(`[pullIfUnchanged] history gap in ${doc.entryPath}; leaving the file as is`);
 			this.releasePulledDoc(doc, intent);
@@ -1492,12 +1497,15 @@ export class TransferQueue extends Loggable {
 	/**
 	 * Whether `doc`'s text can be taken as its synced state: no history gap,
 	 * or one older than HISTORY_GAP_PATIENCE_MS that no sync is going to close.
+	 * Only a gap still there after a completed sync (`synced`) counts towards
+	 * that: one the relay simply never answered is not proof it can't be closed.
 	 */
-	private historyUsable(doc: Document): boolean {
+	private historyUsable(doc: Document, synced: boolean): boolean {
 		if (!hasHistoryGap(doc.crdtDoc)) {
 			this.historyGapSince.delete(doc.entityGuid);
 			return true;
 		}
+		if (!synced) return false;
 		const now = this.clock.now();
 		const since = this.historyGapSince.get(doc.entityGuid);
 		if (since === undefined) {
@@ -2070,7 +2078,7 @@ export class TransferQueue extends Loggable {
 		// path that's actually load-bearing for relay-linked docs (they
 		// never take the HTTP path, see fetchDocument()).
 		// A history gap reads as empty or partial text: wait for it like for empty text.
-		const notReady = () => doc.content === "" || !this.historyUsable(doc);
+		const notReady = () => doc.content === "" || !this.historyUsable(doc, true);
 		const flushed = await this.fallbackToWebsocketSync(
 			doc,
 			"getDocument",

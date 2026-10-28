@@ -188,6 +188,42 @@ describe("pullIfUnchanged — a doc with a history gap is never flushed to disk"
 		expect(state.vault).toBe("PEER EDIT\n");
 	});
 
+	test("a file an earlier version already blanked gets the full text once the gap closes, with no editor open", async () => {
+		// 0.1.27 wrote "" over the file and recorded "" as the base.
+		const history = authorHistory();
+		const crdtDoc = docWithHistoryGap(history);
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, "", "");
+		const queue = makeQueue();
+
+		// The relay has not sent the missing part yet: nothing is written.
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect(writeContents).not.toHaveBeenCalled();
+
+		// The next background pull's sync fills the gap.
+		fakeDoc.onceFreshlySynced = async () => Y.applyUpdate(crdtDoc, history.full);
+		const result = await queue.pullIfUnchanged(fakeDoc);
+
+		expect(result.outcome).toBe("flushed");
+		expect(state.vault).toBe(FULL_TEXT);
+		expect(state.syncBase).toBe(FULL_TEXT);
+	});
+
+	test("a gap that outlasts the patience without any completed sync never blanks the file", async () => {
+		// The relay never answers this doc's catch-up: no sync completes.
+		const crdtDoc = docWithHistoryGap();
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		fakeDoc.onceFreshlySynced = () => new Promise<void>(() => {});
+		const clock = new InstantClock();
+		const queue = makeQueue(clock);
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		clock.time += PATIENCE_MS * 3;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(state.vault).toBe(FULL_TEXT);
+	});
+
 	test("control: a note a peer genuinely cleared is still written to disk", async () => {
 		const { fakeDoc, writeContents, state } = makeFakeDoc(docClearedByPeer(), FULL_TEXT, FULL_TEXT);
 
