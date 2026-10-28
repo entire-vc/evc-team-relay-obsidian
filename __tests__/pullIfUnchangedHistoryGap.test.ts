@@ -97,7 +97,7 @@ function makeFakeDoc(crdtDoc: Y.Doc, vaultContents: string, syncBase: string | u
 	Object.defineProperty(fakeDoc, "awaitFirstSync", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "crdtDoc", { value: crdtDoc });
 	Object.defineProperty(fakeDoc, "connectionIntent", { get: () => "disconnected" });
-	Object.defineProperty(fakeDoc, "bringOnline", { value: async () => true });
+	Object.defineProperty(fakeDoc, "bringOnline", { value: async () => true, writable: true });
 	Object.defineProperty(fakeDoc, "onceOnline", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "onceEverSynced", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "onceFreshlySynced", { value: async () => {}, writable: true });
@@ -536,6 +536,96 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 		expect(writeConflictCopy).not.toHaveBeenCalled();
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(state.vault).toBe(AUTHOR_TEXT);
+	});
+
+	/** Runs the two pulls that confirm the note unseeded, leaving its upload to the test. */
+	async function confirmUnseeded(fakeDoc: Document) {
+		const { queue, clock } = queueRunningUploads();
+		jest.mocked(queue.enqueueUpload).mockResolvedValue(undefined);
+		await queue.pullIfUnchanged(fakeDoc);
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
+		return queue;
+	}
+
+	/** Applies `edit` from a peer that has seen everything `crdtDoc` holds. */
+	function peerEdit(crdtDoc: Y.Doc, edit: (text: Y.Text) => void) {
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, Y.encodeStateAsUpdate(crdtDoc));
+		const before = Y.encodeStateVector(peer);
+		edit(peer.getText("contents"));
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer, before));
+	}
+
+	test("a peer's text that lands while the upload reads the file is not reconciled over", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state } = makeFakeDoc(
+			crdtDoc,
+			AUTHOR_TEXT,
+			undefined,
+		);
+		const queue = await confirmUnseeded(fakeDoc);
+
+		// The upload checks the text, then reads the file: the peer's text lands during that read.
+		let reads = 0;
+		fakeDoc.vaultShare.readContents = async () => {
+			if (++reads === 2) peerEdit(crdtDoc, (text) => text.insert(0, "PEER LINE\n"));
+			return state.vault;
+		};
+		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
+
+		expect(reads).toBeGreaterThanOrEqual(2);
+		expect(crdtDoc.getText("contents").toString()).toBe("PEER LINE\n");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(state.vault).toBe(AUTHOR_TEXT);
+	});
+
+	test("an upload that fails to connect leaves its retry seed-only", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state } = makeFakeDoc(
+			crdtDoc,
+			AUTHOR_TEXT,
+			undefined,
+		);
+		const queue = await confirmUnseeded(fakeDoc);
+
+		fakeDoc.bringOnline = async () => false;
+		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(false);
+		fakeDoc.bringOnline = async () => true;
+		peerEdit(crdtDoc, (text) => text.insert(0, "PEER LINE\n"));
+		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
+
+		expect(crdtDoc.getText("contents").toString()).toBe("PEER LINE\n");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(state.vault).toBe(AUTHOR_TEXT);
+	});
+
+	test("a seed is recorded as the base only while the CRDT still holds the file's text", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const queue = await confirmUnseeded(fakeDoc);
+
+		// A peer edits the seeded text while the upload reads the file to record the base.
+		let edited = false;
+		fakeDoc.vaultShare.readContents = async () => {
+			if (!edited && crdtDoc.getText("contents").toString() === AUTHOR_TEXT) {
+				edited = true;
+				peerEdit(crdtDoc, (text) => text.insert(text.length, "PEER LINE\n"));
+			}
+			return state.vault;
+		};
+		expect(await queue.uploadDocumentViaSocket(fakeDoc)).toBe(true);
+
+		expect(edited).toBe(true);
+		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT + "PEER LINE\n");
+		// The file is not that text: recording it would read the file as a local edit later.
+		expect(state.syncBase).toBeUndefined();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
 		expect(state.vault).toBe(AUTHOR_TEXT);
 	});
 

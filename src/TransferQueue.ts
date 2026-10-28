@@ -309,7 +309,7 @@ export class TransferQueue extends Loggable {
 	private uploadRetries = new Map<string, { attempt: number; timer?: number }>();
 	/** When a pull first found a note never seeded, by guid (see UNSEEDED_CONFIRM_MS). */
 	private unseededSince = new Map<string, number>();
-	/** Notes whose next upload may only seed a text that never held an item. */
+	/** Notes whose uploads may only seed a text that never held an item, until one gets to decide. */
 	private seedOnlyUploads = new Set<string>();
 	private uploadRetryStats = { failed: 0, retried: 0, gaveUp: 0 };
 
@@ -1081,7 +1081,8 @@ export class TransferQueue extends Loggable {
 	 */
 	async uploadDocumentViaSocket(doc: Document | CanvasDocument): Promise<boolean> {
 		// Set by a pull that confirmed the note never held text (see pullIfUnchanged()).
-		const seedOnly = this.seedOnlyUploads.delete(doc.entityGuid);
+		// Kept until an attempt gets as far as deciding: a retry is seed-only too.
+		const seedOnly = this.seedOnlyUploads.has(doc.entityGuid);
 		// Wait for this item's OWN local persistence (IndexedDB) to finish
 		// loading before trusting anything read off its Y.Doc below. Without
 		// this, `doc.content`/exported canvas data can read as empty for a doc
@@ -1182,16 +1183,20 @@ export class TransferQueue extends Loggable {
 		// Not retried: a retry that runs after a peer's edit or clear would
 		// reconcile the stale file over it. The pull whose sync closes the gap
 		// delivers the relay's text instead (see pullIfUnchanged()).
-		let usable = !(isRelayOnPrem && isDocument(doc)) || !hasHistoryGap(doc.crdtDoc);
+		this.seedOnlyUploads.delete(doc.entityGuid);
+		const usable = !(isRelayOnPrem && isDocument(doc)) || !hasHistoryGap(doc.crdtDoc);
 		if (!usable) {
 			this.log(`[uploadDocumentViaSocket] history gap in ${doc.entryPath}; not reconciling yet`);
-		} else if (seedOnly && !neverHeldText(doc.crdtDoc, doc.crdtDoc.getText("contents"))) {
-			// Text reached the relay since the pull found none: not a seed any more.
-			this.log(`[uploadDocumentViaSocket] ${doc.entryPath} holds text now; not seeding it`);
-			usable = false;
 		}
 		let baseSettled = false;
-		if (usable && isRelayOnPrem && isDocument(doc)) {
+		if (usable && isRelayOnPrem && isDocument(doc) && seedOnly) {
+			// No delivery and no reconcile: reconcileRelayContent() seeds the
+			// file only into a text that still never held an item.
+			const currentVaultContents = await this.readVaultContents(doc);
+			if (currentVaultContents) {
+				await this.reconcileRelayContent(doc, currentVaultContents, { seedOnly });
+			}
+		} else if (usable && isRelayOnPrem && isDocument(doc)) {
 			// Typing can continue while the provider connects. Compare the
 			// current disk and CRDT contents, not the pre-connection snapshots.
 			const currentVaultContents = await this.readVaultContents(doc);
@@ -1217,10 +1222,13 @@ export class TransferQueue extends Loggable {
 		// local edit on the next sync and push it over the peer's text.
 		// A seed that did not happen (a peer's text arrived during the claim)
 		// records no base: the stale file must not read as a local edit later.
-		const unseededFile =
-			seedOnly && isDocument(doc) && !sameTextContent(doc.content, await this.readVaultContents(doc));
-		if (usable && isRelayOnPrem && isDocument(doc) && !baseSettled && !unseededFile) {
-			await doc.setSyncBase(doc.content);
+		if (usable && isRelayOnPrem && isDocument(doc) && !baseSettled) {
+			// Read the disk first: the CRDT text compared with it is the one recorded.
+			const diskContents = seedOnly ? await this.readVaultContents(doc) : undefined;
+			const agreed = doc.content;
+			if (!seedOnly || sameTextContent(agreed, diskContents ?? "")) {
+				await doc.setSyncBase(agreed);
+			}
 		}
 
 		// promise can take some time
@@ -1822,6 +1830,7 @@ export class TransferQueue extends Loggable {
 	private async reconcileRelayContent(
 		doc: Document,
 		vaultContents: string,
+		{ seedOnly = false }: { seedOnly?: boolean } = {},
 	): Promise<void> {
 		const syncedText = doc.content;
 		if (!syncedText) {
@@ -1856,6 +1865,9 @@ export class TransferQueue extends Loggable {
 					`[uploadDocumentViaSocket] Skipped initial-content insert for ${doc.entryPath} — lost the init claim to a concurrently-connecting client`,
 				);
 			}
+		} else if (seedOnly) {
+			// Text reached the relay since the pull found none: not a seed any more.
+			this.log(`[uploadDocumentViaSocket] ${doc.entryPath} holds text now; not seeding it`);
 		} else if (!sameTextContent(syncedText, vaultContents)) {
 			// `syncedText` diverges from the vault file. That alone doesn't
 			// tell us whether the RELAY moved (another client's edit just
@@ -2290,6 +2302,7 @@ export class TransferQueue extends Loggable {
 		} catch (e: unknown) {
 			console.error(e);
 			this.clearUploadRetry(doc.entityGuid);
+			this.seedOnlyUploads.delete(doc.entityGuid);
 			return;
 		}
 	}
@@ -2306,6 +2319,7 @@ export class TransferQueue extends Loggable {
 		const delay = UPLOAD_RETRY_DELAYS_MS[retry.attempt];
 		if (delay === undefined) {
 			this.uploadRetries.delete(doc.entityGuid);
+			this.seedOnlyUploads.delete(doc.entityGuid);
 			this.uploadRetryStats.gaveUp++;
 			this.warn("[uploadRetry] giving up for now on", doc.entryPath);
 			return;
@@ -2319,6 +2333,7 @@ export class TransferQueue extends Loggable {
 			const share = doc.vaultShare;
 			if (share.trackedEntries?.get(doc.entityGuid) !== doc || !share.isOnline) {
 				this.uploadRetries.delete(doc.entityGuid);
+				this.seedOnlyUploads.delete(doc.entityGuid);
 				return;
 			}
 			this.uploadRetryStats.retried++;
