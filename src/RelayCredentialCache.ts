@@ -11,6 +11,7 @@ import { platformFetch } from "./platformFetch";
 import { refresh as universalRefresh } from "./RelayCredentialRefresh";
 import {
 	RelayAccessDeniedError,
+	RelayTokenTimeoutError,
 	type RelayOnPremTokenProvider,
 } from "./auth/RelayOnPremTokenProvider";
 import { AccessDeniedBackoff } from "./accessDeniedBackoff";
@@ -24,7 +25,7 @@ function getJwtExpiryFromDocumentGrant(grant: DocumentGrant): number {
 }
 
 /** Refusals are per share: every document of a folder share shares one entry. */
-function shareIdOf(documentId: string): string {
+export function shareIdOf(documentId: string): string {
 	try {
 		const address = ResourceAddress.parse(documentId);
 		return "folderGuid" in address ? address.folderGuid : documentId;
@@ -59,10 +60,13 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 	// until their backoff runs out, whichever path asks (reconnect gate,
 	// background poller, editor open).
 	private accessDenied = new AccessDeniedBackoff();
-	// Shares that granted a token since their last refusal, and the one
-	// token request in flight for each share that has not.
-	private grantedShares = new Set<string>();
-	private shareProbes = new Map<string, Promise<DocumentGrant>>();
+	// The one token request in flight for each share.
+	private shareProbes = new Map<string, Promise<void>>();
+	// Shares whose last token request timed out. That request cannot be
+	// cancelled and may still be in flight, so the share is not asked again
+	// until this backoff runs out.
+	private stalled = new AccessDeniedBackoff();
+	private accessListeners = new Set<(shareId: string) => void>();
 
 	constructor(
 		private authSession: AuthSession,
@@ -95,15 +99,7 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 					documentId: string,
 					onSuccess: (grant: DocumentGrant) => void,
 					onError: (err: Error) => void,
-				) =>
-					void universalRefresh(
-						this.getRelayOnPremProvider(documentId),
-						this.isRelayOnPremMode,
-						documentId,
-						onSuccess,
-						onError,
-						this.filePathMap.get(documentId),
-					),
+				) => void this.gatedRefresh(documentId, onSuccess, onError),
 			},
 			maxConnections,
 		);
@@ -173,51 +169,85 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		if (this.isRelayOnPremMode && onpremServerId) {
 			this.documentServerMap.set(documentId, onpremServerId);
 		}
-		const shareId = shareIdOf(documentId);
-		// Until a share has granted a token, its documents ask one at a time,
-		// so a refused share costs one request per backoff window, not one
-		// per document reconnecting at once. The price is that a working
-		// share's first token of the session is awaited before its other
-		// documents ask; after that first grant they ask concurrently again.
-		for (;;) {
-			const probe = this.grantedShares.has(shareId) ? undefined : this.shareProbes.get(shareId);
-			if (!probe) break;
-			await probe.catch(() => undefined);
-		}
-		const retryAt = this.accessDenied.retryAt(shareId, Date.now());
-		if (retryAt !== undefined) {
-			const denied = new RelayAccessDeniedError(0, `Relay token refused for share ${shareId}; next try in ${Math.ceil((retryAt - Date.now()) / 1000)}s`);
-			denied.retryAt = retryAt;
-			throw denied;
-		}
-		const attempt = this.acquireShareToken(shareId, documentId, friendlyName, callback);
-		if (!this.grantedShares.has(shareId)) {
-			this.shareProbes.set(shareId, attempt);
-			const release = () => {
-				if (this.shareProbes.get(shareId) === attempt) this.shareProbes.delete(shareId);
-			};
-			attempt.then(release, release);
-		}
-		return attempt;
+		return super.acquireToken(documentId, friendlyName, callback);
 	}
 
-	private async acquireShareToken(
-		shareId: string,
+	/**
+	 * Every token request goes through here: a document reconnecting
+	 * (getToken) and the periodic renewal sweep alike, so a refused share is
+	 * backed off on both paths.
+	 */
+	private async gatedRefresh(
 		documentId: string,
-		friendlyName: string,
-		callback: (token: DocumentGrant) => void,
-	): Promise<DocumentGrant> {
+		onSuccess: (grant: DocumentGrant) => void,
+		onError: (err: Error) => void,
+	): Promise<void> {
+		const shareId = shareIdOf(documentId);
+		// A share's documents ask one at a time, so a share refused at any
+		// point (first connect, after a sleep, mid-session) costs one request
+		// per backoff window, not one per document asking at once. This
+		// costs a working share no throughput: the throttle already spaces
+		// token requests 500 ms apart, longer than the request takes
+		// (control plane p99 about 230 ms, 27.10).
+		// A request that times out on the network (RelayTokenTimeoutError)
+		// may still be in flight, so its share is backed off below rather
+		// than asked again at once, and the provider sends nothing for that
+		// share until the old request has settled.
+		for (;;) {
+			const probe = this.shareProbes.get(shareId);
+			if (!probe) break;
+			await probe;
+		}
+		const now = Date.now();
+		const retryAt = this.accessDenied.retryAt(shareId, now);
+		if (retryAt !== undefined) {
+			const denied = new RelayAccessDeniedError(0, `Relay token refused for share ${shareId}; next try in ${Math.ceil((retryAt - now) / 1000)}s`);
+			denied.retryAt = retryAt;
+			// Not inline: the renewal queue calls the next refresh from this
+			// callback, and a run of backed-off documents would recurse.
+			void Promise.resolve().then(() => onError(denied));
+			return;
+		}
+		const stalledUntil = this.stalled.retryAt(shareId, now);
+		if (stalledUntil !== undefined) {
+			const stalled = new Error(`Relay token request for share ${shareId} timed out; next try in ${Math.ceil((stalledUntil - now) / 1000)}s`);
+			void Promise.resolve().then(() => onError(stalled));
+			return;
+		}
+		let settle!: () => void;
+		const probe = new Promise<void>((resolve) => (settle = resolve));
+		this.shareProbes.set(shareId, probe);
+		const done = () => {
+			if (this.shareProbes.get(shareId) === probe) this.shareProbes.delete(shareId);
+			settle();
+		};
 		try {
-			const grant = await super.acquireToken(documentId, friendlyName, callback);
-			this.grantedShares.add(shareId);
-			this.accessDenied.clear(shareId);
-			return grant;
-		} catch (err: unknown) {
-			if (err instanceof RelayAccessDeniedError) {
-				this.grantedShares.delete(shareId);
-				err.retryAt = this.accessDenied.recordDenied(shareId, Date.now());
-			}
-			throw err;
+			await universalRefresh(
+				this.getRelayOnPremProvider(documentId),
+				this.isRelayOnPremMode,
+				documentId,
+				(grant) => {
+					const wasDenied = this.accessDenied.isDenied(shareId);
+					this.accessDenied.clear(shareId);
+					this.stalled.clear(shareId);
+					done();
+					if (wasDenied) this.notifyAccessChange(shareId);
+					onSuccess(grant);
+				},
+				(err) => {
+					if (err instanceof RelayAccessDeniedError) {
+						const wasDenied = this.accessDenied.isDenied(shareId);
+						err.retryAt = this.accessDenied.recordDenied(shareId, Date.now());
+						if (!wasDenied) this.notifyAccessChange(shareId);
+					}
+					if (err instanceof RelayTokenTimeoutError) this.stalled.recordDenied(shareId, Date.now());
+					done();
+					onError(err);
+				},
+				this.filePathMap.get(documentId),
+			);
+		} finally {
+			done();
 		}
 	}
 
@@ -226,9 +256,28 @@ export class RelayCredentialCache extends CredentialCache<DocumentGrant> {
 		return this.accessDenied.isDenied(shareIdOf(documentId));
 	}
 
-	/** Forget every refusal: after a sign-in/token refresh or a manual reconnect. */
-	clearAccessDenied(): void {
-		this.accessDenied.clear();
+	/**
+	 * Forget refusals: every share after a sign-in or token refresh, one
+	 * share on its manual reconnect.
+	 */
+	clearAccessDenied(documentId?: string): void {
+		const shareId = documentId === undefined ? undefined : shareIdOf(documentId);
+		const denied = this.accessDenied.deniedShares().filter((id) => shareId === undefined || id === shareId);
+		this.accessDenied.clear(shareId);
+		for (const provider of this.relayOnPremProviders.values()) {
+			provider.clearRefused(shareId);
+		}
+		for (const id of denied) this.notifyAccessChange(id);
+	}
+
+	/** Called with a share id whenever that share becomes refused or stops being refused. */
+	onAccessDeniedChange(listener: (shareId: string) => void): () => void {
+		this.accessListeners.add(listener);
+		return () => this.accessListeners.delete(listener);
+	}
+
+	private notifyAccessChange(shareId: string): void {
+		for (const listener of this.accessListeners) listener(shareId);
 	}
 
 	clear(filter?: (token: CredentialEntry<DocumentGrant>) => boolean) {

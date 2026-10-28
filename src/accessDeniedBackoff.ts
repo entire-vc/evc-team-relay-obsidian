@@ -40,6 +40,10 @@ export class AccessDeniedBackoff {
 		return entry && now < entry.retryAt ? entry.retryAt : undefined;
 	}
 
+	deniedShares(): string[] {
+		return [...this.entries.keys()];
+	}
+
 	isDenied(shareId: string): boolean {
 		return this.entries.has(shareId);
 	}
