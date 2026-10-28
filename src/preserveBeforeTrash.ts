@@ -177,6 +177,22 @@ export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
 			if (!covered.some(([from, to]) => from <= Math.max(clock, state) && clock + len <= to)) return true;
 		}
 	}
+	// A missing clock is only ever a seed clock: whatever a pending change
+	// refers to, and whatever Yjs waits for, is here, pending or in a seed.
+	const known = (id: Y.ID): boolean =>
+		id.clock < Y.getState(doc.store, id.client) ||
+		findPending(id) !== undefined ||
+		(seedClients.has(id.client) && id.clock < SEED_CLOCKS);
+	for (const struct of structs) {
+		if (!(struct instanceof Y.Item)) continue;
+		const parent = struct.parent as unknown;
+		if (parent instanceof Y.ID && !known(parent)) return true;
+		if (struct.origin !== null && !known(struct.origin)) return true;
+		if (struct.rightOrigin !== null && !known(struct.rightOrigin)) return true;
+	}
+	for (const [client, clock] of pending?.missing ?? []) {
+		if (!known(Y.createID(client, clock))) return true;
+	}
 	return ![...seedClients].every((client) => isIdentitySeedGap(structs, client));
 }
 

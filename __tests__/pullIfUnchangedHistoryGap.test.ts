@@ -592,6 +592,25 @@ describe("missing clocks outside an identity seed are a gap", () => {
 		expect(hasHistoryGap(crdtDoc)).toBe(true);
 	});
 
+	test("a seed-gap writer's change inside another writer's missing type is a gap", () => {
+		const other = new Y.Doc();
+		other.getText("contents").insert(0, "MISSING TEXT");
+		other.getMap("users").set("other-account", new Y.Array<Uint8Array>());
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		Y.applyUpdate(ghost, Y.encodeStateAsUpdate(other));
+		const before = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 1]);
+		((ghost.getMap("users").get("ghost-account") as Y.Map<unknown>).get("ds") as Y.Array<Uint8Array>).push([
+			new Uint8Array([0]),
+		]);
+		(ghost.getMap("users").get("other-account") as Y.Array<Uint8Array>).push([new Uint8Array([1])]);
+		const doc = deliverOnly(Y.encodeStateAsUpdate(ghost, before));
+
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
 	test("a hole after the seed is a gap", () => {
 		const ghost = new Y.Doc();
 		const ids = seedIdentity(ghost);
