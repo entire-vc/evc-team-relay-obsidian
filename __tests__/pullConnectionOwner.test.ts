@@ -33,12 +33,19 @@ async function flushMacrotasks(times = 20): Promise<void> {
 	for (let i = 0; i < times; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
-/** A note whose connection opens when `openSocket()` is called and stays up until goOffline(). */
-function makeDoc() {
+/**
+ * A note whose connection opens when `openSocket()` is called and stays up
+ * until goOffline(). With `separateFirstConnect`, the first bringOnline()
+ * waits for `openFirstSocket()` instead.
+ */
+function makeDoc({ separateFirstConnect = false } = {}) {
 	let online = false;
 	let intent: "connected" | "disconnected" = "disconnected";
 	let openSocket: () => void = () => {};
+	let openFirstSocket: () => void = () => {};
 	const opened = new Promise<void>((resolve) => (openSocket = resolve));
+	const firstOpened = new Promise<void>((resolve) => (openFirstSocket = resolve));
+	let connects = 0;
 	const goOffline = jest.fn(() => {
 		online = false;
 		intent = "disconnected";
@@ -64,7 +71,7 @@ function makeDoc() {
 	Object.defineProperty(doc, "bringOnline", {
 		value: async () => {
 			intent = "connected";
-			await opened;
+			await (separateFirstConnect && connects++ === 0 ? firstOpened : opened);
 			online = true;
 			return true;
 		},
@@ -77,7 +84,7 @@ function makeDoc() {
 	Object.defineProperty(doc, "getSyncBase", { value: async () => "same" });
 	Object.defineProperty(doc, "setSyncBase", { value: async () => {} });
 	Object.defineProperty(doc, "vaultShare", { value: share });
-	return { doc, goOffline, openSocket, isOnline: () => online };
+	return { doc, goOffline, openSocket, openFirstSocket, isOnline: () => online };
 }
 
 describe("pull connection ownership", () => {
@@ -105,9 +112,9 @@ describe("pull connection ownership", () => {
 		expect(isOnline()).toBe(false);
 	});
 
-	test("a newer pull ending first does not lose the connection to the older pull's release", async () => {
+	test("an aborted pull ending after the newer pull closes the connection nobody holds any more", async () => {
 		const queue = new TransferQueue({} as never, new InstantClock(), {} as never, 3);
-		const { doc, goOffline, openSocket } = makeDoc();
+		const { doc, goOffline, openSocket, openFirstSocket, isOnline } = makeDoc({ separateFirstConnect: true });
 
 		const deadline = new AbortController();
 		const pullA = queue.pullIfUnchanged(doc, { signal: deadline.signal });
@@ -115,13 +122,20 @@ describe("pull connection ownership", () => {
 		deadline.abort();
 		const pullB = queue.pullIfUnchanged(doc);
 		await flushMacrotasks();
-		openSocket();
-		await Promise.all([pullA, pullB]);
 
-		// A third pull on a closed note opens and closes its own connection.
-		const pullC = queue.pullIfUnchanged(doc);
-		expect((await pullC).outcome).toBe("unchanged");
+		openSocket();
+		expect((await pullB).outcome).toBe("unchanged");
+		expect(goOffline).toHaveBeenCalledTimes(1);
+
+		// A's connect lands late: the socket it brings up is nobody's now.
+		openFirstSocket();
+		expect((await pullA).outcome).toBe("aborted");
 		expect(goOffline).toHaveBeenCalledTimes(2);
+		expect(isOnline()).toBe(false);
+
+		// No hold is left behind: a third pull opens and closes its own connection.
+		expect((await queue.pullIfUnchanged(doc)).outcome).toBe("unchanged");
+		expect(goOffline).toHaveBeenCalledTimes(3);
 	});
 
 	test("an aborted pull nobody took over still closes its connection", async () => {
