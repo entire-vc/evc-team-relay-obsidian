@@ -371,4 +371,25 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 
 		expect(writeContents).not.toHaveBeenCalled();
 	});
+
+	test.each([
+		["empty", ""],
+		["partial", "PEER LINE\n"],
+	])("fetch with no retry left still never writes a gapped doc's %s text over a local edit", async (_label, peerText) => {
+		const crdtDoc = docWithHistoryGap();
+		if (peerText) {
+			const peer = new Y.Doc();
+			peer.getText("contents").insert(0, peerText);
+			Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		}
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, "local edit\n", FULL_TEXT);
+		const queue = makeQueue(new InstantClock()) as unknown as {
+			fetchDocument: (doc: Document, retry?: number, wait?: number, slowRounds?: number) => Promise<void>;
+		};
+
+		await queue.fetchDocument(fakeDoc, 0, 1000, 0);
+
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(state.vault).toBe("local edit\n");
+	});
 });

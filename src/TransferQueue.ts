@@ -2069,7 +2069,8 @@ export class TransferQueue extends Loggable {
 			doc,
 			"getDocument",
 			() => doc.vaultShare.writeContents(doc, doc.content),
-			() => !(notReady() && (retry > 0 || slowRounds > 0)),
+			// Never while a gap remains, even with no retry left: that text may blank a local edit for good.
+			() => !hasHistoryGap(doc.crdtDoc) && !(notReady() && (retry > 0 || slowRounds > 0)),
 		);
 		if (!flushed && notReady() && retry === 0 && slowRounds > 0) {
 			this.warn(
