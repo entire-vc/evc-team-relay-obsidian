@@ -60,23 +60,27 @@ export function findByPath<T extends PathHolder>(
  * history is missing earlier changes, so the text it shows is not what was
  * last synced.
  *
- * Only pending changes that may belong to `textName` count. A writer whose
- * first changes reached nobody leaves its later presence entries (the `users`
- * map kept by `Y.PermanentUserData`) pending on every client for good; that
- * gap never closes and never alters the text, so it must not hold the text
- * back. A pending change counts unless it is shown to belong elsewhere: its
- * parent chain resolves to another root, or its content is a kind a text
- * never holds (this plugin's text holds no embedded types).
+ * A writer whose first changes reached nobody leaves its later presence
+ * entries (the `users` map kept by `Y.PermanentUserData`) pending on every
+ * client for good; that gap never closes and never alters the text, so it must
+ * not hold the text back. The text is complete only if both hold:
  *
- * Deleted changes do not count either: a pending deleted change (and
- * `pendingDs`, which deletes changes this doc does not have yet) is not in
- * the text now and arrives deleted, so the text already reads as it will
- * once it arrives.
+ * - every pending change lies outside the text: its parent chain resolves to
+ *   another root, its content is a kind a text never holds (this plugin's text
+ *   holds no embedded types), or it is deleted;
+ * - every missing clock lies outside the text. Nothing in the doc says what a
+ *   missing clock held, so the only missing clocks accepted are a writer's
+ *   identity seed: `seedDocIdentity` is the first write of every fresh doc, and
+ *   when its clocks are missing, the writer's later pushes into the seed's
+ *   `ids`/`ds` lists are pending. Any other missing range (a missing prefix
+ *   before a presence entry, a hole between pending changes, a pending delete
+ *   of a change nobody has) may hold text and counts as a gap.
  */
 export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
 	const pending = doc.store.pendingStructs;
-	if (pending === null) return false;
-	const structs = Y.decodeUpdateV2(pending.update).structs;
+	const pendingDs = doc.store.pendingDs;
+	if (pending === null && pendingDs === null) return false;
+	const structs = pending === null ? [] : Y.decodeUpdateV2(pending.update).structs;
 	const byClient = new Map<number, (Y.Item | Y.GC)[]>();
 	for (const struct of structs) {
 		if (struct instanceof Y.Skip) continue;
@@ -84,6 +88,7 @@ export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
 		list.push(struct);
 		byClient.set(struct.id.client, list);
 	}
+	for (const list of byClient.values()) list.sort((a, b) => a.id.clock - b.id.clock);
 	const findPending = (id: Y.ID): Y.Item | Y.GC | undefined =>
 		byClient
 			.get(id.client)
@@ -142,11 +147,67 @@ export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
 			if (struct instanceof Y.GC || struct.content instanceof Y.ContentDeleted) continue;
 			const root = rootOf(struct);
 			if (root !== undefined && root !== textName) continue;
-			if (root === undefined && struct instanceof Y.Item && neverInText(struct.content)) continue;
+			if (root === undefined && neverInText(struct.content)) continue;
 			return true;
 		}
 	}
-	return false;
+
+	// Missing clocks: the ranges before, between and after the pending structs
+	// (a pending delete reaches past them) that this doc does not have.
+	const deletes: Map<number, { clock: number; len: number }[]> =
+		pendingDs === null ? new Map() : Y.decodeUpdateV2(pendingDs).ds.clients;
+	const seedClients = new Set<number>();
+	for (const client of new Set([...byClient.keys(), ...deletes.keys()])) {
+		const state = Y.getState(doc.store, client);
+		let next = state;
+		const covered: [number, number][] = [];
+		for (const struct of byClient.get(client) ?? []) {
+			if (struct.id.clock > next) {
+				if (next !== 0 || struct.id.clock !== SEED_CLOCKS) return true;
+				seedClients.add(client);
+			}
+			const last = covered[covered.length - 1];
+			if (last !== undefined && last[1] === struct.id.clock) last[1] += struct.length;
+			else covered.push([struct.id.clock, struct.id.clock + struct.length]);
+			next = Math.max(next, struct.id.clock + struct.length);
+		}
+		for (const { clock, len } of deletes.get(client) ?? []) {
+			if (clock + len <= state) continue;
+			// A delete of pending changes alters nothing in the text; any other is a gap.
+			if (!covered.some(([from, to]) => from <= Math.max(clock, state) && clock + len <= to)) return true;
+		}
+	}
+	return ![...seedClients].every((client) => isIdentitySeedGap(structs, client));
+}
+
+/** Clocks `Y.PermanentUserData.setUserMapping` writes for a new user entry. */
+const SEED_CLOCKS = 4;
+/**
+ * Layout of those clocks: 0 the user's map in `users`, 1 its `ids` list, 2 its
+ * `ds` list, 3 the writer's client id pushed into `ids`.
+ */
+const SEED_LISTS = new Set([1, 2]);
+const SEED_LAST_ID = 3;
+
+/**
+ * Whether `client`'s missing clocks 0..3 are its identity seed: pending
+ * changes refer to them only as the seed's `ids`/`ds` lists (parent) or its
+ * last `ids` entry (left neighbour), and at least one is a list's child.
+ */
+function isIdentitySeedGap(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): boolean {
+	const inSeed = (id: Y.ID | null): id is Y.ID => id !== null && id.client === client && id.clock < SEED_CLOCKS;
+	let listChild = false;
+	for (const struct of structs) {
+		if (!(struct instanceof Y.Item)) continue;
+		const parent = struct.parent as unknown;
+		if (parent instanceof Y.ID && inSeed(parent)) {
+			if (!SEED_LISTS.has(parent.clock)) return false;
+			listChild = true;
+		}
+		if (inSeed(struct.origin) && struct.origin.clock !== SEED_LAST_ID) return false;
+		if (inSeed(struct.rightOrigin)) return false;
+	}
+	return listChild;
 }
 
 /** Content kinds a Y.Text never holds: list and map values. */

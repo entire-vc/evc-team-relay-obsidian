@@ -399,6 +399,17 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 	});
 });
 
+/** The user entry `PermanentUserData.setUserMapping` writes first in a fresh doc; returns its `ids` list. */
+function seedIdentity(doc: Y.Doc): Y.Array<number> {
+	const user = new Y.Map<unknown>();
+	user.set("ids", new Y.Array<number>());
+	user.set("ds", new Y.Array<Uint8Array>());
+	doc.getMap("users").set("ghost-account", user);
+	const ids = user.get("ids") as Y.Array<number>;
+	ids.push([doc.clientID]);
+	return ids;
+}
+
 /**
  * A presence entry (the `users` map that `Y.PermanentUserData` keeps) whose
  * first clocks never reached anyone: the later pushes into its `ids`/`ds`
@@ -406,15 +417,12 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
  */
 function presenceOnlyGap(opts: { deletePushed?: boolean } = {}): Uint8Array {
 	const ghost = new Y.Doc();
-	const user = new Y.Map<unknown>();
-	user.set("ids", new Y.Array<number>());
-	user.set("ds", new Y.Array<Uint8Array>());
-	ghost.getMap("users").set("ghost-account", user);
-	const ids = user.get("ids") as Y.Array<number>;
-	ids.push([ghost.clientID]);
+	const ids = seedIdentity(ghost);
 	const seeded = Y.encodeStateVector(ghost);
 	ids.push([ghost.clientID + 1]);
-	(user.get("ds") as Y.Array<Uint8Array>).push([new Uint8Array([0, 1, 2])]);
+	((ghost.getMap("users").get("ghost-account") as Y.Map<unknown>).get("ds") as Y.Array<Uint8Array>).push([
+		new Uint8Array([0, 1, 2]),
+	]);
 	if (opts.deletePushed) ids.delete(1, 1);
 	return Y.encodeStateAsUpdate(ghost, seeded);
 }
@@ -480,26 +488,118 @@ describe("a gap only in the presence map does not hold the text back", () => {
 		expect(withPresenceGap.syncBase).toBe(withPresenceGap.text);
 	});
 
-	test("a new presence entry pending behind the writer's lost clocks is not a gap", () => {
-		const ghost = new Y.Doc();
-		ghost.getMap("users").set("ghost-account", "seeded, never sent");
-		const seeded = Y.encodeStateVector(ghost);
-		ghost.getMap("users").set("second-account", new Y.Map<unknown>());
-		const { crdtDoc } = docWithPresenceGap();
-		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+	test("the presence fixture has the layout PermanentUserData writes", () => {
+		const shape = (update: Uint8Array) =>
+			Y.decodeUpdate(update).structs.map((s) => {
+				const item = s as Y.Item;
+				const parent = item.parent as unknown;
+				return [
+					item.id.clock,
+					item.content.constructor.name,
+					parent instanceof Y.ID ? parent.clock : parent,
+					item.origin?.clock ?? null,
+					item.parentSub,
+				];
+			});
+		const real = new Y.Doc();
+		new Y.PermanentUserData(real).setUserMapping(real, real.clientID, "ghost-account");
+		const fixture = new Y.Doc();
+		seedIdentity(fixture);
 
-		expect(crdtDoc.store.pendingStructs).not.toBeNull();
-		expect(hasHistoryGap(crdtDoc)).toBe(false);
+		expect(shape(Y.encodeStateAsUpdate(fixture))).toEqual(shape(Y.encodeStateAsUpdate(real)));
 	});
 
 	test("pending text from the same writer after its presence entry is still a gap", () => {
 		const ghost = new Y.Doc();
-		ghost.getMap("users").set("ghost-account", "seeded, never sent");
+		const ids = seedIdentity(ghost);
 		const seeded = Y.encodeStateVector(ghost);
-		ghost.getMap("users").set("other", new Uint8Array([1]));
+		ids.push([ghost.clientID + 1]);
 		ghost.getText("contents").insert(0, "GHOST TEXT\n");
 		const { crdtDoc } = docWithPresenceGap();
 		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+});
+
+/** A missing range that is not a writer's identity seed may hold text: the text is not known complete. */
+describe("missing clocks outside an identity seed are a gap", () => {
+	/** `update` delivered on its own to a doc holding nothing else. */
+	const deliverOnly = (update: Uint8Array) => {
+		const doc = new Y.Doc();
+		Y.applyUpdate(doc, update);
+		return doc;
+	};
+
+	test("REGRESSION: a pending delete whose earlier clocks hold text", () => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "AB");
+		const before = Y.encodeStateVector(writer);
+		writer.getText("contents").delete(1, 1);
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, before));
+
+		expect(doc.store.pendingStructs).toBeNull();
+		expect(doc.store.pendingDs).not.toBeNull();
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("REGRESSION: a pending deleted change whose earlier clocks hold text", () => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "A");
+		const before = Y.encodeStateVector(writer);
+		writer.getText("contents").insert(1, "B");
+		writer.getText("contents").delete(1, 1);
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, before));
+
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("REGRESSION: a presence entry pending behind missing text", () => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "MISSING TEXT");
+		const before = Y.encodeStateVector(writer);
+		writer.getMap("users").set("account", new Uint8Array([1]));
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, before));
+
+		expect(doc.store.pendingStructs).not.toBeNull();
+		expect(doc.getText("contents").toString()).toBe("");
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("a seed-sized prefix of text before a presence entry is a gap", () => {
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "ABCD");
+		const before = Y.encodeStateVector(writer);
+		writer.getMap("users").set("account", new Uint8Array([1]));
+		const doc = deliverOnly(Y.encodeStateAsUpdate(writer, before));
+
+		expect(hasHistoryGap(doc)).toBe(true);
+	});
+
+	test("a delete of a seed clock is a gap", () => {
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		const seeded = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 1]);
+		ids.delete(0, 1);
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+
+	test("a hole after the seed is a gap", () => {
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		ids.push([ghost.clientID + 1]);
+		const middle = Y.encodeStateVector(ghost);
+		ids.push([ghost.clientID + 2]);
+		const { crdtDoc } = docWithPresenceGap();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, middle));
 
 		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
 		expect(hasHistoryGap(crdtDoc)).toBe(true);
