@@ -352,10 +352,16 @@ export class CrdtBackgroundSyncPoller {
 
 	private _poll(): void {
 		const live = new Set<VaultShare>();
+		const registered = new Set<VaultShare>();
 		this.shareRegistry.each((folder: VaultShare) => {
-			if (!folder.workspaceId || !folder.isOnline) return;
-			live.add(folder);
+			if (!folder.workspaceId) return;
+			// Listen while offline too: on reconnect the folder sync replays the
+			// markers peers wrote in the meantime, usually before the next tick,
+			// and a missed marker leaves its note to the next sweep pass.
+			registered.add(folder);
 			this.subscribe(folder);
+			if (!folder.isOnline) return;
+			live.add(folder);
 			const queues = this.queuesFor(folder);
 			// Refill this share's sweep only once its previous pass has been
 			// handed out entirely: a document visited in this pass waits for
@@ -375,7 +381,7 @@ export class CrdtBackgroundSyncPoller {
 				queues.sweep.set(file.entityGuid, { folder, file, queuedAt: now, attempt: 0 });
 			}
 		});
-		this.forgetSharesExcept(live);
+		this.forgetSharesExcept(live, registered);
 		this.drain();
 		this.maybeLogStats();
 	}
@@ -403,12 +409,12 @@ export class CrdtBackgroundSyncPoller {
 	}
 
 	/** Drops queues and change subscriptions of shares that went offline or away. */
-	private forgetSharesExcept(live: Set<VaultShare>): void {
+	private forgetSharesExcept(live: Set<VaultShare>, registered: Set<VaultShare>): void {
 		for (const folder of [...this.queues.keys()]) {
 			if (!live.has(folder)) this.queues.delete(folder);
 		}
 		for (const [folder, unsubscribe] of [...this.subscriptions]) {
-			if (live.has(folder)) continue;
+			if (registered.has(folder)) continue;
 			unsubscribe();
 			this.subscriptions.delete(folder);
 		}
