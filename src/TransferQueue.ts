@@ -237,6 +237,12 @@ const PULL_SYNC_GRACE_MS = 2_000;
 const AWAIT_CONTENT_CHECK_MS = 250;
 /** How long a pull waits connected for announced text before it first reconnects to ask again; doubles after each. */
 const AWAIT_CONTENT_RECONNECT_MS = 4_000;
+/**
+ * pullIfUnchanged(): how long a note must keep reading as never seeded, across
+ * separate connections, before its file is uploaded. A room the relay is
+ * still loading answers the sync empty, so one connection proves nothing.
+ */
+const UNSEEDED_CONFIRM_MS = 60_000;
 /** probeRelay(): cap on each of its two phases. */
 const PROBE_PHASE_TIMEOUT_MS = 30_000;
 /**
@@ -301,6 +307,8 @@ export class TransferQueue extends Loggable {
 	private serveSeq = 0;
 	private lastStatsLogAt = 0;
 	private uploadRetries = new Map<string, { attempt: number; timer?: number }>();
+	/** When a pull first found a note never seeded, by guid (see UNSEEDED_CONFIRM_MS). */
+	private unseededSince = new Map<string, number>();
 	private uploadRetryStats = { failed: 0, retried: 0, gaveUp: 0 };
 
 	teardowns: Unsubscriber[] = [];
@@ -1433,11 +1441,21 @@ export class TransferQueue extends Loggable {
 				}
 				await doc.vaultShare.ensureParentDir(doc.entryPath);
 			}
-			if (
+			const unseeded =
 				syncBase === undefined &&
 				remoteText === "" &&
 				hasPreservableContent(vaultContentsAfter) &&
-				neverHeldText(doc.crdtDoc, doc.crdtDoc.getText("contents"))
+				neverHeldText(doc.crdtDoc, doc.crdtDoc.getText("contents"));
+			const unseededSince = this.unseededSince.get(doc.entityGuid);
+			if (!unseeded) {
+				this.unseededSince.delete(doc.entityGuid);
+			} else if (unseededSince === undefined) {
+				this.unseededSince.set(doc.entityGuid, this.clock.now());
+			}
+			if (
+				unseeded &&
+				unseededSince !== undefined &&
+				this.clock.now() - unseededSince >= UNSEEDED_CONFIRM_MS
 			) {
 				// The note reached the relay as an entry, its text never did:
 				// not one item, so no peer wrote or cleared it, and the file is
@@ -1445,7 +1463,10 @@ export class TransferQueue extends Loggable {
 				// for a note the relay never acknowledged, so without this the
 				// text stayed on its author's disk and every other client kept
 				// the note empty (0.1.7 author, 58 chars, still missing on
-				// 0.1.30). The upload seeds it under the init claim.
+				// 0.1.30). The upload seeds it under the init claim and checks
+				// again before inserting. Only once a later pull, on its own
+				// connection, still finds it so: see UNSEEDED_CONFIRM_MS.
+				this.unseededSince.delete(doc.entityGuid);
 				this.log(`[pullIfUnchanged] relay never held text for ${doc.entryPath}; uploading the file`);
 				this.releasePulledDoc(doc, intent);
 				void this.enqueueUpload(doc, { priority: true }).catch((err: unknown) => {
@@ -1794,12 +1815,20 @@ export class TransferQueue extends Loggable {
 			// and check ownership after the read in case a peer inserted meanwhile.
 			const currentVaultContents = await this.readVaultContents(doc);
 			const text = doc.crdtDoc.getText("contents");
-			if (currentVaultContents && wonInitClaim(doc.crdtDoc, text)) {
+			// Seed only text that never held an item, on a complete history:
+			// an empty text with tombstones is a peer's clear, and inserting
+			// the file would bring back what they deleted.
+			const seedable = neverHeldText(doc.crdtDoc, text) && !hasHistoryGap(doc.crdtDoc);
+			if (currentVaultContents && seedable && wonInitClaim(doc.crdtDoc, text)) {
 				this.log(
 					`[uploadDocumentViaSocket] Uploading new content for ${doc.entryPath} (${currentVaultContents.length} chars)`,
 				);
 				text.insert(0, currentVaultContents);
 				markInitDone(doc.crdtDoc);
+			} else if (text.length === 0 && !seedable) {
+				this.warn(
+					`[uploadDocumentViaSocket] Skipped initial-content insert for ${doc.entryPath}: the text was cleared or its history is incomplete`,
+				);
 			} else if (text.length === 0) {
 				this.warn(
 					`[uploadDocumentViaSocket] Skipped initial-content insert for ${doc.entryPath} — lost the init claim to a concurrently-connecting client`,

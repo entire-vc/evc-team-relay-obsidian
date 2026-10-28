@@ -423,20 +423,27 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 		return relay;
 	}
 
-	function queueRunningUploads() {
-		const queue = makeQueue();
+	const CONFIRM_MS = 60_000;
+
+	function queueRunningUploads(clock = new InstantClock()) {
+		const queue = makeQueue(clock);
 		const uploads: Promise<boolean>[] = [];
 		jest.mocked(queue.enqueueUpload).mockImplementation(async (doc) => {
 			uploads.push(queue.uploadDocumentViaSocket(doc as Document));
 		});
-		return { queue, uploads };
+		return { queue, uploads, clock };
 	}
 
-	test("REGRESSION: a no-base author whose relay text never held an item uploads it in one pass", async () => {
+	test("REGRESSION: a no-base author whose relay text never held an item uploads it on the confirming pass", async () => {
 		const crdtDoc = docWithoutText();
 		const relay = relayOf(crdtDoc);
 		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const { queue, uploads } = queueRunningUploads();
+		const { queue, uploads, clock } = queueRunningUploads();
+
+		// One connection proves nothing: a room still loading also reads empty.
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		expect(uploads).toHaveLength(0);
+		clock.time += CONFIRM_MS;
 
 		const pull = await queue.pullIfUnchanged(fakeDoc);
 		await Promise.all(uploads);
@@ -458,6 +465,54 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 		expect(relay.getText("contents").toString()).toBe(AUTHOR_TEXT);
 	});
 
+	test("a confirmation that the relay contradicts in between starts over", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue, uploads, clock } = queueRunningUploads();
+
+		await queue.pullIfUnchanged(fakeDoc);
+		// The loaded room turns out to hold a peer's text: not a seed case.
+		const peer = new Y.Doc();
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		// The peer clears it again: tombstones remain, still not a seed case.
+		peer.getText("contents").delete(0, peer.getText("contents").length);
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
+		await Promise.all(uploads);
+
+		expect(uploads).toHaveLength(0);
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+		expect(state.vault).toBe(AUTHOR_TEXT);
+	});
+
+	test("a peer's insert and clear that land before the queued upload are not undone", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, writeConflictCopy } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue, clock } = queueRunningUploads();
+		const queued: Document[] = [];
+		jest.mocked(queue.enqueueUpload).mockImplementation(async (doc) => {
+			queued.push(doc as Document);
+		});
+
+		await queue.pullIfUnchanged(fakeDoc);
+		clock.time += CONFIRM_MS;
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
+		expect(queued).toHaveLength(1);
+
+		const peer = new Y.Doc();
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		peer.getText("contents").delete(0, peer.getText("contents").length);
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		await queue.uploadDocumentViaSocket(fakeDoc);
+
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+	});
+
 	test("a no-base doc whose text a peer cleared keeps the clear: nothing uploaded, file untouched", async () => {
 		// The relay held the text once and a peer deleted it: its items stay as tombstones.
 		const crdtDoc = docClearedByPeer();
@@ -467,8 +522,10 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 			AUTHOR_TEXT,
 			undefined,
 		);
-		const { queue, uploads } = queueRunningUploads();
+		const { queue, uploads, clock } = queueRunningUploads();
 
+		await queue.pullIfUnchanged(fakeDoc);
+		clock.time += CONFIRM_MS;
 		const pull = await queue.pullIfUnchanged(fakeDoc);
 		await Promise.all(uploads);
 
@@ -503,16 +560,20 @@ describe("pullIfUnchanged — an author's text that never reached the relay is u
 		const crdtDoc = docWithoutText();
 		crdtDoc.getMap("meta").set("initDone", true);
 		const { fakeDoc } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
-		const { queue, uploads } = queueRunningUploads();
+		const { queue, uploads, clock } = queueRunningUploads();
 
+		await queue.pullIfUnchanged(fakeDoc);
+		clock.time += CONFIRM_MS;
 		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("no-base");
 		expect(uploads).toHaveLength(0);
 	});
 
 	test("an empty file on a no-base doc uploads nothing", async () => {
 		const { fakeDoc } = makeFakeDoc(docWithoutText(), "", undefined);
-		const { queue, uploads } = queueRunningUploads();
+		const { queue, uploads, clock } = queueRunningUploads();
 
+		await queue.pullIfUnchanged(fakeDoc);
+		clock.time += CONFIRM_MS;
 		await queue.pullIfUnchanged(fakeDoc);
 		expect(uploads).toHaveLength(0);
 	});
