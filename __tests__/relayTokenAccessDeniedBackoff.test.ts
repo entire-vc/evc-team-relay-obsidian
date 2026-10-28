@@ -354,8 +354,20 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(maxInFlight).toBe(1);
 	});
 
-	test("a token request that never settles fails after 30 s and holds its share off the network, not forever", async () => {
-		mockFetch.mockImplementationOnce(() => new Promise<Response>(() => {}));
+	test.each([401, 403])("%i answered after 15 minutes: the share never has two token requests in flight", async (status) => {
+		mockFetch.mockImplementation(() => respondSlowly(status, 15 * MINUTE));
+		const { pb, docIn } = build();
+
+		for (const p of [pb, ...DOCS.map(docIn)]) void p.bringOnline();
+		await jest.advanceTimersByTimeAsync(20 * MINUTE);
+
+		expect(tokenCalls()).toBeGreaterThanOrEqual(1);
+		expect(maxInFlight).toBe(1);
+	});
+
+	test("a token request that hangs fails after 30 s and holds its share off the network until it settles", async () => {
+		let settle: (r: Response) => void = () => {};
+		mockFetch.mockImplementationOnce(() => new Promise<Response>((resolve) => (settle = resolve)));
 		mockFetch.mockImplementation(() => respond(200));
 		const { cache } = build();
 		const [hung, next, later] = DOCS.map((d) => ResourceAddress.serialize(new RemoteDocumentAddress("relay-onprem", G, d)));
@@ -374,16 +386,19 @@ describe("tokens/relay 401/403: back off instead of retrying on a fixed floor", 
 		expect(String(nextError)).toMatch(/timed out; next try in/);
 		expect(tokenCalls()).toBe(1);
 
-		// The backoff is over but the request is still in flight: still no second request.
-		await jest.advanceTimersByTimeAsync(2 * MINUTE);
-		let laterError: unknown;
-		void cache.getToken(later, later, () => {}, "server-a").catch((e: unknown) => (laterError = e));
-		await jest.advanceTimersByTimeAsync(3_000);
-		expect(String(laterError)).toMatch(/still in flight/);
-		expect(tokenCalls()).toBe(1);
+		// Backoffs come and go; while the request is in flight no second one is sent.
+		for (const wait of [2 * MINUTE, 30 * MINUTE]) {
+			await jest.advanceTimersByTimeAsync(wait);
+			let laterError: unknown;
+			void cache.getToken(later, later, () => {}, "server-a").catch((e: unknown) => (laterError = e));
+			await jest.advanceTimersByTimeAsync(3_000);
+			expect(String(laterError)).toMatch(/still in flight|next try in/);
+			expect(tokenCalls()).toBe(1);
+		}
 
-		// Past the abandon cap the share goes back on the network.
-		await jest.advanceTimersByTimeAsync(12 * MINUTE);
+		// Once it settles the share goes back on the network.
+		void respond(500).then(settle);
+		await jest.advanceTimersByTimeAsync(10 * MINUTE);
 		let granted = false;
 		void cache.getToken(next, next, () => (granted = true), "server-a");
 		await jest.advanceTimersByTimeAsync(3_000);

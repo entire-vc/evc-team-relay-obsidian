@@ -104,13 +104,6 @@ export class RelayAccessDeniedError extends Error {
 export const RELAY_TOKEN_TIMEOUT_MS = 30_000;
 
 /**
- * How long a timed-out request keeps its share off the network while it may
- * still be in flight. requestUrl normally settles well before this; the cap
- * only stops a request that never settles from blocking its share for good.
- */
-export const RELAY_TOKEN_ABANDON_MS = 10 * 60_000;
-
-/**
  * POST /v1/tokens/relay did not answer within RELAY_TOKEN_TIMEOUT_MS.
  * requestUrl cannot be cancelled, so the request may still be in flight and
  * may still reach the control plane; callers keep the share off the network
@@ -379,10 +372,10 @@ export class RelayOnPremTokenProvider {
 					body: JSON.stringify(request),
 				}
 			);
+			// The share stays off the network until this request itself settles,
+			// however long that takes: a timeout below only ends the wait for it.
 			this.sharesOnNetwork.set(folderId, fetched);
-			const abandon = window.setTimeout(() => offNetwork(), RELAY_TOKEN_ABANDON_MS);
 			const offNetwork = () => {
-				window.clearTimeout(abandon);
 				if (this.sharesOnNetwork.get(folderId) === fetched) this.sharesOnNetwork.delete(folderId);
 			};
 			fetched.then(offNetwork, offNetwork);
