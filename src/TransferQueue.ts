@@ -1475,9 +1475,14 @@ export class TransferQueue extends Loggable {
 				// finds it so: see UNSEEDED_CONFIRM_MS. Seeded here, on this
 				// pull's connection, not by a queued upload: an upload would
 				// reconcile whatever a peer wrote meanwhile.
-				const seeded = await this.seedUnseededText(doc);
-				this.releasePulledDoc(doc, intent);
-				return { outcome: seeded ? "seed-local" : "no-base", remoteText: doc.content };
+				// Released however the seed ends: a rejected base write must
+				// not leave this pull's connection open.
+				try {
+					const outcome = await this.seedUnseededText(doc, aborted, onPhase);
+					return { outcome, remoteText: doc.content };
+				} finally {
+					this.releasePulledDoc(doc, intent);
+				}
 			}
 			if (syncBase === undefined && !missingOnDisk) {
 				// Never round-tripped through a successful upload cycle for
@@ -1795,13 +1800,22 @@ export class TransferQueue extends Loggable {
 	 * connection of the pull that confirmed it (see pullIfUnchanged()). Only
 	 * seeds: under the init claim, and only if the text still never held an
 	 * item once the claim settled and the file was read. A peer's text or
-	 * clear that arrived meanwhile is left as it is, file included.
+	 * clear that arrived meanwhile is left as it is, file included. Like the
+	 * rest of the pull it writes nothing once `aborted()`; the insert is its
+	 * point of no return ("write" phase), so the caller's deadline cannot
+	 * free the slot for another pull while it still holds the connection.
 	 */
-	private async seedUnseededText(doc: Document): Promise<boolean> {
+	private async seedUnseededText(
+		doc: Document,
+		aborted: () => boolean,
+		onPhase: PullControl["onPhase"],
+	): Promise<"seed-local" | "no-base" | "aborted"> {
 		const text = doc.crdtDoc.getText("contents");
 		claimInitIfUnclaimed(doc.crdtDoc, doc._liveProvider.awareness);
 		await awaitClaimSettled(doc.crdtDoc, { socket: doc._liveProvider.ws });
+		if (aborted()) return "aborted";
 		const fileContents = await this.readVaultContents(doc);
+		if (aborted()) return "aborted";
 		if (
 			!hasPreservableContent(fileContents) ||
 			!neverHeldText(doc.crdtDoc, text) ||
@@ -1809,17 +1823,21 @@ export class TransferQueue extends Loggable {
 			!wonInitClaim(doc.crdtDoc, text)
 		) {
 			this.log(`[pullIfUnchanged] ${doc.entryPath} is no longer unseeded; not seeding it`);
-			return false;
+			return "no-base";
 		}
+		onPhase?.("write");
 		this.log(`[pullIfUnchanged] relay never held text for ${doc.entryPath}; seeding the file`);
 		text.insert(0, fileContents);
 		markInitDone(doc.crdtDoc);
 		await waitForBufferFlush(doc._liveProvider.ws);
-		// Read the disk first: the CRDT text compared with it is the one recorded.
+		// The seeded text is what the file and the relay agreed on, even if a
+		// peer has edited it since: the next pull applies that edit as a diff
+		// against it. Without a base every later pull stops at "no-base" and
+		// the file never gets the peer's edit. A file changed meanwhile is a
+		// local edit, not that agreement: no base then.
 		const diskContents = await this.readVaultContents(doc);
-		const agreed = doc.content;
-		if (sameTextContent(agreed, diskContents)) await doc.setSyncBase(agreed);
-		return true;
+		if (sameTextContent(fileContents, diskContents)) await doc.setSyncBase(fileContents);
+		return "seed-local";
 	}
 
 	/**
@@ -1852,20 +1870,12 @@ export class TransferQueue extends Loggable {
 			// and check ownership after the read in case a peer inserted meanwhile.
 			const currentVaultContents = await this.readVaultContents(doc);
 			const text = doc.crdtDoc.getText("contents");
-			// Seed only text that never held an item, on a complete history:
-			// an empty text with tombstones is a peer's clear, and inserting
-			// the file would bring back what they deleted.
-			const seedable = neverHeldText(doc.crdtDoc, text) && !hasHistoryGap(doc.crdtDoc);
-			if (currentVaultContents && seedable && wonInitClaim(doc.crdtDoc, text)) {
+			if (currentVaultContents && wonInitClaim(doc.crdtDoc, text)) {
 				this.log(
 					`[uploadDocumentViaSocket] Uploading new content for ${doc.entryPath} (${currentVaultContents.length} chars)`,
 				);
 				text.insert(0, currentVaultContents);
 				markInitDone(doc.crdtDoc);
-			} else if (text.length === 0 && !seedable) {
-				this.warn(
-					`[uploadDocumentViaSocket] Skipped initial-content insert for ${doc.entryPath}: the text was cleared or its history is incomplete`,
-				);
 			} else if (text.length === 0) {
 				this.warn(
 					`[uploadDocumentViaSocket] Skipped initial-content insert for ${doc.entryPath} — lost the init claim to a concurrently-connecting client`,

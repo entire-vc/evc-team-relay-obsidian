@@ -89,6 +89,8 @@ function makeFakeDoc(crdtDoc: Y.Doc, vaultContents: string, syncBase: string | u
 		state.syncBase = text;
 	});
 
+	const goOffline = jest.fn<() => void>();
+
 	const fakeDoc = Object.create(Document.prototype) as Document;
 	Object.defineProperty(fakeDoc, "entryPath", { value: "nested/note.md" });
 	Object.defineProperty(fakeDoc, "entityGuid", { value: "test-guid" });
@@ -101,7 +103,7 @@ function makeFakeDoc(crdtDoc: Y.Doc, vaultContents: string, syncBase: string | u
 	Object.defineProperty(fakeDoc, "onceOnline", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "onceEverSynced", { value: async () => {} });
 	Object.defineProperty(fakeDoc, "onceFreshlySynced", { value: async () => {}, writable: true });
-	Object.defineProperty(fakeDoc, "goOffline", { value: () => {} });
+	Object.defineProperty(fakeDoc, "goOffline", { value: goOffline });
 	Object.defineProperty(fakeDoc, "_liveProvider", { value: { ws: null, awareness: null } });
 	Object.defineProperty(fakeDoc, "getSyncBase", { value: async () => state.syncBase });
 	Object.defineProperty(fakeDoc, "setSyncBase", { value: setSyncBase });
@@ -116,7 +118,7 @@ function makeFakeDoc(crdtDoc: Y.Doc, vaultContents: string, syncBase: string | u
 			credentialCache: { dropFromQueue: () => {} },
 		},
 	});
-	return { fakeDoc, writeContents, writeConflictCopy, setSyncBase, state };
+	return { fakeDoc, writeContents, writeConflictCopy, setSyncBase, goOffline, state };
 }
 
 function makeQueue(clock = new InstantClock()): TransferQueue {
@@ -282,6 +284,17 @@ describe("upload and fetch — a doc with a history gap is not reconciled, recor
 		// Once the relay fills the gap the text is the author's, not doubled.
 		Y.applyUpdate(crdtDoc, history.full);
 		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+	});
+
+	test("upload of an explicit edit on a legacy doc with tombstones and no init flag still sends the edit", async () => {
+		// Written before the init flag existed: text inserted and cleared, base "".
+		const crdtDoc = docClearedByPeer();
+		const { fakeDoc, state } = makeFakeDoc(crdtDoc, "LOCAL EDIT\n", "");
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(crdtDoc.getText("contents").toString()).toBe("LOCAL EDIT\n");
+		expect(state.syncBase).toBe("LOCAL EDIT\n");
 	});
 
 	test.each([
@@ -539,7 +552,7 @@ describe("pullIfUnchanged — an author's text that never reached the relay is s
 		expect(queue.enqueueUpload).not.toHaveBeenCalled();
 	});
 
-	test("a seed is recorded as the base only while the CRDT still holds the file's text", async () => {
+	test("a peer's edit that lands right after the seed reaches the file on the next pull", async () => {
 		const crdtDoc = docWithoutText();
 		const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
 		const { queue } = await firstPull(fakeDoc);
@@ -554,13 +567,92 @@ describe("pullIfUnchanged — an author's text that never reached the relay is s
 			return state.vault;
 		};
 		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
-
 		expect(edited).toBe(true);
-		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT + "PEER LINE\n");
-		// The file is not that text: recording it would read the file as a local edit later.
-		expect(state.syncBase).toBeUndefined();
-		expect(writeConflictCopy).not.toHaveBeenCalled();
+		// What was seeded is the agreed text: the peer's edit is a diff against it.
+		expect(state.syncBase).toBe(AUTHOR_TEXT);
 		expect(state.vault).toBe(AUTHOR_TEXT);
+
+		// Without that base every later pull stopped at "no-base" for good.
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("flushed");
+		expect(state.vault).toBe(AUTHOR_TEXT + "PEER LINE\n");
+		expect(state.syncBase).toBe(AUTHOR_TEXT + "PEER LINE\n");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+	});
+
+	test("a file edited while the seed is flushed is not recorded as the base", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, setSyncBase, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue } = await firstPull(fakeDoc);
+
+		duringRead(fakeDoc, state, 4, () => {
+			state.vault = AUTHOR_TEXT + "LOCAL LINE\n";
+		});
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("seed-local");
+
+		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT);
+		expect(setSyncBase).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		// The init claim is the seed's first write: the abort lands while it settles.
+		["while the claim settles", (crdtDoc: Y.Doc, controller: AbortController) => {
+			crdtDoc.once("afterTransaction", () => controller.abort());
+		}],
+		["while the seed reads the file", () => {}],
+	])("a pull aborted %s seeds nothing and drops its connection", async (_label, armClaimAbort) => {
+		const crdtDoc = docWithoutText();
+		const relay = relayOf(crdtDoc);
+		const { fakeDoc, setSyncBase, goOffline, state } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue } = await firstPull(fakeDoc);
+		goOffline.mockClear();
+
+		const controller = new AbortController();
+		const claimCase = armClaimAbort.length > 0;
+		// Read 2 is the pull's last one before the seed starts its claim; read 3 is the seed's.
+		duringRead(fakeDoc, state, claimCase ? 2 : 3, () =>
+			claimCase ? armClaimAbort(crdtDoc, controller) : controller.abort(),
+		);
+		const phases: string[] = [];
+		const result = await queue.pullIfUnchanged(fakeDoc, {
+			signal: controller.signal,
+			onPhase: (phase) => phases.push(phase),
+		});
+
+		expect(result.outcome).toBe("aborted");
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+		expect(relay.getText("contents").toString()).toBe("");
+		expect(setSyncBase).not.toHaveBeenCalled();
+		expect(phases).not.toContain("write");
+		expect(goOffline).toHaveBeenCalledTimes(1);
+	});
+
+	test("the seed enters the write phase before it inserts, so a deadline cannot abort it halfway", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue } = await firstPull(fakeDoc);
+
+		let textAtWrite: string | undefined;
+		const result = await queue.pullIfUnchanged(fakeDoc, {
+			signal: new AbortController().signal,
+			onPhase: (phase) => {
+				if (phase === "write") textAtWrite = crdtDoc.getText("contents").toString();
+			},
+		});
+
+		expect(result.outcome).toBe("seed-local");
+		expect(textAtWrite).toBe("");
+	});
+
+	test("a base write that fails still drops the pull's connection", async () => {
+		const crdtDoc = docWithoutText();
+		const { fakeDoc, setSyncBase, goOffline } = makeFakeDoc(crdtDoc, AUTHOR_TEXT, undefined);
+		const { queue } = await firstPull(fakeDoc);
+		goOffline.mockClear();
+		setSyncBase.mockRejectedValueOnce(new Error("store closed"));
+
+		await expect(queue.pullIfUnchanged(fakeDoc)).rejects.toThrow("store closed");
+		expect(crdtDoc.getText("contents").toString()).toBe(AUTHOR_TEXT);
+		expect(goOffline).toHaveBeenCalledTimes(1);
 	});
 
 	test("a pull in between that does not find the note unseeded restarts the wait", async () => {
