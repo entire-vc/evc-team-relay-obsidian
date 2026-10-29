@@ -21,7 +21,7 @@
  */
 
 import * as Y from "yjs";
-import { sameTextContent } from "./textEquivalence";
+import { normalizeLineEndings, sameTextContent } from "./textEquivalence";
 import type { CanvasData } from "./HostCanvasView";
 import { deepValueEquals } from "./deepValueEquals";
 
@@ -76,8 +76,118 @@ export function findByPath<T extends PathHolder>(
  *   deleted clock shows nothing, whatever it held. Any other missing range (a
  *   missing prefix before a presence entry, a hole between pending changes,
  *   the clocks before a pending delete) may hold text and counts as a gap.
+ *   So does a hole shaped like a seed that no pushed delete set proves, unless
+ *   `acceptLostSeeds` and the relay was seen not to have it either (see
+ *   `noteCompletedSync`).
  */
-export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
+export function hasHistoryGap(doc: Y.Doc, textName = "contents", acceptLostSeeds = false): boolean {
+	const gap = analyseHistoryGap(doc, textName);
+	if (typeof gap === "boolean") return gap;
+	return !acceptLostSeeds || !allLost(doc, gap);
+}
+
+/**
+ * Whether the text shows without a gap only because seed holes count as lost,
+ * and for one of them no write has yet put that text on disk (see
+ * `noteLostSeedTextOnDisk`).
+ * The hole may have held text the file still has; the first such write must
+ * keep whatever of the file it drops. Once the file shows the text without
+ * the hole, later differences are the peers' edits.
+ */
+export function firstWriteWithoutLostSeed(doc: Y.Doc, textName = "contents"): boolean {
+	const gap = analyseHistoryGap(doc, textName);
+	if (typeof gap === "boolean" || !allLost(doc, gap)) return false;
+	const onDisk = lostSeedTextOnDisk.get(doc);
+	return gap.some((client) => !onDisk?.has(client));
+}
+
+/** Record that the file now shows `doc`'s text without its current lost seed holes. */
+export function noteLostSeedTextOnDisk(doc: Y.Doc, textName = "contents"): void {
+	const gap = analyseHistoryGap(doc, textName);
+	if (typeof gap === "boolean") return;
+	const onDisk = lostSeedTextOnDisk.get(doc) ?? new Set<number>();
+	for (const client of gap) onDisk.add(client);
+	lostSeedTextOnDisk.set(doc, onDisk);
+}
+
+/** Per doc, the writers whose lost seed hole the file already shows the text without. */
+const lostSeedTextOnDisk = new WeakMap<Y.Doc, Set<number>>();
+
+function allLost(doc: Y.Doc, clients: number[]): boolean {
+	const sightings = lostSeedSightings.get(doc);
+	return clients.every((client) => (sightings?.get(client)?.count ?? 0) >= LOST_SEED_CONNECTIONS);
+}
+
+/** Whether every character of `before` is still in `after`, in order: `after` only adds text. */
+export function keepsAllText(before: string, after: string): boolean {
+	const kept = normalizeLineEndings(before);
+	const next = normalizeLineEndings(after);
+	let at = 0;
+	for (let i = 0; i < next.length && at < kept.length; i++) {
+		if (kept[at] === next[i]) at++;
+	}
+	return at === kept.length;
+}
+
+/**
+ * Seed holes the relay could not fill: per doc, per client, the last
+ * connection that completed a sync without it and how many distinct ones did.
+ */
+const lostSeedSightings = new WeakMap<Y.Doc, Map<number, { connection: object; count: number }>>();
+
+/**
+ * Completed syncs on distinct connections that must each leave a seed hole
+ * open before it counts as lost. A relay that has not loaded the doc yet can
+ * answer a sync with an empty placeholder (see TransferQueue.fetchDocument),
+ * so one empty answer proves nothing; the next connection gets the real doc.
+ */
+const LOST_SEED_CONNECTIONS = 2;
+
+/**
+ * Record that `connection` has just completed a sync with the relay. A sync
+ * answers the doc's state vector, which counts no pending clocks, so a relay
+ * holding any clock of a writer missing here sends it from clock 0: a seed hole
+ * still open after the sync is one the relay does not have either.
+ *
+ * Such a hole is accepted as lost (see `hasHistoryGap`) once completed syncs on
+ * `LOST_SEED_CONNECTIONS` distinct connections all left it open, and only while
+ * nothing pending can be text and the hole is referred to only as a seed is
+ * (see `seedHole`). Whatever its clocks held, no peer has it: waiting cannot
+ * bring it back, while the gap keeps every later change to the note off the
+ * disk. `shownOnDisk` says the text the doc showed before this sync is the
+ * file's or the last agreed text: the hole hides nothing the user has. The
+ * first sighting of a hole needs it; the hole's clocks never change, so later
+ * ones do not (by then the text holds the peers' edits the gap kept off disk).
+ */
+export function noteCompletedSync(
+	doc: Y.Doc,
+	connection: object | null,
+	shownOnDisk: boolean,
+	textName = "contents",
+): void {
+	if (connection === null) return;
+	const gap = analyseHistoryGap(doc, textName);
+	const open = typeof gap === "boolean" ? [] : gap;
+	const sightings = lostSeedSightings.get(doc) ?? new Map<number, { connection: object; count: number }>();
+	for (const client of sightings.keys()) {
+		if (!open.includes(client)) sightings.delete(client);
+	}
+	for (const client of open) {
+		const seen = sightings.get(client);
+		if (seen === undefined && shownOnDisk) sightings.set(client, { connection, count: 1 });
+		else if (seen !== undefined && seen.connection !== connection) {
+			sightings.set(client, { connection, count: seen.count + 1 });
+		}
+	}
+	if (sightings.size > 0) lostSeedSightings.set(doc, sightings);
+	else lostSeedSightings.delete(doc);
+}
+
+/**
+ * `hasHistoryGap` without lost seeds: `true` or `false`, or the writers whose
+ * seed hole is all that holds the text back, unproven (see `seedHole`).
+ */
+function analyseHistoryGap(doc: Y.Doc, textName: string): boolean | number[] {
 	const pending = doc.store.pendingStructs;
 	const pendingDs = doc.store.pendingDs;
 	if (pending === null && pendingDs === null) return false;
@@ -198,7 +308,13 @@ export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
 	for (const [client, clock] of pending?.missing ?? []) {
 		if (!known(Y.createID(client, clock))) return true;
 	}
-	return ![...seedClients].every((client) => isIdentitySeedGap(structs, client));
+	const unproven: number[] = [];
+	for (const client of seedClients) {
+		const hole = seedHole(structs, client);
+		if (hole === "other") return true;
+		if (hole === "unproven") unproven.push(client);
+	}
+	return unproven.length === 0 ? false : unproven;
 }
 
 /** Clocks `Y.PermanentUserData.setUserMapping` writes for a new user entry. */
@@ -211,7 +327,9 @@ const SEED_DS = 2;
 const SEED_LAST_ID = 3;
 
 /**
- * Whether `client`'s missing clocks 0..3 are its identity seed. Pending changes
+ * What `client`'s missing clocks 0..3 are: its identity seed ("seed"), a hole
+ * shaped like one that nothing proves a seed ("unproven"), or a range that may
+ * hold text ("other"). Pending changes
  * may refer to them only as a later seed would be referred to: a delete set
  * pushed into the empty `ds` list (parent clock 2) or a client id pushed after
  * the last `ids` entry (left neighbour clock 3). A seed written after an edit
@@ -224,24 +342,28 @@ const SEED_LAST_ID = 3;
  * a list this writer created, which only a seed at clock 0 does. A client id
  * after clock 3 proves nothing on its own: a writer mapping an account whose
  * entry a peer already wrote pushes one id into the peer's `ids`, which after
- * three characters of text lands at clock 3 too.
+ * three characters of text lands at clock 3 too. Such a hole is "unproven";
+ * one nothing refers to the way a seed is referred to is "other".
  */
-function isIdentitySeedGap(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): boolean {
+function seedHole(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): "seed" | "unproven" | "other" {
 	const inSeed = (id: Y.ID | null): id is Y.ID => id !== null && id.client === client && id.clock < SEED_CLOCKS;
 	let deleteSetPushed = false;
+	let idPushed = false;
 	for (const struct of structs) {
 		if (!(struct instanceof Y.Item)) continue;
 		const parent = struct.parent as unknown;
 		if (parent instanceof Y.ID && inSeed(parent)) {
-			if (parent.clock !== SEED_DS || !(struct.content instanceof Y.ContentBinary)) return false;
+			if (parent.clock !== SEED_DS || !(struct.content instanceof Y.ContentBinary)) return "other";
 			deleteSetPushed = true;
 		}
 		if (inSeed(struct.origin)) {
-			if (struct.origin.clock !== SEED_LAST_ID || !(struct.content instanceof Y.ContentAny)) return false;
+			if (struct.origin.clock !== SEED_LAST_ID || !(struct.content instanceof Y.ContentAny)) return "other";
+			idPushed = true;
 		}
-		if (inSeed(struct.rightOrigin)) return false;
+		if (inSeed(struct.rightOrigin)) return "other";
 	}
-	return deleteSetPushed;
+	if (deleteSetPushed) return "seed";
+	return idPushed ? "unproven" : "other";
 }
 
 /** Content kinds a Y.Text never holds: list and map values. */
