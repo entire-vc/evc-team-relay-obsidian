@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.31
+- Fixed: older closed notes could stop receiving updates because changes to collaborator records were mistaken for missing text history. These records no longer hold up text updates; notes with genuinely incomplete history remain protected from being overwritten.
+
 ## 0.1.30
 - Fixed: after both devices restarted, a closed note could become empty on the device that created it, while the other device still had the full text. The plugin now waits for missing text history before writing the note to disk; missing presence records no longer hold up text updates.
 - Fixed: a closed note could keep stale text after downloading an update even when it had no local edits. The downloaded text is now written to disk.
