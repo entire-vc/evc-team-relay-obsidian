@@ -453,6 +453,34 @@ function docWithPresenceGap(text = FULL_TEXT, opts: { deletePushed?: boolean } =
 	return { crdtDoc, peer };
 }
 
+/**
+ * Two clients that map the same account before either has seen the other each
+ * write a fresh presence entry; the merge keeps one and deletes the other's
+ * whole entry. When the losing writer's first clocks never reached anyone,
+ * they stay missing and their delete stays pending for good, while the text
+ * is complete. Seen on most gapped notes of a real vault after 0.1.30.
+ */
+function docWithReplacedPresence(text = FULL_TEXT) {
+	const mapAccount = (doc: Y.Doc) =>
+		new Y.PermanentUserData(doc).setUserMapping(doc, doc.clientID, "ghost-account");
+	const peer = new Y.Doc();
+	peer.getText("contents").insert(0, text);
+	const ghost = new Y.Doc();
+	ghost.clientID = 1;
+	mapAccount(ghost);
+	((ghost.getMap("users").get("ghost-account") as Y.Map<unknown>).get("ids") as Y.Array<number>).push([7]);
+	const winner = new Y.Doc();
+	winner.clientID = 2;
+	mapAccount(winner);
+	Y.applyUpdate(winner, Y.encodeStateAsUpdate(ghost));
+
+	const crdtDoc = new Y.Doc();
+	Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+	// Everything but the ghost's seed.
+	Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(winner, Y.encodeStateVector(new Map([[ghost.clientID, SEED_SIZE]]))));
+	return { crdtDoc, peer, ghost, winner };
+}
+
 describe("a gap only in the presence map does not hold the text back", () => {
 	test("the presence entries stay pending while the text is complete", () => {
 		const { crdtDoc } = docWithPresenceGap(FULL_TEXT, { deletePushed: true });
@@ -523,6 +551,48 @@ describe("a gap only in the presence map does not hold the text back", () => {
 		seedIdentity(fixture);
 
 		expect(shape(Y.encodeStateAsUpdate(fixture))).toEqual(shape(Y.encodeStateAsUpdate(real)));
+	});
+
+	test("REGRESSION: a presence entry a later mapping replaced, whose clocks never arrived, is no gap", () => {
+		const { crdtDoc } = docWithReplacedPresence();
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(crdtDoc.store.pendingDs).not.toBeNull();
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(false);
+	});
+
+	test("REGRESSION: a peer's edit to a closed note reaches disk (replaced presence entry in users)", async () => {
+		const { crdtDoc, peer } = docWithReplacedPresence();
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		fakeDoc.onceFreshlySynced = async () => Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+
+		const result = await makeQueue().pullIfUnchanged(fakeDoc);
+
+		expect(result.outcome).toBe("flushed");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "PEER LINE\n" + FULL_TEXT);
+		expect(state.vault).toBe("PEER LINE\n" + FULL_TEXT);
+	});
+
+	test("the replaced presence fixture: the merge deletes the losing writer's whole entry", () => {
+		const { ghost, winner } = docWithReplacedPresence();
+		const ds = Y.decodeUpdate(Y.encodeStateAsUpdate(winner)).ds.clients.get(ghost.clientID);
+
+		expect(ds).toEqual([{ clock: 0, len: Y.getState(ghost.store, ghost.clientID) }]);
+		expect((winner.getMap("users").get("ghost-account") as Y.Map<Y.Array<number>>).get("ids")?.toArray()).toEqual([
+			winner.clientID,
+		]);
+	});
+
+	test("a hole after a replaced presence entry is still a gap", () => {
+		const { crdtDoc } = docWithReplacedPresence();
+		const ghost = new Y.Doc();
+		ghost.getText("contents").insert(0, "XYZ");
+		const before = Y.encodeStateVector(ghost);
+		ghost.getMap("users").set("other", new Uint8Array([1]));
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, before));
+
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
 	});
 
 	test("pending text from the same writer after its presence entry is still a gap", () => {
