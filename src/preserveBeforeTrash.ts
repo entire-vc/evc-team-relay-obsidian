@@ -21,7 +21,7 @@
  */
 
 import * as Y from "yjs";
-import { sameTextContent } from "./textEquivalence";
+import { normalizeLineEndings, sameTextContent } from "./textEquivalence";
 import type { CanvasData } from "./HostCanvasView";
 import { deepValueEquals } from "./deepValueEquals";
 
@@ -77,13 +77,48 @@ export function findByPath<T extends PathHolder>(
  *   missing prefix before a presence entry, a hole between pending changes,
  *   the clocks before a pending delete) may hold text and counts as a gap.
  *   So does a hole shaped like a seed that no pushed delete set proves, unless
- *   the relay was seen not to have it either (see `noteCompletedSync`).
+ *   `acceptLostSeeds` and the relay was seen not to have it either (see
+ *   `noteCompletedSync`).
  */
-export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
+export function hasHistoryGap(doc: Y.Doc, textName = "contents", acceptLostSeeds = false): boolean {
 	const gap = analyseHistoryGap(doc, textName);
 	if (typeof gap === "boolean") return gap;
-	const confirmed = lostSeedSightings.get(doc);
-	return !gap.every((client) => (confirmed?.get(client)?.count ?? 0) >= LOST_SEED_CONNECTIONS);
+	return !acceptLostSeeds || !allLost(doc, gap);
+}
+
+/**
+ * Whether the text shows without a gap only because seed holes count as lost,
+ * and no write has yet put that text on disk (see `noteLostSeedTextOnDisk`).
+ * The hole may have held text the file still has; the first such write must
+ * keep whatever of the file it drops. Once the file shows the text without
+ * the hole, later differences are the peers' edits.
+ */
+export function firstWriteWithoutLostSeed(doc: Y.Doc, textName = "contents"): boolean {
+	const gap = analyseHistoryGap(doc, textName);
+	return typeof gap !== "boolean" && allLost(doc, gap) && !lostSeedTextOnDisk.has(doc);
+}
+
+/** Record that the file now shows `doc`'s text without its lost seed holes. */
+export function noteLostSeedTextOnDisk(doc: Y.Doc): void {
+	lostSeedTextOnDisk.add(doc);
+}
+
+const lostSeedTextOnDisk = new WeakSet<Y.Doc>();
+
+function allLost(doc: Y.Doc, clients: number[]): boolean {
+	const sightings = lostSeedSightings.get(doc);
+	return clients.every((client) => (sightings?.get(client)?.count ?? 0) >= LOST_SEED_CONNECTIONS);
+}
+
+/** Whether every character of `before` is still in `after`, in order: `after` only adds text. */
+export function keepsAllText(before: string, after: string): boolean {
+	const kept = normalizeLineEndings(before);
+	const next = normalizeLineEndings(after);
+	let at = 0;
+	for (let i = 0; i < next.length && at < kept.length; i++) {
+		if (kept[at] === next[i]) at++;
+	}
+	return at === kept.length;
 }
 
 /**

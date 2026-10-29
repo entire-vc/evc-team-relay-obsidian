@@ -22,7 +22,7 @@ import * as Y from "yjs";
 import type { Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
-import { hasHistoryGap } from "../src/preserveBeforeTrash";
+import { hasHistoryGap, keepsAllText, noteCompletedSync } from "../src/preserveBeforeTrash";
 
 /** Fires every timer on the next macrotask; `now()` only moves when a test moves it. */
 class InstantClock implements Clock {
@@ -762,7 +762,7 @@ describe("a seed hole the relay does not have either is accepted after two compl
 		const second = await queue.pullIfUnchanged(fakeDoc);
 
 		expect(crdtDoc.store.pendingStructs).not.toBeNull();
-		expect(hasHistoryGap(crdtDoc)).toBe(false);
+		expect(hasHistoryGap(crdtDoc, "contents", true)).toBe(false);
 		expect(second.outcome).toBe("flushed");
 		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "PEER LINE\n" + FULL_TEXT);
 		expect(writeConflictCopy).not.toHaveBeenCalled();
@@ -906,6 +906,77 @@ describe("a seed hole the relay does not have either is accepted after two compl
 		expect(outcomes).toEqual(["history-gap", "unchanged"]);
 	});
 
+	test("REGRESSION: lost text identical to a deleted original is kept in a conflict copy, once", async () => {
+		const map = (doc: Y.Doc) => new Y.PermanentUserData(doc).setUserMapping(doc, doc.clientID, "same-account");
+		const peer = new Y.Doc();
+		map(peer);
+		peer.getText("contents").insert(0, "KEEP ABC");
+		// A writer replaces "ABC" with the same "ABC", then maps the account twice.
+		const writer = new Y.Doc();
+		Y.applyUpdate(writer, Y.encodeStateAsUpdate(peer));
+		const text = writer.getText("contents");
+		text.delete(5, 3);
+		text.insert(5, "ABC");
+		map(writer);
+		map(writer);
+		// Only the delete and the second push survived; clocks 0..3 reached nobody.
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(writer, Y.encodeStateVector(new Map([[writer.clientID, SEED_SIZE]]))));
+		expect(relay.getText("contents").toString()).toBe("KEEP ");
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, "KEEP ABC", "KEEP ABC");
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+
+		const outcomes = [];
+		for (let i = 0; i < 3; i++) outcomes.push((await queue.pullIfUnchanged(fakeDoc)).outcome);
+		// A peer's later delete is an ordinary edit: no further copy.
+		const later = new Y.Doc();
+		Y.applyUpdate(later, Y.encodeStateAsUpdate(relay));
+		later.getText("contents").delete(0, 1);
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(later));
+		outcomes.push((await queue.pullIfUnchanged(fakeDoc)).outcome);
+
+		expect(outcomes).toEqual(["history-gap", "flushed", "unchanged", "flushed"]);
+		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(writeConflictCopy.mock.calls[0][1]).toBe("KEEP ABC");
+		expect(writeContents.mock.calls.map((call) => call[1])).toEqual(["KEEP ", "EEP "]);
+		expect(state.vault).toBe("EEP ");
+	});
+
+	test("the first write without a lost seed that only adds text keeps no copy", async () => {
+		const { crdtDoc, peer, relay } = docWithLostSeed();
+		const { fakeDoc, writeConflictCopy } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		peer.getText("contents").insert(FULL_TEXT.length, "PEER LINE\n");
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(peer));
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+
+		await queue.pullIfUnchanged(fakeDoc);
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("flushed");
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+	});
+
+	test("upload, fetch and the other callers still see the gap", () => {
+		const { crdtDoc } = docWithLostSeed();
+		const connections = [{}, {}];
+		for (const connection of connections) noteCompletedSync(crdtDoc, connection, true);
+
+		expect(hasHistoryGap(crdtDoc, "contents", true)).toBe(false);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+
+	test.each([
+		["ABC", "xAyBzC", true],
+		["KEEP ABC", "KEEP ", false],
+		["a\r\nb", "a\nb", true],
+		["", "", true],
+	])("keepsAllText(%j, %j) is %s", (before, after, kept) => {
+		expect(keepsAllText(before, after)).toBe(kept);
+	});
+
 	test("the last agreed text stands in for a file edited since", async () => {
 		const { crdtDoc } = docWithLostSeed();
 
@@ -913,7 +984,7 @@ describe("a seed hole the relay does not have either is accepted after two compl
 
 		expect(outcomes[0]).toBe("history-gap");
 		expect(outcomes[1]).not.toBe("history-gap");
-		expect(hasHistoryGap(crdtDoc)).toBe(false);
+		expect(hasHistoryGap(crdtDoc, "contents", true)).toBe(false);
 		expect(writeContents).not.toHaveBeenCalledWith(expect.anything(), FULL_TEXT);
 	});
 

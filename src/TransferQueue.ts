@@ -20,7 +20,13 @@ import { applyDiffToYText, reconcileWithConflictCopy } from "./ytextDiff";
 import { hasPreservableContent, sameTextContent } from "./textEquivalence";
 import { waitForBufferFlush } from "./websocketFlush";
 import { textFingerprint } from "./docActivity";
-import { hasHistoryGap, noteCompletedSync } from "./preserveBeforeTrash";
+import {
+	firstWriteWithoutLostSeed,
+	hasHistoryGap,
+	keepsAllText,
+	noteCompletedSync,
+	noteLostSeedTextOnDisk,
+} from "./preserveBeforeTrash";
 import {
 	claimInitIfUnclaimed,
 	wonInitClaim,
@@ -1438,7 +1444,7 @@ export class TransferQueue extends Loggable {
 			}
 			noteCompletedSync(doc.crdtDoc, doc._liveProvider?.ws ?? null, shownOnDisk);
 		}
-		if (hasHistoryGap(doc.crdtDoc)) {
+		if (hasHistoryGap(doc.crdtDoc, "contents", true)) {
 			// Updates are pending on changes this client never stored (the
 			// note's author after a restart): the text reads empty or partial
 			// until the relay sends the missing part. Not what was last synced,
@@ -1448,10 +1454,14 @@ export class TransferQueue extends Loggable {
 			return { outcome: "history-gap" };
 		}
 		const remoteText = doc.content;
+		const lostSeedFirstWrite = firstWriteWithoutLostSeed(doc.crdtDoc);
 		const vaultContentsAfter = await this.readVaultContents(doc);
 		if (aborted()) {
 			this.releasePulledDoc(doc, hold);
 			return { outcome: "aborted" };
+		}
+		if (lostSeedFirstWrite && sameTextContent(remoteText, vaultContentsAfter)) {
+			noteLostSeedTextOnDisk(doc.crdtDoc);
 		}
 		if (
 			vaultContentsAfter === vaultContentsBefore &&
@@ -1557,10 +1567,17 @@ export class TransferQueue extends Loggable {
 			onPhase?.("preserve");
 			// An empty read means a file that is not on disk yet (or an empty
 			// one): there is nothing to preserve, only the relay text to write.
-			if (
-				syncBase !== undefined &&
+			// A seed hole that counts as lost may have held text this file
+			// still has: the first write without it keeps whatever it drops.
+			const dropsLostSeedText =
+				lostSeedFirstWrite &&
 				hasPreservableContent(vaultContentsAfter) &&
-				!sameTextContent(vaultContentsAfter, syncBase)
+				!keepsAllText(vaultContentsAfter, remoteText);
+			if (
+				(syncBase !== undefined &&
+					hasPreservableContent(vaultContentsAfter) &&
+					!sameTextContent(vaultContentsAfter, syncBase)) ||
+				dropsLostSeedText
 			) {
 				// The vault file doesn't just differ from the relay's CURRENT
 				// content -- it differs from what THIS client last confirmed
@@ -1622,6 +1639,7 @@ export class TransferQueue extends Loggable {
 			// Measured live: one spurious copy per delivered edit on
 			// the receiver, from the second edit on.
 			await doc.setSyncBase(remoteText);
+			if (lostSeedFirstWrite) noteLostSeedTextOnDisk(doc.crdtDoc);
 			this.log(`[pullIfUnchanged] flushed remote update to disk for ${doc.entryPath}`);
 			this.releasePulledDoc(doc, hold);
 			return { outcome: "flushed", remoteText };
