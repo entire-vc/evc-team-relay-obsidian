@@ -108,11 +108,20 @@ const LOST_SEED_CONNECTIONS = 2;
  *
  * Such a hole is accepted as lost (see `hasHistoryGap`) once completed syncs on
  * `LOST_SEED_CONNECTIONS` distinct connections all left it open, and only while
- * nothing pending can be text and nothing refers into it as text would (see
- * `seedHole`). Whatever its clocks held, no peer has it: waiting cannot bring
- * it back, while the gap keeps every later change to the note off the disk.
+ * nothing pending can be text and the hole is referred to only as a seed is
+ * (see `seedHole`). Whatever its clocks held, no peer has it: waiting cannot
+ * bring it back, while the gap keeps every later change to the note off the
+ * disk. `shownOnDisk` says the text the doc showed before this sync is the
+ * file's or the last agreed text: the hole hides nothing the user has. The
+ * first sighting of a hole needs it; the hole's clocks never change, so later
+ * ones do not (by then the text holds the peers' edits the gap kept off disk).
  */
-export function noteCompletedSync(doc: Y.Doc, connection: object | null, textName = "contents"): void {
+export function noteCompletedSync(
+	doc: Y.Doc,
+	connection: object | null,
+	shownOnDisk: boolean,
+	textName = "contents",
+): void {
 	if (connection === null) return;
 	const gap = analyseHistoryGap(doc, textName);
 	const open = typeof gap === "boolean" ? [] : gap;
@@ -122,8 +131,10 @@ export function noteCompletedSync(doc: Y.Doc, connection: object | null, textNam
 	}
 	for (const client of open) {
 		const seen = sightings.get(client);
-		if (seen === undefined) sightings.set(client, { connection, count: 1 });
-		else if (seen.connection !== connection) sightings.set(client, { connection, count: seen.count + 1 });
+		if (seen === undefined && shownOnDisk) sightings.set(client, { connection, count: 1 });
+		else if (seen !== undefined && seen.connection !== connection) {
+			sightings.set(client, { connection, count: seen.count + 1 });
+		}
 	}
 	if (sightings.size > 0) lostSeedSightings.set(doc, sightings);
 	else lostSeedSightings.delete(doc);
@@ -288,11 +299,13 @@ const SEED_LAST_ID = 3;
  * a list this writer created, which only a seed at clock 0 does. A client id
  * after clock 3 proves nothing on its own: a writer mapping an account whose
  * entry a peer already wrote pushes one id into the peer's `ids`, which after
- * three characters of text lands at clock 3 too.
+ * three characters of text lands at clock 3 too. Such a hole is "unproven";
+ * one nothing refers to the way a seed is referred to is "other".
  */
 function seedHole(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): "seed" | "unproven" | "other" {
 	const inSeed = (id: Y.ID | null): id is Y.ID => id !== null && id.client === client && id.clock < SEED_CLOCKS;
 	let deleteSetPushed = false;
+	let idPushed = false;
 	for (const struct of structs) {
 		if (!(struct instanceof Y.Item)) continue;
 		const parent = struct.parent as unknown;
@@ -302,10 +315,12 @@ function seedHole(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): "seed" |
 		}
 		if (inSeed(struct.origin)) {
 			if (struct.origin.clock !== SEED_LAST_ID || !(struct.content instanceof Y.ContentAny)) return "other";
+			idPushed = true;
 		}
 		if (inSeed(struct.rightOrigin)) return "other";
 	}
-	return deleteSetPushed ? "seed" : "unproven";
+	if (deleteSetPushed) return "seed";
+	return idPushed ? "unproven" : "other";
 }
 
 /** Content kinds a Y.Text never holds: list and map values. */

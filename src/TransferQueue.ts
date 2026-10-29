@@ -1346,6 +1346,8 @@ export class TransferQueue extends Loggable {
 		onPhase?.("first-sync");
 		await doc.awaitFirstSync();
 		if (aborted()) return { outcome: "aborted" };
+		// What the local store shows, before this pull's sync adds the relay's changes.
+		const shownBeforeSync = doc.content;
 		// A pull aborted at its deadline may still hold the connection it
 		// opened: take it over, so that pull's late release leaves it alone.
 		const hold =
@@ -1422,7 +1424,20 @@ export class TransferQueue extends Loggable {
 			this.releasePulledDoc(doc, hold);
 			return { outcome: "not-synced" };
 		}
-		noteCompletedSync(doc.crdtDoc, doc._liveProvider?.ws ?? null);
+		if (hasHistoryGap(doc.crdtDoc)) {
+			// A seed hole the relay lacks too counts as lost after syncs on two
+			// connections, if it hides nothing the file or the last agreed text holds.
+			let shownOnDisk = sameTextContent(shownBeforeSync, vaultContentsBefore);
+			if (!shownOnDisk) {
+				const syncBase = await doc.getSyncBase();
+				if (aborted()) {
+					this.releasePulledDoc(doc, hold);
+					return { outcome: "aborted" };
+				}
+				shownOnDisk = syncBase !== undefined && sameTextContent(shownBeforeSync, syncBase);
+			}
+			noteCompletedSync(doc.crdtDoc, doc._liveProvider?.ws ?? null, shownOnDisk);
+		}
 		if (hasHistoryGap(doc.crdtDoc)) {
 			// Updates are pending on changes this client never stored (the
 			// note's author after a restart): the text reads empty or partial
