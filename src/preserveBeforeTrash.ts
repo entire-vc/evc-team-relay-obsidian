@@ -70,11 +70,12 @@ export function findByPath<T extends PathHolder>(
  *   holds no embedded types), or it is deleted;
  * - every missing clock lies outside the text. Nothing in the doc says what a
  *   missing clock held, so the only missing clocks accepted are a writer's
- *   identity seed: `seedDocIdentity` is the first write of every fresh doc, and
- *   when its clocks are missing, the writer's later pushes into the seed's
- *   `ids`/`ds` lists are pending. Any other missing range (a missing prefix
- *   before a presence entry, a hole between pending changes, a pending delete
- *   of a change nobody has) may hold text and counts as a gap.
+ *   identity seed and clocks a pending delete names: `seedDocIdentity` is the
+ *   first write of every fresh doc, and when its clocks are missing, the
+ *   writer's later pushes into the seed's `ids`/`ds` lists are pending; a
+ *   deleted clock shows nothing, whatever it held. Any other missing range (a
+ *   missing prefix before a presence entry, a hole between pending changes,
+ *   the clocks before a pending delete) may hold text and counts as a gap.
  */
 export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
 	const pending = doc.store.pendingStructs;
@@ -152,36 +153,40 @@ export function hasHistoryGap(doc: Y.Doc, textName = "contents"): boolean {
 		}
 	}
 
-	// Missing clocks: the ranges before, between and after the pending structs
-	// (a pending delete reaches past them) that this doc does not have.
+	// Missing clocks: the ranges before and between the pending structs and
+	// pending deletes that this doc does not have. A pending delete names
+	// clocks that exist and are deleted: whatever they held, the text shows
+	// none of it, so they are no gap (a writer whose whole presence entry a
+	// later mapping replaced leaves exactly that). The clocks before it are.
 	const deletes: Map<number, { clock: number; len: number }[]> =
 		pendingDs === null ? new Map() : Y.decodeUpdateV2(pendingDs).ds.clients;
+	const isDeleted = (id: Y.ID): boolean =>
+		(deletes.get(id.client) ?? []).some(({ clock, len }) => clock <= id.clock && id.clock < clock + len);
 	const seedClients = new Set<number>();
 	for (const client of new Set([...byClient.keys(), ...deletes.keys()])) {
 		const state = Y.getState(doc.store, client);
+		const ranges: [number, number][] = [
+			...(byClient.get(client) ?? []).map((s): [number, number] => [s.id.clock, s.id.clock + s.length]),
+			...(deletes.get(client) ?? []).map(({ clock, len }): [number, number] => [clock, clock + len]),
+		]
+			.filter(([, to]) => to > state)
+			.sort((a, b) => a[0] - b[0]);
 		let next = state;
-		const covered: [number, number][] = [];
-		for (const struct of byClient.get(client) ?? []) {
-			if (struct.id.clock > next) {
-				if (next !== 0 || struct.id.clock !== SEED_CLOCKS) return true;
+		for (const [from, to] of ranges) {
+			if (from > next) {
+				if (next !== 0 || from !== SEED_CLOCKS) return true;
 				seedClients.add(client);
 			}
-			const last = covered[covered.length - 1];
-			if (last !== undefined && last[1] === struct.id.clock) last[1] += struct.length;
-			else covered.push([struct.id.clock, struct.id.clock + struct.length]);
-			next = Math.max(next, struct.id.clock + struct.length);
-		}
-		for (const { clock, len } of deletes.get(client) ?? []) {
-			if (clock + len <= state) continue;
-			// A delete of pending changes alters nothing in the text; any other is a gap.
-			if (!covered.some(([from, to]) => from <= Math.max(clock, state) && clock + len <= to)) return true;
+			next = Math.max(next, to);
 		}
 	}
 	// A missing clock is only ever a seed clock: whatever a pending change
-	// refers to, and whatever Yjs waits for, is here, pending or in a seed.
+	// refers to, and whatever Yjs waits for, is here, pending, deleted or in
+	// a seed.
 	const known = (id: Y.ID): boolean =>
 		id.clock < Y.getState(doc.store, id.client) ||
 		findPending(id) !== undefined ||
+		isDeleted(id) ||
 		(seedClients.has(id.client) && id.clock < SEED_CLOCKS);
 	for (const struct of structs) {
 		if (!(struct instanceof Y.Item)) continue;
