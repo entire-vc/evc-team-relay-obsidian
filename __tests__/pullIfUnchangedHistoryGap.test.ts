@@ -609,6 +609,85 @@ describe("a gap only in the presence map does not hold the text back", () => {
 	});
 });
 
+/**
+ * The field case (44 notes on one vault copy): the author's local store lacks
+ * its own identity seed, so every later update of that author, the whole
+ * text included, waits in pending structs and the note reads empty. The relay
+ * holds the seed. A sync answers the client's state vector, which counts no
+ * pending clocks, so the relay's reply carries the seed and closes the gap.
+ */
+describe("a gap on the author's own identity seed closes on the next sync", () => {
+	/** The author's doc after a restart: its store kept everything but the seed. */
+	function authorWithoutOwnSeed(text = FULL_TEXT) {
+		const author = new Y.Doc();
+		seedIdentity(author);
+		const seeded = Y.encodeStateVector(author);
+		author.getText("contents").insert(0, text);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(author, seeded));
+		return { author, crdtDoc };
+	}
+
+	/** What the relay sends back to sync step 1: everything past the client's state vector. */
+	const syncFromRelay = (crdtDoc: Y.Doc, relay: Y.Doc) => async () =>
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(relay, Y.encodeStateVector(crdtDoc)));
+
+	test("the fixture has the field shape: empty text, the whole text pending on the author's seed", () => {
+		const { author, crdtDoc } = authorWithoutOwnSeed();
+		expect(crdtDoc.getText("contents").toString()).toBe("");
+		expect(crdtDoc.store.pendingStructs?.missing).toEqual(new Map([[author.clientID, SEED_SIZE - 1]]));
+		expect(Y.getState(crdtDoc.store, author.clientID)).toBe(0);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+
+	test("REGRESSION: a peer's edit to the closed note reaches disk and the gap closes", async () => {
+		const { author, crdtDoc } = authorWithoutOwnSeed();
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(author));
+		const peer = new Y.Doc();
+		Y.applyUpdate(peer, Y.encodeStateAsUpdate(relay));
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(peer));
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		fakeDoc.onceFreshlySynced = syncFromRelay(crdtDoc, relay);
+
+		const result = await makeQueue().pullIfUnchanged(fakeDoc);
+
+		expect(crdtDoc.store.pendingStructs).toBeNull();
+		expect(hasHistoryGap(crdtDoc)).toBe(false);
+		expect(result.outcome).toBe("flushed");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "PEER LINE\n" + FULL_TEXT);
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("PEER LINE\n" + FULL_TEXT);
+		expect(state.syncBase).toBe("PEER LINE\n" + FULL_TEXT);
+	});
+
+	test("with no peer edit the sync closes the gap and leaves the file alone", async () => {
+		const { author, crdtDoc } = authorWithoutOwnSeed();
+		const { fakeDoc, writeContents } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		fakeDoc.onceFreshlySynced = syncFromRelay(crdtDoc, author);
+
+		const result = await makeQueue().pullIfUnchanged(fakeDoc);
+
+		expect(crdtDoc.store.pendingStructs).toBeNull();
+		expect(result.outcome).toBe("unchanged");
+		expect(result.remoteText).toBe(FULL_TEXT);
+		expect(writeContents).not.toHaveBeenCalled();
+	});
+
+	test("control: a relay that lost the seed keeps the gap and the file", async () => {
+		const { crdtDoc } = authorWithoutOwnSeed();
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(crdtDoc));
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		fakeDoc.onceFreshlySynced = syncFromRelay(crdtDoc, relay);
+
+		expect((await makeQueue().pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(state.vault).toBe(FULL_TEXT);
+	});
+});
+
 /** A missing range that is not a writer's identity seed may hold text: the text is not known complete. */
 describe("missing clocks outside an identity seed are a gap", () => {
 	/** `update` delivered on its own to a doc holding nothing else. */
