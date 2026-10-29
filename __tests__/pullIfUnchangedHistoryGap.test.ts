@@ -946,6 +946,40 @@ describe("a seed hole the relay does not have either is accepted after two compl
 		expect(state.vault).toBe("EEP ");
 	});
 
+	test("REGRESSION: a hole accepted after another one was written gets its own copy", async () => {
+		const map = (doc: Y.Doc) => new Y.PermanentUserData(doc).setUserMapping(doc, doc.clientID, "same-account");
+		const peer = new Y.Doc();
+		map(peer);
+		peer.getText("contents").insert(0, "KEEP ABC");
+		const { ghost } = docWithLostSeed();
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(peer));
+		// A first lost seed: presence pushes only.
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(ghost, Y.encodeStateVector(new Map([[ghost.clientID, SEED_SIZE]]))));
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(relay));
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, "KEEP ABC", "KEEP ABC");
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+		const outcomes = [];
+		for (let i = 0; i < 2; i++) outcomes.push((await queue.pullIfUnchanged(fakeDoc)).outcome);
+		// A second writer replaces "ABC" with the same text; its first clocks are lost.
+		const writer = new Y.Doc();
+		Y.applyUpdate(writer, Y.encodeStateAsUpdate(peer));
+		writer.getText("contents").delete(5, 3);
+		writer.getText("contents").insert(5, "ABC");
+		map(writer);
+		map(writer);
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(writer, Y.encodeStateVector(new Map([[writer.clientID, SEED_SIZE]]))));
+		for (let i = 0; i < 2; i++) outcomes.push((await queue.pullIfUnchanged(fakeDoc)).outcome);
+
+		expect(outcomes).toEqual(["history-gap", "unchanged", "history-gap", "flushed"]);
+		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(writeConflictCopy.mock.calls[0][1]).toBe("KEEP ABC");
+		expect(writeContents.mock.calls.map((call) => call[1])).toEqual(["KEEP "]);
+		expect(state.vault).toBe("KEEP ");
+	});
+
 	test("the first write without a lost seed that only adds text keeps no copy", async () => {
 		const { crdtDoc, peer, relay } = docWithLostSeed();
 		const { fakeDoc, writeConflictCopy } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);

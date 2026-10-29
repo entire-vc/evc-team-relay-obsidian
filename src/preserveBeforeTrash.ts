@@ -88,22 +88,30 @@ export function hasHistoryGap(doc: Y.Doc, textName = "contents", acceptLostSeeds
 
 /**
  * Whether the text shows without a gap only because seed holes count as lost,
- * and no write has yet put that text on disk (see `noteLostSeedTextOnDisk`).
+ * and for one of them no write has yet put that text on disk (see
+ * `noteLostSeedTextOnDisk`).
  * The hole may have held text the file still has; the first such write must
  * keep whatever of the file it drops. Once the file shows the text without
  * the hole, later differences are the peers' edits.
  */
 export function firstWriteWithoutLostSeed(doc: Y.Doc, textName = "contents"): boolean {
 	const gap = analyseHistoryGap(doc, textName);
-	return typeof gap !== "boolean" && allLost(doc, gap) && !lostSeedTextOnDisk.has(doc);
+	if (typeof gap === "boolean" || !allLost(doc, gap)) return false;
+	const onDisk = lostSeedTextOnDisk.get(doc);
+	return gap.some((client) => !onDisk?.has(client));
 }
 
-/** Record that the file now shows `doc`'s text without its lost seed holes. */
-export function noteLostSeedTextOnDisk(doc: Y.Doc): void {
-	lostSeedTextOnDisk.add(doc);
+/** Record that the file now shows `doc`'s text without its current lost seed holes. */
+export function noteLostSeedTextOnDisk(doc: Y.Doc, textName = "contents"): void {
+	const gap = analyseHistoryGap(doc, textName);
+	if (typeof gap === "boolean") return;
+	const onDisk = lostSeedTextOnDisk.get(doc) ?? new Set<number>();
+	for (const client of gap) onDisk.add(client);
+	lostSeedTextOnDisk.set(doc, onDisk);
 }
 
-const lostSeedTextOnDisk = new WeakSet<Y.Doc>();
+/** Per doc, the writers whose lost seed hole the file already shows the text without. */
+const lostSeedTextOnDisk = new WeakMap<Y.Doc, Set<number>>();
 
 function allLost(doc: Y.Doc, clients: number[]): boolean {
 	const sightings = lostSeedSightings.get(doc);
