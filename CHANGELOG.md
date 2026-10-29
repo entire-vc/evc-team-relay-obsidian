@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.32
+- Fixed: some older closed notes could remain stuck after a device lost its initial sync records. After confirming the missing records across two connections, the plugin now resumes updates when text history is intact. If the first update would remove existing file content, a conflict copy preserves the previous text.
+
 ## 0.1.31
 - Fixed: older closed notes could stop receiving updates because changes to collaborator records were mistaken for missing text history. These records no longer hold up text updates; notes with genuinely incomplete history remain protected from being overwritten.
 
