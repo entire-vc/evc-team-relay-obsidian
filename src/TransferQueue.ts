@@ -20,7 +20,7 @@ import { applyDiffToYText, reconcileWithConflictCopy } from "./ytextDiff";
 import { hasPreservableContent, sameTextContent } from "./textEquivalence";
 import { waitForBufferFlush } from "./websocketFlush";
 import { textFingerprint } from "./docActivity";
-import { hasHistoryGap } from "./preserveBeforeTrash";
+import { hasHistoryGap, noteCompletedSync } from "./preserveBeforeTrash";
 import {
 	claimInitIfUnclaimed,
 	wonInitClaim,
@@ -1422,6 +1422,7 @@ export class TransferQueue extends Loggable {
 			this.releasePulledDoc(doc, hold);
 			return { outcome: "not-synced" };
 		}
+		noteCompletedSync(doc.crdtDoc, doc._liveProvider?.ws ?? null);
 		if (hasHistoryGap(doc.crdtDoc)) {
 			// Updates are pending on changes this client never stored (the
 			// note's author after a restart): the text reads empty or partial

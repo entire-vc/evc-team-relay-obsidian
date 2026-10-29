@@ -688,6 +688,177 @@ describe("a gap on the author's own identity seed closes on the next sync", () =
 	});
 });
 
+/**
+ * The field case on a second vault (493 notes): a writer's identity seed that
+ * nobody kept, the relay included. Its later pushes into `ids` (one clock
+ * each, from clock 4) wait for clocks 0..3 for good; the text is complete and
+ * nothing pending is text. No pushed delete set proves the hole is a seed, so
+ * clocks 0..2 might once have been text: but no peer has them either, so a
+ * gap kept for them only keeps every later edit of the note off the disk. The
+ * hole is accepted once syncs on two distinct connections have left it open.
+ */
+describe("a seed hole the relay does not have either is accepted after two completed syncs", () => {
+	/** A peer's complete text, plus the later pushes of a writer whose seed is lost everywhere. */
+	function docWithLostSeed(pushes = 3) {
+		const peer = new Y.Doc();
+		peer.getText("contents").insert(0, FULL_TEXT);
+		const ghost = new Y.Doc();
+		const ids = seedIdentity(ghost);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		// One update per push, as each later session sends its own.
+		for (let i = 1; i <= pushes; i++) {
+			const before = Y.encodeStateVector(ghost);
+			ids.push([ghost.clientID + i]);
+			Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, before));
+		}
+		// The relay holds what this client holds: the seed reached nobody.
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(crdtDoc));
+		return { crdtDoc, peer, ghost, relay };
+	}
+
+	/**
+	 * Each completed sync answers the doc's state vector with everything past
+	 * it, on a new connection unless `sameConnection`.
+	 */
+	function syncsWith(fakeDoc: Document, crdtDoc: Y.Doc, relay: Y.Doc, opts: { sameConnection?: boolean } = {}) {
+		const provider = fakeDoc._liveProvider as { ws: WebSocket | null };
+		fakeDoc.onceFreshlySynced = async () => {
+			if (!opts.sameConnection || provider.ws === null) provider.ws = {} as WebSocket;
+			Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(relay, Y.encodeStateVector(crdtDoc)));
+		};
+	}
+
+	test("the fixture has the field shape: one missing seed, single pushes pending from clock 4, the text complete", () => {
+		const { crdtDoc, ghost } = docWithLostSeed();
+		const pending = Y.decodeUpdateV2(crdtDoc.store.pendingStructs!.update).structs.filter(
+			(s) => !(s instanceof Y.Skip),
+		);
+
+		expect(crdtDoc.store.pendingStructs?.missing).toEqual(new Map([[ghost.clientID, SEED_SIZE - 1]]));
+		expect(pending.map((s) => [s.id.client, s.id.clock, s.length])).toEqual([
+			[ghost.clientID, 4, 1],
+			[ghost.clientID, 5, 1],
+			[ghost.clientID, 6, 1],
+		]);
+		expect(pending.every((s) => s instanceof Y.Item && s.content instanceof Y.ContentAny)).toBe(true);
+		expect(crdtDoc.store.pendingDs).toBeNull();
+		expect(crdtDoc.getText("contents").toString()).toBe(FULL_TEXT);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+
+	test("REGRESSION: a peer's edit to the closed note reaches disk on the second connection", async () => {
+		const { crdtDoc, peer, relay } = docWithLostSeed();
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(peer));
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+
+		// One completed sync is no proof: a relay that has not loaded the doc answers empty.
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect(writeContents).not.toHaveBeenCalled();
+		const second = await queue.pullIfUnchanged(fakeDoc);
+
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(hasHistoryGap(crdtDoc)).toBe(false);
+		expect(second.outcome).toBe("flushed");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "PEER LINE\n" + FULL_TEXT);
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("PEER LINE\n" + FULL_TEXT);
+		expect(state.syncBase).toBe("PEER LINE\n" + FULL_TEXT);
+	});
+
+	test("syncs on one connection, however many, keep the gap", async () => {
+		const { crdtDoc, peer, relay } = docWithLostSeed();
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(peer));
+		syncsWith(fakeDoc, crdtDoc, relay, { sameConnection: true });
+		const queue = makeQueue();
+
+		for (let i = 0; i < 3; i++) expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(state.vault).toBe(FULL_TEXT);
+	});
+
+	test("a relay that has the seed fills the hole instead", async () => {
+		const { crdtDoc, ghost } = docWithLostSeed();
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(crdtDoc));
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(ghost));
+		const { fakeDoc, writeContents } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		syncsWith(fakeDoc, crdtDoc, relay);
+
+		const result = await makeQueue().pullIfUnchanged(fakeDoc);
+
+		expect(crdtDoc.store.pendingStructs).toBeNull();
+		expect(result.outcome).toBe("unchanged");
+		expect(writeContents).not.toHaveBeenCalled();
+	});
+
+	test("control: the author's own seed with the whole text pending stays a gap after two connections", async () => {
+		const author = new Y.Doc();
+		seedIdentity(author);
+		const seeded = Y.encodeStateVector(author);
+		author.getText("contents").insert(0, FULL_TEXT);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(author, seeded));
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(crdtDoc));
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(state.vault).toBe(FULL_TEXT);
+	});
+
+	test("control: pending text of the same writer stays a gap after two connections", async () => {
+		const { crdtDoc, ghost, relay } = docWithLostSeed();
+		const seeded = Y.encodeStateVector(ghost);
+		ghost.getText("contents").insert(0, "GHOST TEXT\n");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(ghost, seeded));
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(crdtDoc));
+		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(state.vault).toBe(FULL_TEXT);
+	});
+
+	test("control: a peer's text item next to the hole stays a gap after two connections", async () => {
+		const { crdtDoc, relay } = docWithLostSeed();
+		// A writer's first four clocks are text, its next three presence values.
+		const writer = new Y.Doc();
+		writer.getText("contents").insert(0, "ABCD");
+		const lost = Y.encodeStateVector(writer);
+		for (let i = 0; i < 3; i++) writer.getMap("users").set(`entry-${i}`, i);
+		const typedByPeer = new Y.Doc();
+		Y.applyUpdate(typedByPeer, Y.encodeStateAsUpdate(writer));
+		const before = Y.encodeStateVector(typedByPeer);
+		typedByPeer.getText("contents").insert(2, "X");
+		// The four characters reached nobody; the rest and the peer's insert between them did.
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(writer, lost));
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(typedByPeer, before));
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(crdtDoc));
+		expect(crdtDoc.store.pendingStructs?.missing.get(writer.clientID)).toBeLessThan(SEED_SIZE);
+		const { fakeDoc, writeContents } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect(writeContents).not.toHaveBeenCalled();
+	});
+});
+
 /** A missing range that is not a writer's identity seed may hold text: the text is not known complete. */
 describe("missing clocks outside an identity seed are a gap", () => {
 	/** `update` delivered on its own to a doc holding nothing else. */
