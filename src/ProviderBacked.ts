@@ -396,9 +396,14 @@ export class ProviderBacked extends Loggable {
 		}
 		const tokenFrom = Date.now();
 		this.lastTokenMs = undefined;
+		const offlineCalls = this.offlineCalls;
 		try {
 			const clientToken = await this.requestProviderToken();
 			this.lastTokenMs = Date.now() - tokenFrom;
+			// goOffline() ran while the token was on its way (a caller that
+			// stopped waiting for this connect released it): connecting now
+			// would leave a socket nobody owns.
+			if (this.offlineCalls !== offlineCalls) return false;
 			this.applyRefreshedToken(clientToken); // re-check: token may already be current at this point
 			this._liveProvider.connect();
 			// A retry left by an earlier failure is not needed any more.
@@ -456,7 +461,11 @@ export class ProviderBacked extends Loggable {
 		return this._providerSynced;
 	}
 
+	/** Counts goOffline() calls, so a connect still awaiting its token can tell it was cancelled. */
+	private offlineCalls = 0;
+
 	goOffline(): void {
+		this.offlineCalls++;
 		// A retry scheduled by a failed bringOnline() would otherwise reconnect
 		// against this explicit "disconnected" intent -- e.g. a background
 		// pull whose token request failed would leave the document connected

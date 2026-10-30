@@ -11,10 +11,13 @@ import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
 
 class InstantClock implements Clock {
+	/** The 15s connect timeout has not elapsed yet: an abort comes first in these cases. */
+	constructor(private readonly connectTimeoutPending = false) {}
 	now(): number {
 		return Date.now();
 	}
-	scheduleTimeout(callback: () => void): number {
+	scheduleTimeout(callback: () => void, ms?: number): number {
+		if (this.connectTimeoutPending && ms === 15_000) return 0;
 		setImmediate(callback);
 		return 0;
 	}
@@ -89,7 +92,7 @@ function makeDoc({ separateFirstConnect = false } = {}) {
 
 describe("pull connection ownership", () => {
 	test("an aborted pull's late release leaves the connection to the newer pull of the note", async () => {
-		const queue = new TransferQueue({} as never, new InstantClock(), {} as never, 3);
+		const queue = new TransferQueue({} as never, new InstantClock(true), {} as never, 3);
 		const { doc, goOffline, openSocket, isOnline } = makeDoc();
 
 		const deadline = new AbortController();
@@ -113,7 +116,7 @@ describe("pull connection ownership", () => {
 	});
 
 	test("an aborted pull ending after the newer pull closes the connection nobody holds any more", async () => {
-		const queue = new TransferQueue({} as never, new InstantClock(), {} as never, 3);
+		const queue = new TransferQueue({} as never, new InstantClock(true), {} as never, 3);
 		const { doc, goOffline, openSocket, openFirstSocket, isOnline } = makeDoc({ separateFirstConnect: true });
 
 		const deadline = new AbortController();
@@ -139,7 +142,7 @@ describe("pull connection ownership", () => {
 	});
 
 	test("an aborted pull nobody took over still closes its connection", async () => {
-		const queue = new TransferQueue({} as never, new InstantClock(), {} as never, 3);
+		const queue = new TransferQueue({} as never, new InstantClock(true), {} as never, 3);
 		const { doc, goOffline, openSocket, isOnline } = makeDoc();
 
 		const deadline = new AbortController();

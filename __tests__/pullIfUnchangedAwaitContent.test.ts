@@ -234,6 +234,43 @@ describe("pullIfUnchanged — waiting connected for announced content", () => {
 		expect(doc.writeContents).toHaveBeenCalledWith(doc.fakeDoc, "edited by peer");
 	});
 
+	test("a first connect that never settles ends the pull as connect-failed at the connect timeout, and its late result changes nothing", async () => {
+		const clock = new SteppingClock();
+		let lateConnect!: (ok: boolean) => void;
+		const doc = makeFakeDoc({
+			bringOnline: () => new Promise<boolean>((resolve) => (lateConnect = resolve)),
+		});
+		const phases: string[] = [];
+		const result = await clock.settle(
+			makeQueue(clock).pullIfUnchanged(doc.fakeDoc, {
+				expected: () => textFingerprint("edited by peer"),
+				awaitContentMs: 60_000,
+				onPhase: (phase) => phases.push(phase),
+			}),
+		);
+		expect(result).toEqual({ outcome: "connect-failed" });
+		expect(clock.now() - 1_000_000).toBe(15_000);
+		expect(phases).not.toContain("await-content");
+		expect(doc.writeContents).not.toHaveBeenCalled();
+		// The release cancels the connect (goOffline() is what ProviderBacked reads).
+		expect(doc.goOffline).toHaveBeenCalledTimes(1);
+
+		lateConnect(true);
+		await flushMacrotasks();
+		expect(doc.writeContents).not.toHaveBeenCalled();
+		expect(doc.goOffline).toHaveBeenCalledTimes(1);
+	});
+
+	test("a first connect that times out leaves a connection an editor holds alone", async () => {
+		const clock = new SteppingClock();
+		const doc = makeFakeDoc({ editLock: true, bringOnline: () => new Promise<boolean>(() => {}) });
+		const result = await clock.settle(
+			makeQueue(clock).pullIfUnchanged(doc.fakeDoc, { expected: () => textFingerprint("x"), awaitContentMs: 60_000 }),
+		);
+		expect(result).toEqual({ outcome: "connect-failed" });
+		expect(doc.goOffline).not.toHaveBeenCalled();
+	});
+
 	test("aborted during a reconnect: no write, connection dropped", async () => {
 		const clock = new SteppingClock();
 		const controller = new AbortController();
