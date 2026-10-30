@@ -31,7 +31,7 @@ module.exports = {
 	// red) without that stack running. It is excluded here so `npm test` stays
 	// hermetic and the 40-suite/453-test baseline is unaffected; run it with
 	// `LIVE_RELAY=1 npx jest --config jest.live.config.js`, which re-includes it.
-	testPathIgnorePatterns: ["/__tests__/mocks/", "/__tests__/jest.setup.js", "/__tests__/live/"],
+	testPathIgnorePatterns: ["/__tests__/mocks/", "/__tests__/jest.setup.js", "/__tests__/live/", "/__tests__/m3/(?!.*\\.test\\.ts$)"],
     globals: {
         "BUILD_TYPE": "production",
         "GIT_TAG": "test",
