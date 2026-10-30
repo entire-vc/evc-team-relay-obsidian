@@ -885,6 +885,49 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("an announced pull aborted at its deadline is re-checked: the re-check starts, waits for the text and reaches compare", async () => {
+		const held: Held[] = [];
+		let first = true;
+		const pull = jest.fn<PullFn>().mockImplementation((file, control) => {
+			if (first) {
+				first = false;
+				// Stuck on a connect that never settles.
+				control.onPhase?.("connect");
+				return new Promise<PullResult>(() => undefined);
+			}
+			return new Promise<PullResult>((resolve) => held.push({ file, control, resolve }));
+		});
+		const folder = makeFolder("a", 0, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		folder.trackedEntries.set("a-0", { __isDocument: true, isOnline: false, entityGuid: "a-0", entryPath: "a/0.md" });
+		folder.announce("a-0", textFingerprint("edited"));
+		await flushPromises();
+		const stuck = pull.mock.calls[0][1];
+
+		clock.setTime(t0 + PULL_DEADLINE_MS);
+		await flushPromises();
+		expect(stuck.signal?.aborted).toBe(true);
+		expect(poller.stats().timeouts).toEqual({ connect: 1 });
+
+		// The re-check comes by itself, for the same text, with leave to wait for it.
+		clock.setTime(t0 + PULL_DEADLINE_MS + 60_000);
+		await flushPromises();
+		expect(startedGuids(pull)).toEqual(["a-0", "a-0"]);
+		const recheck = held[0];
+		expect(recheck.control.signal?.aborted).toBe(false);
+		expect(recheck.control.expected?.()).toBe(textFingerprint("edited"));
+		expect(recheck.control.awaitContentMs).toBeGreaterThan(0);
+
+		// It gets as far as compare and delivers the announced text.
+		recheck.control.onPhase?.("compare");
+		recheck.resolve({ outcome: "flushed", remoteText: "edited" });
+		await flushPromises();
+		expect(poller.stats().inflight).toBe(0);
+		expect(poller.stats().outcomes).toMatchObject({ deadline: 1, flushed: 1 });
+		poller.destroy();
+	});
+
 	test("once the announced text lands, the pull is back on the usual deadline and over the cap nothing new starts", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);

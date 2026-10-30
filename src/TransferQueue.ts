@@ -1404,7 +1404,9 @@ export class TransferQueue extends Loggable {
 								return;
 							control.onReconnect?.();
 							doc.goOffline();
-							if (!(await doc.bringOnline()) || aborted()) return;
+							// A connect that never settles must not park this pull: the wait
+							// goes on with what it has, and the next interval asks again.
+							if (!(await this.raceTimeout(doc.bringOnline(), PULL_CONNECT_TIMEOUT_MS)) || aborted()) return;
 							await this.raceTimeout(doc.onceOnline(), PULL_CONNECT_TIMEOUT_MS);
 						}
 					: undefined;

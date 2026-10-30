@@ -208,6 +208,32 @@ describe("pullIfUnchanged — waiting connected for announced content", () => {
 		expect(bringOnline).toHaveBeenCalledTimes(4);
 	});
 
+	test("a reconnect whose connect never settles is bounded: the wait goes on and the next reconnect lands the text", async () => {
+		const clock = new SteppingClock();
+		let connects = 0;
+		const doc = makeFakeDoc({
+			bringOnline: () => {
+				connects++;
+				// The first reconnect hangs for good; the one after it gets the edit.
+				if (connects === 2) return new Promise<boolean>(() => {});
+				if (connects === 3) doc.setContent("edited by peer");
+				return Promise.resolve(true);
+			},
+		});
+		const pull = makeQueue(clock).pullIfUnchanged(doc.fakeDoc, {
+			expected: () => textFingerprint("edited by peer"),
+			awaitContentMs: 60_000,
+		});
+		const stalled = Symbol("stalled");
+		const result = await Promise.race([
+			clock.settle(pull),
+			flushMacrotasks(200).then(() => stalled),
+		]);
+		expect(result).not.toBe(stalled);
+		expect(result).toMatchObject({ outcome: "flushed" });
+		expect(doc.writeContents).toHaveBeenCalledWith(doc.fakeDoc, "edited by peer");
+	});
+
 	test("aborted during a reconnect: no write, connection dropped", async () => {
 		const clock = new SteppingClock();
 		const controller = new AbortController();
