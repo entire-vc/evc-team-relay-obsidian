@@ -1360,7 +1360,10 @@ export class TransferQueue extends Loggable {
 			doc.connectionIntent === "disconnected" || this.pullHolds.has(doc.entityGuid) ? ownHold : undefined;
 		onPhase?.("connect");
 		if (hold) this.pullHolds.set(doc.entityGuid, hold);
-		const connected = await doc.bringOnline();
+		// Bounded like every other connect wait: the poller's deadline frees the
+		// slot but cannot end this await. A connect that lands after the
+		// timeout is cancelled by the release below (goOffline()).
+		const connected = await this.raceTimeout(doc.bringOnline(), PULL_CONNECT_TIMEOUT_MS);
 		if (!connected || aborted()) {
 			// bringOnline() can leave a retry scheduled (or, if it resolved
 			// late, an open socket); a background pull must not keep either.
@@ -1404,7 +1407,9 @@ export class TransferQueue extends Loggable {
 								return;
 							control.onReconnect?.();
 							doc.goOffline();
-							if (!(await doc.bringOnline()) || aborted()) return;
+							// A connect that never settles must not park this pull: the wait
+							// goes on with what it has, and the next interval asks again.
+							if (!(await this.raceTimeout(doc.bringOnline(), PULL_CONNECT_TIMEOUT_MS)) || aborted()) return;
 							await this.raceTimeout(doc.onceOnline(), PULL_CONNECT_TIMEOUT_MS);
 						}
 					: undefined;

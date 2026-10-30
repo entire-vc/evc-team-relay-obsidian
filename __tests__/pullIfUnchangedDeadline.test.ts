@@ -16,10 +16,13 @@ import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
 
 class InstantClock implements Clock {
+	/** The 15s connect timeout has not elapsed yet: an abort comes first in these cases. */
+	constructor(private readonly connectTimeoutPending = false) {}
 	now(): number {
 		return Date.now();
 	}
-	scheduleTimeout(callback: () => void): number {
+	scheduleTimeout(callback: () => void, ms?: number): number {
+		if (this.connectTimeoutPending && ms === 15_000) return 0;
 		setImmediate(callback);
 		return 0;
 	}
@@ -88,8 +91,8 @@ function makeFakeDoc(opts: FakeDocOptions = {}) {
 	return { fakeDoc, goOffline, writeContents, writeConflictCopy, setSyncBase, ensureParentDir };
 }
 
-function makeQueue(): TransferQueue {
-	return new TransferQueue({} as never, new InstantClock(), {} as never);
+function makeQueue(connectTimeoutPending = false): TransferQueue {
+	return new TransferQueue({} as never, new InstantClock(connectTimeoutPending), {} as never);
 }
 
 describe("pullIfUnchanged — deadline abort and connection release", () => {
@@ -123,7 +126,7 @@ describe("pullIfUnchanged — deadline abort and connection release", () => {
 			bringOnline: () => new Promise<boolean>((resolve) => (finishConnect = resolve)),
 		});
 		const controller = new AbortController();
-		const pull = makeQueue().pullIfUnchanged(fakeDoc, { signal: controller.signal });
+		const pull = makeQueue(true).pullIfUnchanged(fakeDoc, { signal: controller.signal });
 		await flushMacrotasks();
 
 		controller.abort();
