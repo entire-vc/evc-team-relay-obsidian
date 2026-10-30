@@ -1440,7 +1440,14 @@ export class TransferQueue extends Loggable {
 					this.releasePulledDoc(doc, hold);
 					return { outcome: "aborted" };
 				}
-				shownOnDisk = syncBase !== undefined && sameTextContent(shownBeforeSync, syncBase);
+				// A file still at the last agreed text, all of it in the doc,
+				// holds nothing the hole could hide: a peer's edit only added
+				// to it (live socket before this first pull: doc 78 chars, file 65).
+				shownOnDisk =
+					syncBase !== undefined &&
+					(sameTextContent(shownBeforeSync, syncBase) ||
+						(sameTextContent(vaultContentsBefore, syncBase) &&
+							keepsAllText(vaultContentsBefore, shownBeforeSync)));
 			}
 			noteCompletedSync(doc.crdtDoc, doc._liveProvider?.ws ?? null, shownOnDisk);
 		}

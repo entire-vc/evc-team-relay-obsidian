@@ -770,6 +770,45 @@ describe("a seed hole the relay does not have either is accepted after two compl
 		expect(state.syncBase).toBe("PEER LINE\n" + FULL_TEXT);
 	});
 
+	test("REGRESSION: a peer's edit that reached the doc before the first pull reaches disk on the second connection", async () => {
+		const { crdtDoc, peer, relay } = docWithLostSeed();
+		// The live socket delivered the edit: the doc shows it, the closed file does not.
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		const edit = Y.encodeStateAsUpdate(peer, Y.encodeStateVector(crdtDoc));
+		Y.applyUpdate(crdtDoc, edit);
+		Y.applyUpdate(relay, edit);
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+
+		expect(crdtDoc.getText("contents").toString()).toBe("PEER LINE\n" + FULL_TEXT);
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		const second = await queue.pullIfUnchanged(fakeDoc);
+
+		expect(second.outcome).toBe("flushed");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "PEER LINE\n" + FULL_TEXT);
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("PEER LINE\n" + FULL_TEXT);
+	});
+
+	test("control: the same early edit with a file holding unsynced local text stays a gap", async () => {
+		const { crdtDoc, peer, relay } = docWithLostSeed();
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		const edit = Y.encodeStateAsUpdate(peer, Y.encodeStateVector(crdtDoc));
+		Y.applyUpdate(crdtDoc, edit);
+		Y.applyUpdate(relay, edit);
+		const local = FULL_TEXT + "local line\n";
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, local, FULL_TEXT);
+		syncsWith(fakeDoc, crdtDoc, relay);
+		const queue = makeQueue();
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe(local);
+	});
+
 	test("syncs on one connection, however many, keep the gap", async () => {
 		const { crdtDoc, peer, relay } = docWithLostSeed();
 		const { fakeDoc, writeContents, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
