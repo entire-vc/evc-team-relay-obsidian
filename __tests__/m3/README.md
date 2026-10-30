@@ -21,6 +21,10 @@ M3_RECEIPT_OUT=/tmp/m3-receipt.json npx jest __tests__/m3/m3SyncScenario.test.ts
 The receipt names the commit (`head`), a SHA-256 over every file in `src/`
 (`src_sha256`) and, per run, sizes and 8-hex digests only.
 
+`completedSyncs` is counted relay-side (the relay answered the client's state
+vector); the outcome itself is decided by the real `noteCompletedSync` logic,
+and the one-pull control run shows a single sync does not change the file.
+
 ## Isolation (fails closed, `isolation.ts`)
 
 - Endpoint: only the relay's own `ws://127.0.0.1:<port>` origin. A host name,
@@ -52,6 +56,8 @@ The scenario copies nothing out of the fixture: the vault, the relay and the
 local store are all created fresh and deleted at the end of the run.
 
 ## Output limits
+
+The 8-hex digests of a short or guessable text can be confirmed by guessing; keep receipts of a private copy inside the team.
 
 Share only the receipt file: it holds the commit, the source digest, outcomes
 (`history-gap`, `flushed`), counts, character counts and 8-hex digests. Do not

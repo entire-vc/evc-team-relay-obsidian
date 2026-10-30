@@ -69,8 +69,9 @@ describe("M3 isolation: path", () => {
 		const root = createDisposableRoot();
 		const outside = fs.mkdtempSync(path.join(os.tmpdir(), "m3-outside-"));
 		fs.symlinkSync(outside, path.join(root, "link"));
+		fs.symlinkSync(path.join(outside, "not-yet"), path.join(root, "dangling"));
 		try {
-			for (const bad of ["../escape.md", path.join(outside, "x.md"), "/etc/m3-escape", "link/x.md", "vault/../../x.md"]) {
+			for (const bad of ["../escape.md", path.join(outside, "x.md"), "/etc/m3-escape", "link/x.md", "dangling", "dangling/x.md", "vault/../../x.md"]) {
 				expect(() => assertDisposablePath(root, bad)).toThrow(IsolationError);
 			}
 			expect(fs.readdirSync(outside)).toEqual([]);
@@ -96,7 +97,7 @@ describe("M3 isolation: the scenario itself", () => {
 	test("RED: a grant that points at a foreign endpoint aborts the run before any connection", async () => {
 		await expect(
 			runM3Scenario(SYNTHETIC_FIXTURE, { grantUrlOverride: "wss://relay.example.com" }),
-		).rejects.toThrow(/IsolationError|loopback|disposable relay|pull|sync/i);
+		).rejects.toThrow(IsolationError);
 	}, 60_000);
 
 	test("RED: a vault path outside the disposable root aborts the run before any write", async () => {

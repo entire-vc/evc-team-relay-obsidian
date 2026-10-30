@@ -55,13 +55,26 @@ function resolveThroughSymlinks(target: string): string {
 	const absolute = path.resolve(target);
 	let existing = absolute;
 	const tail: string[] = [];
-	while (!fs.existsSync(existing)) {
+	// lstat, not exists: a dangling symlink exists as a link and must not read as a missing tail.
+	const present = (p: string) => {
+		try {
+			fs.lstatSync(p);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	while (!present(existing)) {
 		tail.unshift(path.basename(existing));
 		const parent = path.dirname(existing);
 		if (parent === existing) break;
 		existing = parent;
 	}
-	return path.join(fs.realpathSync(existing), ...tail);
+	try {
+		return path.join(fs.realpathSync(existing), ...tail);
+	} catch {
+		throw new IsolationError("path goes through a dangling symlink");
+	}
 }
 
 /** Returns the resolved absolute path, or throws before anything is touched. */
