@@ -125,4 +125,44 @@ describe("ProviderBacked.bringOnline() cancelled by goOffline() while its token 
 		await expect(hp.bringOnline()).resolves.toBe(true);
 		expect(hp.isOnline).toBe(true);
 	});
+
+	test("a token that is rejected after goOffline() schedules no retry and opens no socket, however long we wait", async () => {
+		jest.useFakeTimers();
+		try {
+			let reject!: (err: Error) => void;
+			const getToken = jest.fn<() => Promise<DocumentGrant>>(
+				() => new Promise<DocumentGrant>((_resolve, rej) => (reject = rej)),
+			);
+			const hp = makeProvider(getToken);
+
+			const connect = hp.bringOnline();
+			hp.goOffline();
+			reject(new Error("503 control plane"));
+
+			await expect(connect).resolves.toBe(false);
+			await jest.advanceTimersByTimeAsync(60_000);
+			expect(getToken).toHaveBeenCalledTimes(1);
+			expect(hp.isOnline).toBe(false);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
+
+	test("control: a token rejected without goOffline() still schedules its retry", async () => {
+		jest.useFakeTimers();
+		try {
+			const getToken = jest
+				.fn<() => Promise<DocumentGrant>>()
+				.mockRejectedValueOnce(new Error("503 control plane"))
+				.mockResolvedValue(VALID_TOKEN);
+			const hp = makeProvider(getToken);
+
+			await expect(hp.bringOnline()).resolves.toBe(false);
+			await jest.advanceTimersByTimeAsync(5_000);
+			expect(getToken).toHaveBeenCalledTimes(2);
+			expect(hp.isOnline).toBe(true);
+		} finally {
+			jest.useRealTimers();
+		}
+	});
 });

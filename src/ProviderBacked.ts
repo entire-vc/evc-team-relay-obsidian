@@ -412,6 +412,9 @@ export class ProviderBacked extends Loggable {
 			return true;
 		} catch (e) {
 			this.warn("bringOnline() failed:", e instanceof Error ? e.message : e);
+			// Cancelled by goOffline() while the token was on its way: the
+			// explicit "disconnected" intent stands, no retry behind it.
+			if (this.offlineCalls !== offlineCalls) return false;
 			// A rejected requestProviderToken() means _liveProvider.connect() above was
 			// NEVER called, so _liveProvider never emits "connection-error" and the
 			// reconnectGate.schedule() in attachConnectionErrorHandler() never
