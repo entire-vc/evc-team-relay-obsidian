@@ -310,7 +310,7 @@ function analyseHistoryGap(doc: Y.Doc, textName: string): boolean | number[] {
 	}
 	const unproven: number[] = [];
 	for (const client of seedClients) {
-		const hole = seedHole(structs, client);
+		const hole = seedHole(doc, structs, client);
 		if (hole === "other") return true;
 		if (hole === "unproven") unproven.push(client);
 	}
@@ -345,25 +345,96 @@ const SEED_LAST_ID = 3;
  * three characters of text lands at clock 3 too. Such a hole is "unproven";
  * one nothing refers to the way a seed is referred to is "other".
  */
-function seedHole(structs: (Y.Item | Y.GC | Y.Skip)[], client: number): "seed" | "unproven" | "other" {
+function seedHole(doc: Y.Doc, structs: (Y.Item | Y.GC | Y.Skip)[], client: number): "seed" | "unproven" | "other" {
 	const inSeed = (id: Y.ID | null): id is Y.ID => id !== null && id.client === client && id.clock < SEED_CLOCKS;
 	let deleteSetPushed = false;
 	let idPushed = false;
+	let ownReference = false;
 	for (const struct of structs) {
 		if (!(struct instanceof Y.Item)) continue;
 		const parent = struct.parent as unknown;
 		if (parent instanceof Y.ID && inSeed(parent)) {
+			ownReference = true;
 			if (parent.clock !== SEED_DS || !(struct.content instanceof Y.ContentBinary)) return "other";
 			deleteSetPushed = true;
 		}
 		if (inSeed(struct.origin)) {
+			ownReference = true;
 			if (struct.origin.clock !== SEED_LAST_ID || !(struct.content instanceof Y.ContentAny)) return "other";
 			idPushed = true;
 		}
 		if (inSeed(struct.rightOrigin)) return "other";
 	}
 	if (deleteSetPushed) return "seed";
-	return idPushed ? "unproven" : "other";
+	if (idPushed) return "unproven";
+	return ownReference ? "other" : boundToForeignSeed(doc, structs, client) ? "unproven" : "other";
+}
+
+/**
+ * Whether the pending changes of `client`, whose own clocks 0..3 are missing,
+ * only bind it to another writer's identity seed that this doc holds
+ * integrated: a writer mapping an account whose `users` entry a peer already
+ * wrote pushes its client id after the peer's last `ids` entry (origin: the
+ * peer's clock 3) and its delete set into the peer's `ds` list (parent: the
+ * peer's clock 2). Both targets must be the items a seed makes, in a user map
+ * under the root `users` map, and when both are named, the same user map.
+ * A reference to anything else of another writer (a text item, a right
+ * neighbour, another clock, a change this doc lacks or holds only as a
+ * placeholder) fails: a writer's state alone does not say what its clocks hold.
+ *
+ * It proves what the pending changes attach to, not what the writer's own
+ * clocks 0..3 held: the caller still treats the hole as unproven.
+ */
+function boundToForeignSeed(doc: Y.Doc, structs: (Y.Item | Y.GC | Y.Skip)[], client: number): boolean {
+	const entries = new Set<Y.Map<unknown>>();
+	for (const struct of structs) {
+		if (!(struct instanceof Y.Item) || struct.id.client !== client) continue;
+		const parent = struct.parent as unknown;
+		if (parent instanceof Y.ID && parent.client !== client) {
+			if (!(struct.content instanceof Y.ContentBinary) || parent.clock !== SEED_DS) return false;
+			const entry = identityEntry(doc, parent, "ds");
+			if (entry === null) return false;
+			entries.add(entry);
+		}
+		if (struct.origin !== null && struct.origin.client !== client) {
+			if (!(struct.content instanceof Y.ContentAny) || struct.origin.clock !== SEED_LAST_ID) return false;
+			const entry = identityEntry(doc, struct.origin, "ids");
+			if (entry === null) return false;
+			entries.add(entry);
+		}
+		if (struct.rightOrigin !== null && struct.rightOrigin.client !== client) return false;
+	}
+	return entries.size === 1;
+}
+
+/**
+ * The user map under the root `users` map that the integrated item `id` is
+ * the seed's `ds` list (`ds`) or the id pushed into its `ids` list (`ids`) of.
+ */
+function identityEntry(doc: Y.Doc, id: Y.ID, kind: "ds" | "ids"): Y.Map<unknown> | null {
+	if (id.clock >= Y.getState(doc.store, id.client)) return null;
+	const item = Y.getItem(doc.store, id);
+	if (!(item instanceof Y.Item)) return null;
+	let entry: unknown;
+	if (kind === "ds") {
+		if (!(item.content instanceof Y.ContentType) || !(item.content.type instanceof Y.Array)) return null;
+		if (item.parentSub !== "ds") return null;
+		entry = item.parent;
+	} else {
+		if (!(item.content instanceof Y.ContentAny)) return null;
+		const ids = item.parent as unknown;
+		if (!(ids instanceof Y.Array) || ids._item === null || ids._item.parentSub !== "ids") return null;
+		entry = ids._item.parent;
+	}
+	if (!(entry instanceof Y.Map) || entry._item === null || !(entry._item.parent instanceof Y.AbstractType)) return null;
+	const users = entry._item.parent as Y.AbstractType<unknown>; // a root nobody asked for by kind is a bare AbstractType
+	if (users._item !== null) return null;
+	try {
+		if (Y.findRootTypeKey(users) !== "users") return null;
+	} catch {
+		return null;
+	}
+	return entry as Y.Map<unknown>;
 }
 
 /** Content kinds a Y.Text never holds: list and map values. */
