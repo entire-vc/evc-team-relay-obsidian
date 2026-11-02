@@ -1564,3 +1564,223 @@ describe("pullIfUnchanged — an author's text that never reached the relay is s
 		expect(queue.enqueueUpload).not.toHaveBeenCalled();
 	});
 });
+
+describe("a lost writer bound to another writer's integrated identity seed", () => {
+	/**
+	 * The field shape: writer Y mapped its account (clocks 0..3 of the `users`
+	 * entry) and wrote the text. Writer c's own first four clocks reached nobody;
+	 * its later pushes bind it to Y's entry: its id after Y's last `ids` entry
+	 * (origin (Y,3)) and its delete set into Y's `ds` list (parent (Y,2)).
+	 */
+	function peerWithIdentity(rootName = "users") {
+		const peer = new Y.Doc();
+		const user = new Y.Map<unknown>();
+		user.set("ids", new Y.Array<number>());
+		user.set("ds", new Y.Array<Uint8Array>());
+		peer.getMap(rootName).set("account", user);
+		(user.get("ids") as Y.Array<number>).push([peer.clientID]);
+		peer.getText("contents").insert(0, FULL_TEXT);
+		return peer;
+	}
+
+	/** A writer `c` that holds `base`, wrote 4 invisible clocks, then bound itself to the entry. */
+	function lostWriterUpdate(base: Y.Doc, opts: { rootName?: string; extra?: (c: Y.Doc) => void } = {}) {
+		const c = new Y.Doc();
+		Y.applyUpdate(c, Y.encodeStateAsUpdate(base));
+		const scratch = c.getMap("scratch");
+		for (let i = 0; i < SEED_SIZE; i++) scratch.set(`k${i}`, i);
+		const before = Y.encodeStateVector(c);
+		const user = c.getMap(opts.rootName ?? "users").get("account") as Y.Map<unknown>;
+		(user.get("ids") as Y.Array<number>).push([c.clientID]);
+		(user.get("ds") as Y.Array<Uint8Array>).push([new Uint8Array([0, 1, 2])]);
+		opts.extra?.(c);
+		return { c, update: Y.encodeStateAsUpdate(c, before) };
+	}
+
+	function docWithForeignBinding(opts: { rootName?: string; extra?: (c: Y.Doc) => void } = {}) {
+		const peer = peerWithIdentity(opts.rootName);
+		const { c, update } = lostWriterUpdate(peer, opts);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(crdtDoc, update);
+		return { crdtDoc, peer, c };
+	}
+
+	/** Two completed syncs on two distinct connections that leave the hole open. */
+	function acceptedAfterTwoSyncs(doc: Y.Doc, shownOnDisk = true, connections = 2): boolean {
+		for (let i = 0; i < connections; i++) noteCompletedSync(doc, {}, shownOnDisk);
+		return !hasHistoryGap(doc, "contents", true);
+	}
+
+	test("the fixture has the field shape: one missing client, structs from clock 4 attached to the peer's seed", () => {
+		const { crdtDoc, c, peer } = docWithForeignBinding();
+		const pending = Y.decodeUpdateV2(crdtDoc.store.pendingStructs!.update).structs.filter(
+			(s) => !(s instanceof Y.Skip),
+		) as Y.Item[];
+
+		expect(crdtDoc.store.pendingStructs?.missing).toEqual(new Map([[c.clientID, SEED_SIZE - 1]]));
+		expect(pending.map((s) => s.id.clock)[0]).toBe(SEED_SIZE);
+		expect(pending.some((s) => s.origin?.client === peer.clientID && s.origin.clock === 3)).toBe(true);
+		expect(
+			pending.some((s) => s.parent instanceof Y.ID && s.parent.client === peer.clientID && s.parent.clock === 2),
+		).toBe(true);
+		expect(hasHistoryGap(crdtDoc)).toBe(true);
+	});
+
+	test("RED on the own-seed-only rule, GREEN now: accepted after two connections, never before", () => {
+		const { crdtDoc } = docWithForeignBinding();
+
+		expect(hasHistoryGap(crdtDoc, "contents", true)).toBe(true);
+		noteCompletedSync(crdtDoc, {}, true);
+		expect(hasHistoryGap(crdtDoc, "contents", true)).toBe(true);
+		noteCompletedSync(crdtDoc, {}, true);
+		expect(hasHistoryGap(crdtDoc, "contents", true)).toBe(false);
+		expect(hasHistoryGap(crdtDoc)).toBe(true); // strict stays a gap
+	});
+
+	test("one connection, however many syncs, keeps the gap", () => {
+		const { crdtDoc } = docWithForeignBinding();
+		const connection = {};
+		for (let i = 0; i < 4; i++) noteCompletedSync(crdtDoc, connection, true);
+		expect(hasHistoryGap(crdtDoc, "contents", true)).toBe(true);
+	});
+
+	test("a first sighting not shown on disk keeps the gap", () => {
+		const { crdtDoc } = docWithForeignBinding();
+		expect(acceptedAfterTwoSyncs(crdtDoc, false)).toBe(false);
+	});
+
+	test("control: pending text of the lost writer stays a gap", () => {
+		const { crdtDoc } = docWithForeignBinding({ extra: (c) => c.getText("contents").insert(0, "typed\n") });
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(false);
+	});
+
+	test("control: a text reference into the lost writer's hole stays a gap", () => {
+		const peer = peerWithIdentity();
+		const { c, update } = lostWriterUpdate(peer);
+		// A text item anchored at the writer's own clock 2.
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(crdtDoc, update);
+		const writer = new Y.Doc();
+		Y.applyUpdate(writer, Y.encodeStateAsUpdate(c));
+		writer.clientID = c.clientID;
+		writer.getText("contents").insert(1, "z");
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(writer, Y.encodeStateVector(c)));
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(false);
+	});
+
+	test("control: the peer's entry outside the root users map is not an identity seed", () => {
+		const { crdtDoc } = docWithForeignBinding({ rootName: "notes" });
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(false);
+	});
+
+	test("control: a peer's seed that a later mapping deleted is not an identity seed", () => {
+		const peer = peerWithIdentity();
+		const { update } = lostWriterUpdate(peer);
+		peer.getMap("users").delete("account");
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(crdtDoc, update);
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(false);
+	});
+
+	test.each([
+		["its user entry", (peer: Y.Doc) => peer.getMap("users").delete("account")],
+		["its ids entry", (peer: Y.Doc) => ((peer.getMap("users").get("account") as Y.Map<unknown>).get("ids") as Y.Array<number>).delete(0)],
+	])("control: with garbage collection off, a peer that deleted %s is not an identity seed", (_name, remove) => {
+		const peer = new Y.Doc({ gc: false });
+		const user = new Y.Map<unknown>();
+		user.set("ids", new Y.Array<number>());
+		user.set("ds", new Y.Array<Uint8Array>());
+		peer.getMap("users").set("account", user);
+		(user.get("ids") as Y.Array<number>).push([peer.clientID]);
+		peer.getText("contents").insert(0, FULL_TEXT);
+		const { update } = lostWriterUpdate(peer);
+		remove(peer);
+		const crdtDoc = new Y.Doc({ gc: false });
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(crdtDoc, update);
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(false);
+	});
+
+	test("control: a peer whose seed the doc lacks entirely is a gap", () => {
+		const peer = peerWithIdentity();
+		const { update } = lostWriterUpdate(peer);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, update); // nothing of the peer: its clocks are missing too
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(false);
+	});
+
+	test("a delete set pushed alone into the peer's ds list is still the same shape", () => {
+		const peer = new Y.Doc();
+		const user = new Y.Map<unknown>();
+		user.set("ids", new Y.Array<number>());
+		user.set("ds", new Y.Array<Uint8Array>());
+		peer.getMap("users").set("account", user); // clocks 0..2 only
+		peer.getText("contents").insert(0, FULL_TEXT);
+		const c = new Y.Doc();
+		Y.applyUpdate(c, Y.encodeStateAsUpdate(peer));
+		for (let i = 0; i < SEED_SIZE; i++) c.getMap("scratch").set(`k${i}`, i);
+		const before = Y.encodeStateVector(c);
+		((c.getMap("users").get("account") as Y.Map<unknown>).get("ds") as Y.Array<Uint8Array>).push([
+			new Uint8Array([1]),
+		]);
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(c, before));
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(true);
+	});
+
+	test("two lost writers bound to the same seed are both accepted; one unbound writer keeps the gap", () => {
+		const peer = peerWithIdentity();
+		const crdtDoc = new Y.Doc();
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		const a = lostWriterUpdate(peer);
+		const b = lostWriterUpdate(peer);
+		Y.applyUpdate(crdtDoc, a.update);
+		Y.applyUpdate(crdtDoc, b.update);
+		expect(crdtDoc.store.pendingStructs?.missing.size).toBe(2);
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(true);
+
+		// A third writer whose pushes bind to nothing known.
+		const ghost = new Y.Doc();
+		for (let i = 0; i < SEED_SIZE; i++) ghost.getMap("scratch").set(`k${i}`, i);
+		const before = Y.encodeStateVector(ghost);
+		ghost.getMap("scratch").set("later", 1);
+		const mixed = new Y.Doc();
+		Y.applyUpdate(mixed, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(mixed, a.update);
+		Y.applyUpdate(mixed, Y.encodeStateAsUpdate(ghost, before));
+		expect(acceptedAfterTwoSyncs(mixed)).toBe(false);
+	});
+
+	test("ordinary delivery: a peer's edit reaches the closed file on the second connection, an edited file keeps its text", async () => {
+		const { crdtDoc, peer, c } = docWithForeignBinding();
+		void c;
+		const relay = new Y.Doc();
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(crdtDoc));
+		peer.getText("contents").insert(0, "PEER LINE\n");
+		Y.applyUpdate(relay, Y.encodeStateAsUpdate(peer));
+		const provide = (fakeDoc: Document) => {
+			const provider = fakeDoc._liveProvider as { ws: WebSocket | null };
+			fakeDoc.onceFreshlySynced = async () => {
+				provider.ws = {} as WebSocket;
+				Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(relay, Y.encodeStateVector(crdtDoc)));
+			};
+		};
+		const { fakeDoc, writeContents, writeConflictCopy, state } = makeFakeDoc(crdtDoc, FULL_TEXT, FULL_TEXT);
+		provide(fakeDoc);
+		const queue = makeQueue();
+
+		expect((await queue.pullIfUnchanged(fakeDoc)).outcome).toBe("history-gap");
+		const second = await queue.pullIfUnchanged(fakeDoc);
+
+		expect(second.outcome).toBe("flushed");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "PEER LINE\n" + FULL_TEXT);
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(state.vault).toBe("PEER LINE\n" + FULL_TEXT);
+	});
+});
