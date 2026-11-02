@@ -1686,6 +1686,26 @@ describe("a lost writer bound to another writer's integrated identity seed", () 
 		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(false);
 	});
 
+	test.each([
+		["its user entry", (peer: Y.Doc) => peer.getMap("users").delete("account")],
+		["its ids entry", (peer: Y.Doc) => ((peer.getMap("users").get("account") as Y.Map<unknown>).get("ids") as Y.Array<number>).delete(0)],
+	])("control: with garbage collection off, a peer that deleted %s is not an identity seed", (_name, remove) => {
+		const peer = new Y.Doc({ gc: false });
+		const user = new Y.Map<unknown>();
+		user.set("ids", new Y.Array<number>());
+		user.set("ds", new Y.Array<Uint8Array>());
+		peer.getMap("users").set("account", user);
+		(user.get("ids") as Y.Array<number>).push([peer.clientID]);
+		peer.getText("contents").insert(0, FULL_TEXT);
+		const { update } = lostWriterUpdate(peer);
+		remove(peer);
+		const crdtDoc = new Y.Doc({ gc: false });
+		Y.applyUpdate(crdtDoc, Y.encodeStateAsUpdate(peer));
+		Y.applyUpdate(crdtDoc, update);
+		expect(crdtDoc.store.pendingStructs).not.toBeNull();
+		expect(acceptedAfterTwoSyncs(crdtDoc)).toBe(false);
+	});
+
 	test("control: a peer whose seed the doc lacks entirely is a gap", () => {
 		const peer = peerWithIdentity();
 		const { update } = lostWriterUpdate(peer);

@@ -414,7 +414,7 @@ function boundToForeignSeed(doc: Y.Doc, structs: (Y.Item | Y.GC | Y.Skip)[], cli
 function identityEntry(doc: Y.Doc, id: Y.ID, kind: "ds" | "ids"): Y.Map<unknown> | null {
 	if (id.clock >= Y.getState(doc.store, id.client)) return null;
 	const item = Y.getItem(doc.store, id);
-	if (!(item instanceof Y.Item)) return null;
+	if (!(item instanceof Y.Item) || item.deleted) return null;
 	let entry: unknown;
 	if (kind === "ds") {
 		if (!(item.content instanceof Y.ContentType) || !(item.content.type instanceof Y.Array)) return null;
@@ -423,10 +423,14 @@ function identityEntry(doc: Y.Doc, id: Y.ID, kind: "ds" | "ids"): Y.Map<unknown>
 	} else {
 		if (!(item.content instanceof Y.ContentAny)) return null;
 		const ids = item.parent as unknown;
-		if (!(ids instanceof Y.Array) || ids._item === null || ids._item.parentSub !== "ids") return null;
+		if (!(ids instanceof Y.Array) || ids._item === null || ids._item.deleted || ids._item.parentSub !== "ids") {
+			return null;
+		}
 		entry = ids._item.parent;
 	}
-	if (!(entry instanceof Y.Map) || entry._item === null || !(entry._item.parent instanceof Y.AbstractType)) return null;
+	if (!(entry instanceof Y.Map) || entry._item === null || entry._item.deleted || !(entry._item.parent instanceof Y.AbstractType)) {
+		return null;
+	}
 	const users = entry._item.parent as Y.AbstractType<unknown>; // a root nobody asked for by kind is a bare AbstractType
 	if (users._item !== null) return null;
 	try {
