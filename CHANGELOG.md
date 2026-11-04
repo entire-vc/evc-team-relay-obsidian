@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.33
+## Unreleased (candidate 0.1.33, not published)
 - Fixed: a closed note could stay stuck after a device lost its own initial sync record when another collaborator's record had already incorporated it. The plugin now recognizes that case and resumes updates when text history is intact; notes with genuinely incomplete history remain protected from being overwritten.
 
 ## 0.1.32
