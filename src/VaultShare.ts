@@ -375,6 +375,29 @@ export class VaultShare extends ProviderBacked {
 	private uploadRetryAttempt = 0;
 	private static readonly UPLOAD_RETRY_BACKOFF_MS = [60_000, 300_000, 900_000, 3_600_000];
 
+	/**
+	 * Puts every already-tracked entry that still has a pending claim back on
+	 * the upload queue. `adoptLocalFiles` returns an existing tracked entry
+	 * without enqueueing it, so without this a failed attachment upload would
+	 * never be retried. `enqueueUpload` is a no-op while the guid is queued or
+	 * in flight, so repeated passes cannot duplicate work.
+	 */
+	private _requeuePendingUploads(): void {
+		const vpaths: string[] = [];
+		this.uploadClaims?.forEach((_guid, vpath) => {
+			vpaths.push(vpath);
+		});
+		for (const vpath of vpaths) {
+			const guid = this.folderIndex.guidFor(vpath);
+			const entry = guid ? this.trackedEntries.get(guid) : undefined;
+			if (!entry) continue;
+			if (!(isDocument(entry) || isCanvasDocument(entry) || isAttachmentFile(entry))) continue;
+			this.transfers
+				.enqueueUpload(entry)
+				.catch((e: unknown) => this.warn("pending-upload requeue failed:", vpath, e));
+		}
+	}
+
 	/** Number of files still waiting for their first upload. */
 	public pendingUploadCount(): number {
 		let n = 0;
@@ -401,6 +424,7 @@ export class VaultShare extends ProviderBacked {
 			this.uploadRetryTimer = undefined;
 			if (this.isTornDown) return;
 			this._pruneStalePendingUploads();
+			this._requeuePendingUploads();
 			void this.adoptLocalFiles(false)
 				.catch((e: unknown) => this.warn("pending-upload retry failed:", e))
 				.finally(() => this._scheduleUploadRetry());
