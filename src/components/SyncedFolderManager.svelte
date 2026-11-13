@@ -28,6 +28,23 @@
 		dispatch("goBack", {});
 	}
 
+	const folderMissing = syncedFolder ? syncedFolder.folderMissing : false;
+	const pendingUploads = syncedFolder ? syncedFolder.pendingUploadCount() : 0;
+
+	async function removeLocalEntry(): Promise<void> {
+		// Local record only: the server share and other members' access are untouched.
+		if (syncedFolder) live.shareRegistry.delete(syncedFolder);
+		goHome();
+	}
+
+	async function relinkFolder(): Promise<void> {
+		// Recreates the missing folder at the share's own path; the share keeps
+		// its guid and the next sync repopulates it from the server.
+		if (!syncedFolder) return;
+		await live.app.vault.createFolder(syncedFolder.path);
+		dispatch("goBack", {});
+	}
+
 	// Both buttons re-trigger a debounced click guard on every render -- an
 	// inline `debounce(() => handler())` named here instead of wrapped in an
 	// extra arrow function.
@@ -48,6 +65,33 @@
 		it.
 	</p>
 </div>
+
+{#if folderMissing}
+	<ConfigSectionHeading heading="Folder not found" />
+	<SettingsCluster>
+		<ConfigRow
+			heading="Re-link folder"
+			caption="Recreates the folder at {syncedFolder.path} and reconnects it to the same shared folder. Files are downloaded again from the server."
+		>
+			<button on:click={debounce(relinkFolder)}>Re-link</button>
+		</ConfigRow>
+		<ConfigRow
+			heading="Remove from this device"
+			caption="Removes only this device's record of the shared folder. The shared folder on the server and other people's access are not changed."
+		>
+			<button class="mod-warning" on:click={debounce(removeLocalEntry)}>Remove</button>
+		</ConfigRow>
+	</SettingsCluster>
+{/if}
+
+{#if pendingUploads > 0}
+	<div style={NOTICE_WRAPPER_STYLE}>
+		<p style={NOTICE_TEXT_STYLE}>
+			{pendingUploads} file{pendingUploads === 1 ? "" : "s"} not uploaded yet. They stay on this
+			device and the upload is retried automatically.
+		</p>
+	</div>
+{/if}
 
 {#if syncedFolder}
 	<ConfigSectionHeading heading="Irreversible actions" />
