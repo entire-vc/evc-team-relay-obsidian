@@ -274,7 +274,6 @@ export class VaultShare extends ProviderBacked {
 			`${hostAppId}-evc-team-relay/folders/${this.entityGuid}/pendingUploads`,
 			this.obsidianApp,
 		);
-		this._pruneStalePendingUploads();
 
 		this.relayRegistry = relayRegistry;
 		this.workspaceId = workspaceId;
@@ -285,6 +284,7 @@ export class VaultShare extends ProviderBacked {
 
 		this.attachmentSettings = this._buildSyncSettingsManager();
 		this.folderIndex = this._buildSyncStore();
+		this._pruneStalePendingUploads();
 		this._wireSyncStoreListener();
 		this.docActivity = new DocActivityChannel(this.crdtDoc);
 
@@ -343,17 +343,92 @@ export class VaultShare extends ProviderBacked {
 		instanceLabels.set(this, this.path);
 	}
 
+	/**
+	 * Drops upload claims that can never complete: the file is gone, or it is
+	 * not syncable (e.g. `.artifacts/...` with a type this share does not
+	 * sync). A claim for a syncable file that IS on disk is kept: it is what
+	 * stops `_maybeDeleteOrphanedFile` from trashing a file that never reached
+	 * the server. Those are retried instead (`_scheduleUploadRetry`).
+	 */
 	private _pruneStalePendingUploads(): void {
+		const doomed: string[] = [];
 		this.uploadClaims.forEach((guid, vpath) => {
-			if (!this.hasFileSync(vpath)) {
-				this.warn(
-					"file behind this pending-upload record is gone, dropping it:",
-					vpath,
-					guid,
-				);
-				this.uploadClaims.delete(vpath);
+			if (this._claimIsUnfulfillable(vpath)) {
+				this.warn("dropping pending-upload record that cannot complete:", vpath, guid);
+				doomed.push(vpath);
 			}
 		});
+		for (const vpath of doomed) this.uploadClaims.delete(vpath);
+	}
+
+	private _claimIsUnfulfillable(vpath: string): boolean {
+		if (!this.hasFileSync(vpath)) return true;
+		const tfile = this.vaultApi.getAbstractFileByPath(
+			normalizePath(this.absolutePath(vpath)),
+		);
+		return !tfile || !this.isSyncableVaultFile(tfile);
+	}
+
+	/** Claims older than this are surfaced to the user (never auto-dropped). */
+	public static readonly STUCK_UPLOAD_MS = 7 * 24 * 60 * 60 * 1000;
+	private uploadRetryTimer?: number;
+	private uploadRetryAttempt = 0;
+	private static readonly UPLOAD_RETRY_BACKOFF_MS = [60_000, 300_000, 900_000, 3_600_000];
+
+	/**
+	 * Puts every already-tracked entry that still has a pending claim back on
+	 * the upload queue. `adoptLocalFiles` returns an existing tracked entry
+	 * without enqueueing it, so without this a failed attachment upload would
+	 * never be retried. `enqueueUpload` is a no-op while the guid is queued or
+	 * in flight, so repeated passes cannot duplicate work.
+	 */
+	private _requeuePendingUploads(): void {
+		const vpaths: string[] = [];
+		this.uploadClaims?.forEach((_guid, vpath) => {
+			vpaths.push(vpath);
+		});
+		for (const vpath of vpaths) {
+			const guid = this.folderIndex.guidFor(vpath);
+			const entry = guid ? this.trackedEntries.get(guid) : undefined;
+			if (!entry) continue;
+			if (!(isDocument(entry) || isCanvasDocument(entry) || isAttachmentFile(entry))) continue;
+			this.transfers
+				.enqueueUpload(entry)
+				.catch((e: unknown) => this.warn("pending-upload requeue failed:", vpath, e));
+		}
+	}
+
+	/** Number of files still waiting for their first upload. */
+	public pendingUploadCount(): number {
+		let n = 0;
+		this.uploadClaims?.forEach(() => {
+			n++;
+		});
+		return n;
+	}
+
+	/**
+	 * Re-runs adoption (ensureFileMetadata + upload enqueue) for files whose
+	 * claim is still pending, with backoff, until none remain.
+	 */
+	public _scheduleUploadRetry(): void {
+		if (this.isTornDown || this.uploadRetryTimer !== undefined) return;
+		if (this.pendingUploadCount() === 0) {
+			this.uploadRetryAttempt = 0;
+			return;
+		}
+		const steps = VaultShare.UPLOAD_RETRY_BACKOFF_MS;
+		const delay = steps[Math.min(this.uploadRetryAttempt, steps.length - 1)];
+		this.uploadRetryAttempt++;
+		this.uploadRetryTimer = window.setTimeout(() => {
+			this.uploadRetryTimer = undefined;
+			if (this.isTornDown) return;
+			this._pruneStalePendingUploads();
+			this._requeuePendingUploads();
+			void this.adoptLocalFiles(false)
+				.catch((e: unknown) => this.warn("pending-upload retry failed:", e))
+				.finally(() => this._scheduleUploadRetry());
+		}, delay);
 	}
 
 	private _buildSyncSettingsManager(): AttachmentSyncSettings {
@@ -470,6 +545,7 @@ export class VaultShare extends ProviderBacked {
 			if (freshlySynced && this._wantsConnection) await this.awaitFolderTreeReady();
 			await this.adoptLocalFiles(allowMint);
 			void this.scanFileTree(this.folderIndex);
+			this._scheduleUploadRetry();
 		}
 	}
 
@@ -1127,10 +1203,24 @@ export class VaultShare extends ProviderBacked {
 		return this.attachmentSettings.isFileTypeAllowed(vpath);
 	}
 
+	private missingFolderWarned = false;
+
+	/** True when no on-disk folder backs this share (deleted, moved, unmounted). */
+	public get folderMissing(): boolean {
+		return !resolveShareFolder(this.vaultApi, this.path);
+	}
+
 	private vaultFilesInScope(): TAbstractFile[] {
-		const folder = this.lookupTFolder(
-			`no on-disk folder backs this shared folder at ${this.path}`,
-		);
+		const resolved = resolveShareFolder(this.vaultApi, this.path);
+		if (!resolved) {
+			if (!this.missingFolderWarned) {
+				this.missingFolderWarned = true;
+				this.warn(`no on-disk folder backs this shared folder at ${this.path}; skipping`);
+			}
+			return [];
+		}
+		this.missingFolderWarned = false;
+		const folder = resolved;
 		const descendants: TAbstractFile[] = [];
 		Vault.recurseChildren(folder, (candidate: TAbstractFile) => {
 			if (candidate === folder) {
@@ -2245,6 +2335,11 @@ export class VaultShare extends ProviderBacked {
 				if (this.folderIndex.tracks(vpath)) {
 					continue;
 				}
+				// A claim for a file this share will never sync can never be
+				// fulfilled and would linger in pendingUploads forever.
+				if (!this.isSyncableVaultFile(file)) {
+					continue;
+				}
 				this.log("claiming a fresh guid for:", vpath);
 				this.folderIndex.new(vpath);
 				claimed.push(vpath);
@@ -2991,6 +3086,7 @@ export class VaultShare extends ProviderBacked {
 			doc.dismantle();
 			this.trackedEntries.delete(doc.entityGuid);
 		});
+		if (this.uploadRetryTimer !== undefined) window.clearTimeout(this.uploadRetryTimer);
 		this.folderIndex.destroy();
 		this.docActivity?.destroy();
 		this.attachmentSettings.destroy();
