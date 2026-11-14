@@ -116,7 +116,16 @@ export class TFolder {
 	}
 }
 
-export class Vault {}
+export class Vault {
+	/** Same contract as Obsidian's: visits `root` and every descendant. */
+	static recurseChildren(root: TFolder, cb: (file: TFile | TFolder) => unknown): void {
+		cb(root);
+		for (const child of root.children) {
+			if (child instanceof TFolder) Vault.recurseChildren(child, cb);
+			else cb(child);
+		}
+	}
+}
 
 /**
  * Enough of `WorkspaceLeaf`/`Workspace`/`ItemView` to let a module that

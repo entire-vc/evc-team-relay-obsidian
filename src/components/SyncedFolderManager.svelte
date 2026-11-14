@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { debounce } from "obsidian";
+	import { debounce, Notice } from "obsidian";
 	import { createEventDispatcher } from "svelte";
 	import type TeamRelayPlugin from "src/main";
 	import { type VaultShare } from "src/VaultShare";
@@ -29,7 +29,38 @@
 	}
 
 	const folderMissing = syncedFolder ? syncedFolder.folderMissing : false;
-	const pendingUploads = syncedFolder ? syncedFolder.pendingUploadCount() : 0;
+	let pendingUploads = syncedFolder ? syncedFolder.pendingUploadCount() : 0;
+	let stuckPaths: string[] = syncedFolder ? syncedFolder.stuckUploadPaths() : [];
+	let showStuck = false;
+	let retrying = false;
+
+	const relinkTargets: string[] =
+		folderMissing && syncedFolder ? live.shareRegistry.relinkTargets(syncedFolder) : [];
+	let relinkTarget = relinkTargets[0] ?? "";
+
+	function relinkToOther(): void {
+		if (!syncedFolder || !relinkTarget) return;
+		try {
+			live.shareRegistry.relink(syncedFolder, relinkTarget);
+		} catch (e: unknown) {
+			new Notice(`Re-link failed: ${e instanceof Error ? e.message : String(e)}`);
+			return;
+		}
+		new Notice(`Shared folder re-linked to ${relinkTarget}.`);
+		dispatch("goBack", {});
+	}
+
+	async function retryStuck(): Promise<void> {
+		if (!syncedFolder || retrying) return;
+		retrying = true;
+		try {
+			await syncedFolder.retryPendingUploads();
+		} finally {
+			retrying = false;
+			pendingUploads = syncedFolder.pendingUploadCount();
+			stuckPaths = syncedFolder.stuckUploadPaths();
+		}
+	}
 
 	async function removeLocalEntry(): Promise<void> {
 		// Local record only: the server share and other members' access are untouched.
@@ -70,10 +101,23 @@
 	<ConfigSectionHeading heading="Folder not found" />
 	<SettingsCluster>
 		<ConfigRow
-			heading="Re-link folder"
+			heading="Recreate folder"
 			caption="Recreates the folder at {syncedFolder.path} and reconnects it to the same shared folder. Files are downloaded again from the server."
 		>
-			<button on:click={debounce(relinkFolder)}>Re-link</button>
+			<button on:click={debounce(relinkFolder)}>Recreate</button>
+		</ConfigRow>
+		<ConfigRow
+			heading="Re-link to another folder"
+			caption={relinkTargets.length > 0
+				? "Connects an existing folder in this vault to the same shared folder. Its files are synced with the server."
+				: "No folder in this vault can be used: every folder is shared already or contains a shared folder."}
+		>
+			<select class="dropdown" bind:value={relinkTarget} disabled={relinkTargets.length === 0}>
+				{#each relinkTargets as target (target)}
+					<option value={target}>{target}</option>
+				{/each}
+			</select>
+			<button disabled={!relinkTarget} on:click={debounce(relinkToOther)}>Re-link</button>
 		</ConfigRow>
 		<ConfigRow
 			heading="Remove from this device"
@@ -82,6 +126,30 @@
 			<button class="mod-warning" on:click={debounce(removeLocalEntry)}>Remove</button>
 		</ConfigRow>
 	</SettingsCluster>
+{/if}
+
+{#if stuckPaths.length > 0}
+	<ConfigSectionHeading heading="Files not uploaded" />
+	<SettingsCluster>
+		<ConfigRow
+			heading="{stuckPaths.length} file{stuckPaths.length === 1 ? '' : 's'} not uploaded"
+			caption="Waiting for upload for more than 7 days. The files stay on this device."
+		>
+			<button on:click={() => (showStuck = !showStuck)}>
+				{showStuck ? "Hide files" : "Show files"}
+			</button>
+			<button class="mod-cta" disabled={retrying} on:click={debounce(retryStuck)}>
+				{retrying ? "Retrying..." : "Retry"}
+			</button>
+		</ConfigRow>
+	</SettingsCluster>
+	{#if showStuck}
+		<ul class="evc-stuck-upload-list">
+			{#each stuckPaths as path (path)}
+				<li>{path}</li>
+			{/each}
+		</ul>
+	{/if}
 {/if}
 
 {#if pendingUploads > 0}
