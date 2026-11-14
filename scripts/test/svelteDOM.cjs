@@ -21,9 +21,19 @@ function loadSvelteComponent(filename, dependencies = {}) {
 		import config from "./svelte.config.mjs";
 		const filename = process.argv[1];
 		const options = { ...config.compilerOptions };
-		const processed = await preprocess(fs.readFileSync(filename, "utf8"), config.preprocess, { filename });
-		const compiled = compile(processed.code, { ...options, filename, dev: true });
+		const compileFile = async (file) => {
+			const processed = await preprocess(fs.readFileSync(file, "utf8"), config.preprocess, { filename: file });
+			return compile(processed.code, { ...options, filename: file, dev: true }).js.code;
+		};
+		// Child components (import X from "./X.svelte") compile the same way.
+		const sveltePlugin = { name: "svelte", setup(b) {
+			b.onLoad({ filter: /\.svelte$/ }, async (args) => ({
+				contents: await compileFile(args.path), loader: "js", resolveDir: path.dirname(args.path),
+			}));
+		} };
+		const compiled = { js: { code: await compileFile(filename) } };
 		const bundle = await build({
+			plugins: [sveltePlugin],
 			stdin: {
 				contents: compiled.js.code + '\\nexport { flushSync, mount } from "svelte";' +
 					'\\nexport { mountComponent } from ' + JSON.stringify(path.resolve("src/svelteMount.ts")) + ';',

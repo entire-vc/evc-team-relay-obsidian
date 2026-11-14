@@ -1,12 +1,14 @@
 <script lang="ts">
-	import { debounce } from "obsidian";
+	import { debounce, Notice } from "obsidian";
 	import { createEventDispatcher } from "svelte";
 	import type TeamRelayPlugin from "src/main";
 	import { type VaultShare } from "src/VaultShare";
+	import { uploadNotice } from "src/stuckUploads";
 	import NavTrail from "./NavTrail.svelte";
 	import SettingsCluster from "./SettingsCluster.svelte";
 	import ConfigRow from "./ConfigRow.svelte";
 	import ConfigSectionHeading from "./ConfigSectionHeading.svelte";
+	import StuckUploadsBlock from "./StuckUploadsBlock.svelte";
 
 	export let live: TeamRelayPlugin;
 	export let syncedFolder: VaultShare;
@@ -29,7 +31,38 @@
 	}
 
 	const folderMissing = syncedFolder ? syncedFolder.folderMissing : false;
-	const pendingUploads = syncedFolder ? syncedFolder.pendingUploadCount() : 0;
+	let pendingUploads = syncedFolder ? syncedFolder.pendingUploadCount() : 0;
+	let stuckPaths: string[] = syncedFolder ? syncedFolder.stuckUploadPaths() : [];
+	$: notice = uploadNotice(pendingUploads, stuckPaths.length);
+	let retrying = false;
+
+	const relinkTargets: string[] =
+		folderMissing && syncedFolder ? live.shareRegistry.relinkTargets(syncedFolder) : [];
+	let relinkTarget = relinkTargets[0] ?? "";
+
+	function relinkToOther(): void {
+		if (!syncedFolder || !relinkTarget) return;
+		try {
+			live.shareRegistry.relink(syncedFolder, relinkTarget);
+		} catch (e: unknown) {
+			new Notice(`Re-link failed: ${e instanceof Error ? e.message : String(e)}`);
+			return;
+		}
+		new Notice(`Shared folder re-linked to ${relinkTarget}.`);
+		dispatch("goBack", {});
+	}
+
+	async function retryStuck(): Promise<void> {
+		if (!syncedFolder || retrying) return;
+		retrying = true;
+		try {
+			await syncedFolder.retryPendingUploads();
+		} finally {
+			retrying = false;
+			pendingUploads = syncedFolder.pendingUploadCount();
+			stuckPaths = syncedFolder.stuckUploadPaths();
+		}
+	}
 
 	async function removeLocalEntry(): Promise<void> {
 		// Local record only: the server share and other members' access are untouched.
@@ -70,10 +103,23 @@
 	<ConfigSectionHeading heading="Folder not found" />
 	<SettingsCluster>
 		<ConfigRow
-			heading="Re-link folder"
+			heading="Recreate folder"
 			caption="Recreates the folder at {syncedFolder.path} and reconnects it to the same shared folder. Files are downloaded again from the server."
 		>
-			<button on:click={debounce(relinkFolder)}>Re-link</button>
+			<button on:click={debounce(relinkFolder)}>Recreate</button>
+		</ConfigRow>
+		<ConfigRow
+			heading="Re-link to another folder"
+			caption={relinkTargets.length > 0
+				? "Connects an existing folder in this vault to the same shared folder. Its files are synced with the server."
+				: "No folder in this vault can be used: every folder is shared already or contains a shared folder."}
+		>
+			<select class="dropdown" bind:value={relinkTarget} disabled={relinkTargets.length === 0}>
+				{#each relinkTargets as target (target)}
+					<option value={target}>{target}</option>
+				{/each}
+			</select>
+			<button disabled={!relinkTarget} on:click={debounce(relinkToOther)}>Re-link</button>
 		</ConfigRow>
 		<ConfigRow
 			heading="Remove from this device"
@@ -84,10 +130,18 @@
 	</SettingsCluster>
 {/if}
 
-{#if pendingUploads > 0}
+{#if notice?.kind === "stuck"}
+	<ConfigSectionHeading heading="Files not uploaded" />
+	<StuckUploadsBlock
+		{stuckPaths}
+		more={notice.more}
+		{retrying}
+		onRetry={debounce(retryStuck)}
+	/>
+{:else if notice?.kind === "pending"}
 	<div style={NOTICE_WRAPPER_STYLE}>
 		<p style={NOTICE_TEXT_STYLE}>
-			{pendingUploads} file{pendingUploads === 1 ? "" : "s"} not uploaded yet. They stay on this
+			{notice.count} file{notice.count === 1 ? "" : "s"} not uploaded yet. They stay on this
 			device and the upload is retried automatically.
 		</p>
 	</div>

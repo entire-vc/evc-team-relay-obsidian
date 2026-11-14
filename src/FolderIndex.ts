@@ -81,6 +81,8 @@ export class FolderIndex extends Notifier<FolderIndex> {
 		private scopePath: string,
 		public mintedGuids: Map<string, string>,
 		private attachmentSettings: AttachmentSyncSettings,
+		/** Told about every guid `new()` mints, so the owner can stamp the claim's age. */
+		private onMinted?: (vpath: string, guid: string) => void,
 	) {
 		super();
 		this.flatIdMap = this.crdt.getMap("docs");
@@ -163,6 +165,7 @@ export class FolderIndex extends Notifier<FolderIndex> {
 		this.requireVirtualPath(vpath);
 		const guid = uuidv4();
 		this.mintedGuids.set(vpath, guid);
+		this.onMinted?.(vpath, guid);
 		return guid;
 	}
 

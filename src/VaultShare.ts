@@ -80,6 +80,8 @@ import {
 	hasUnsyncedCanvasEdit,
 } from "./preserveBeforeTrash";
 import { LostClaimSettler, preserveThenAdopt, settleLostClaim } from "./lostClaimWinner";
+import { STUCK_UPLOAD_MS, reconcileClaimAges, stuckClaimPaths } from "./stuckUploads";
+import { relinkCandidates, relinkTargetError } from "./shareRelink";
 import type { CanvasData } from "./HostCanvasView";
 import {
 	claimVpathIfUnclaimed,
@@ -189,6 +191,8 @@ export class VaultShare extends ProviderBacked {
 	private discardedFolderNodes = new WeakSet<TAbstractFile>();
 	private deletedEntryRoots = new WeakMap<SyncableEntry, string>();
 	private uploadClaims: VaultScopedMap<string>;
+	/** guid -> ms when its upload claim was first seen (see stuckUploads.ts). */
+	private uploadClaimAges?: VaultScopedMap<number>;
 
 	// -- Remote / connection state --
 	_linked?: RemoteFolderRecord;
@@ -282,9 +286,16 @@ export class VaultShare extends ProviderBacked {
 
 		this.isAuthority = !hasPendingUpdates;
 
+		this.uploadClaimAges = new VaultScopedMap<number>(
+			`${hostAppId}-evc-team-relay/folders/${this.entityGuid}/pendingUploadsSince`,
+			this.obsidianApp,
+		);
 		this.attachmentSettings = this._buildSyncSettingsManager();
 		this.folderIndex = this._buildSyncStore();
 		this._pruneStalePendingUploads();
+		// Claims written before ages were tracked get the file's mtime: it
+		// makes an already month-old claim visible at once.
+		this._reconcileUploadClaimAges();
 		this._wireSyncStoreListener();
 		this.docActivity = new DocActivityChannel(this.crdtDoc);
 
@@ -370,7 +381,67 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	/** Claims older than this are surfaced to the user (never auto-dropped). */
-	public static readonly STUCK_UPLOAD_MS = 7 * 24 * 60 * 60 * 1000;
+	public static readonly STUCK_UPLOAD_MS = STUCK_UPLOAD_MS;
+
+	private _fileMtime(vpath: string): number | undefined {
+		const tfile = this.vaultApi.getAbstractFileByPath(normalizePath(this.absolutePath(vpath)));
+		const mtime = (tfile as TFile | null)?.stat?.mtime;
+		return typeof mtime === "number" ? mtime : undefined;
+	}
+
+	/**
+	 * Ages are stamped when a claim is minted (`FolderIndex.new`); this only
+	 * backfills a claim that has none (written before ages were tracked) with
+	 * the file's mtime, and drops ages of finished claims.
+	 */
+	private _reconcileUploadClaimAges(): void {
+		if (!this.uploadClaimAges) return;
+		reconcileClaimAges(
+			this.uploadClaims,
+			this.uploadClaimAges,
+			(vpath) => this._fileMtime(vpath) ?? Date.now(),
+		);
+	}
+
+	/** Records when a new upload claim appeared, before anyone reads it. */
+	private _stampClaimAge(guid: string): void {
+		if (this.uploadClaimAges && this.uploadClaimAges.get(guid) === undefined) {
+			this.uploadClaimAges.set(guid, Date.now());
+		}
+	}
+
+	/**
+	 * Files whose first upload has been pending for more than `STUCK_UPLOAD_MS`.
+	 * Read-only: reading never stamps an age, so opening the panel cannot
+	 * restart the clock of a claim.
+	 */
+	public stuckUploadPaths(now: number = Date.now()): string[] {
+		if (!this.uploadClaimAges) return [];
+		return stuckClaimPaths(this.uploadClaims, this.uploadClaimAges, now, STUCK_UPLOAD_MS);
+	}
+
+	/**
+	 * User-requested retry of every pending upload: drops claims that can never
+	 * complete, re-enqueues tracked entries and re-runs adoption now, then
+	 * resumes the backoff timer from its first step.
+	 */
+	public async retryPendingUploads(): Promise<void> {
+		if (this.isTornDown) return;
+		if (this.uploadRetryTimer !== undefined) {
+			window.clearTimeout(this.uploadRetryTimer);
+			this.uploadRetryTimer = undefined;
+		}
+		this.uploadRetryAttempt = 0;
+		this._pruneStalePendingUploads();
+		this._requeuePendingUploads();
+		try {
+			await this.adoptLocalFiles(false);
+		} catch (e: unknown) {
+			this.warn("pending-upload retry failed:", e);
+		}
+		this._reconcileUploadClaimAges();
+		this._scheduleUploadRetry();
+	}
 	private uploadRetryTimer?: number;
 	private uploadRetryAttempt = 0;
 	private static readonly UPLOAD_RETRY_BACKOFF_MS = [60_000, 300_000, 900_000, 3_600_000];
@@ -427,7 +498,10 @@ export class VaultShare extends ProviderBacked {
 			this._requeuePendingUploads();
 			void this.adoptLocalFiles(false)
 				.catch((e: unknown) => this.warn("pending-upload retry failed:", e))
-				.finally(() => this._scheduleUploadRetry());
+				.finally(() => {
+					this._reconcileUploadClaimAges();
+					this._scheduleUploadRetry();
+				});
 		}, delay);
 	}
 
@@ -444,6 +518,7 @@ export class VaultShare extends ProviderBacked {
 			this.path,
 			this.uploadClaims,
 			this.attachmentSettings,
+			(_vpath, guid) => this._stampClaimAge(guid),
 		);
 	}
 
@@ -3160,6 +3235,41 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 	}
 
 	notifyDebounced = debounce(() => this.notifySubscribers(), 100);
+
+	private _otherSharePaths(share: VaultShare): string[] {
+		return this.toArray()
+			.filter((other) => other !== share)
+			.map((other) => other.path);
+	}
+
+	/** Existing vault folders `share` can be re-linked to. */
+	relinkTargets(share: VaultShare): string[] {
+		const folders = this.vaultApi
+			.getAllLoadedFiles()
+			.filter((f): f is TFolder => f instanceof TFolder)
+			.map((f) => f.path);
+		return relinkCandidates(folders, share.path, this._otherSharePaths(share), sep);
+	}
+
+	/**
+	 * Points the local record of `share` at another existing vault folder
+	 * (same guid, same server share), then runs a full sync pass on it -- the
+	 * same move a rename of the share's folder makes, for a folder that
+	 * vanished from its old path. Throws with a user-facing reason when
+	 * `target` cannot be used.
+	 */
+	relink(share: VaultShare, target: string): void {
+		const error = relinkTargetError(target, share.path, this._otherSharePaths(share), sep);
+		if (error) throw new Error(error);
+		if (!(this.vaultApi.getAbstractFileByPath(target) instanceof TFolder)) {
+			throw new Error(`No folder at ${target}.`);
+		}
+		share.relocate(target);
+		this.notifySubscribers();
+		void share
+			.refreshFromServer()
+			.catch((e: unknown) => this.warn(`sync after re-link to ${target} failed:`, e));
+	}
 
 	public get registry(): RelayRegistry {
 		return this.relayRegistry;
