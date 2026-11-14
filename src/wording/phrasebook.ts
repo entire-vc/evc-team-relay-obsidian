@@ -153,6 +153,9 @@ export const englishPhrasebook = {
 
 	"shareDetail.localFolder.heading": "Local Folder",
 	"shareDetail.localFolder.connectedStatus": "Connected and syncing",
+	"shareDetail.localFolder.missingStatus":
+		"Folder not found. Nothing syncs until it is re-linked or recreated.",
+	"shareDetail.localFolder.fixButton": "Fix folder",
 	"shareDetail.localFolder.notConnectedStatus":
 		"Not connected to a local folder",
 	"shareDetail.localFolder.disconnectButton": "Disconnect",
@@ -604,6 +607,9 @@ export const ruPhrasebook = {
 
 	"shareDetail.localFolder.heading": "Локальная папка",
 	"shareDetail.localFolder.connectedStatus": "Подключено и синхронизируется",
+	"shareDetail.localFolder.missingStatus":
+		"Папка не найдена. Синхронизации нет, пока папку не привяжут заново или не создадут.",
+	"shareDetail.localFolder.fixButton": "Исправить папку",
 	"shareDetail.localFolder.notConnectedStatus":
 		"Не подключено к локальной папке",
 	"shareDetail.localFolder.disconnectButton": "Отключить",

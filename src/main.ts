@@ -127,6 +127,7 @@ import { QuickShareModal } from "./ui/QuickShareModal";
 import { confirmDialog } from "./ui/dialogs";
 import { VaultScopedMap } from "./VaultScopedMap";
 import { collectWebFolderItems, isRootSharePath, joinFolderPath, resolveShareFolder } from "./vaultRootPath";
+import { FolderShareTracker } from "./FolderShareTracker";
 
 interface LoggingSettings {
 	debugging: boolean;
@@ -815,18 +816,13 @@ export default class TeamRelayPlugin extends Plugin {
 			// menu, the share view or the management modal) leaves the
 			// registry; stop polling a share that no longer has a VaultShare
 			// or, for one polled by path alone, its folder.
-			this.register(
-				this.shareRegistry.on(() => {
-					// A share polled by path that now has a VaultShare follows the
-					// VaultShare from here on: disconnecting it stops the polling.
-					for (const shareId of [...this.pathOnlyPolledShares.keys()]) {
-						if (this.shareRegistry.locate((sf) => sf.entityGuid === shareId)) {
-							this.pathOnlyPolledShares.delete(shareId);
-						}
-					}
-					this.inboundSyncPoller?.retainOnly(this.keepPollingShare);
-				}),
+			const folderShares = new FolderShareTracker(
+				this.shareRegistry,
+				this.app.vault,
+				() => this.inboundSyncPoller,
 			);
+			this.folderShares = folderShares;
+			this.register(this.shareRegistry.on(() => folderShares.onRegistryChange()));
 		}
 
 		// Add status bar item for Relay On-Prem (v1.8.2)
@@ -1272,6 +1268,8 @@ export default class TeamRelayPlugin extends Plugin {
 			this.webSyncManager?.onFileRenamed(file.path, oldPath);
 			return;
 		}
+		// A folder moved back to a dormant share's path starts that share.
+		if (file instanceof TFolder) this.shareRegistry.wakeAt(file.path);
 
 		const fromFolder = this.shareRegistry.shareFor(oldPath);
 		const toFolder = this.shareRegistry.shareFor(file.path);
@@ -1294,41 +1292,16 @@ export default class TeamRelayPlugin extends Plugin {
 		this.webSyncManager?.onFileRenamed(file.path, oldPath);
 	}
 
-	/**
-	 * Folder shares polled because a folder sits at their path although no
-	 * VaultShare was made for it; keyed by share id, valued by that path.
-	 */
-	private pathOnlyPolledShares = new Map<string, string>();
+	/** Share-list routing of folder shares to the inbound poller; see FolderShareTracker. */
+	private folderShares?: FolderShareTracker;
 
-	/** Whether a polled share still has a VaultShare, or still has its folder. */
-	private keepPollingShare = (shareId: string): boolean => {
-		if (this.shareRegistry.locate((sf) => sf.entityGuid === shareId)) return true;
-		const path = this.pathOnlyPolledShares.get(shareId);
-		return path !== undefined && !!resolveShareFolder(this.app.vault, path);
-	};
-
-	/**
-	 * Hand a folder share from the share list to the inbound poller: polled
-	 * if it has a VaultShare or a folder in this vault, otherwise checked
-	 * from the listed timestamp.
-	 */
 	private trackFolderShare(
 		shareId: string,
 		serverId: string,
 		sharePath: string,
 		listedUpdatedAt: string | null | undefined,
 	): void {
-		if (!this.inboundSyncPoller) return;
-		// Re-run after a listed check's download: once it has written the
-		// folder, the share is polled.
-		const isLocal = (): boolean => {
-			const registered = !!this.shareRegistry.locate((sf) => sf.entityGuid === shareId);
-			const pathOnly = !registered && !!resolveShareFolder(this.app.vault, sharePath);
-			if (pathOnly) this.pathOnlyPolledShares.set(shareId, sharePath);
-			else this.pathOnlyPolledShares.delete(shareId);
-			return registered || pathOnly;
-		};
-		this.inboundSyncPoller.track(shareId, serverId, isLocal(), listedUpdatedAt, isLocal);
+		this.folderShares?.track(shareId, serverId, sharePath, listedUpdatedAt);
 	}
 
 	private async loadRelayOnPremShares() {
@@ -1361,7 +1334,10 @@ export default class TeamRelayPlugin extends Plugin {
 						) : undefined;
 						const existing = byGuid || byPath;
 
-						if (existing && (existing.entityGuid !== share.id || !existing.workspaceId)) {
+						if (existing?.isDormant) {
+							// Restored without its folder: waits for Re-link or Recreate.
+							log(`Share "${share.path}" has no local folder (${existing.path}); not connecting`);
+						} else if (existing && (existing.entityGuid !== share.id || !existing.workspaceId)) {
 							// Migrate: guid mismatch or missing workspaceId — recreate
 							log(`Migrating VaultShare ${share.path} (guid: ${existing.entityGuid} → ${share.id})`);
 							this.shareRegistry.delete(existing);
@@ -1458,7 +1434,10 @@ export default class TeamRelayPlugin extends Plugin {
 						) : undefined;
 						const existing = byGuid || byPath;
 
-						if (existing && (existing.entityGuid !== share.id || !existing.workspaceId)) {
+						if (existing?.isDormant) {
+							// Restored without its folder: waits for Re-link or Recreate.
+							log(`Share "${share.path}" has no local folder (${existing.path}); not connecting`);
+						} else if (existing && (existing.entityGuid !== share.id || !existing.workspaceId)) {
 							// Migrate: guid mismatch or missing workspaceId — recreate
 							log(`Migrating VaultShare ${share.path} (guid: ${existing.entityGuid} → ${share.id})`);
 							this.shareRegistry.delete(existing);
@@ -1638,7 +1617,9 @@ export default class TeamRelayPlugin extends Plugin {
 			for (const share of shares) {
 				if (share.kind === "folder") {
 					const folder = this.shareRegistry.locate(sf => sf.entityGuid === share.id);
-					if (folder) {
+					if (folder?.isDormant) {
+						// No local folder: nothing to sync until Re-link or Recreate.
+					} else if (folder) {
 						void folder.bringOnline();
 						relaySynced++;
 					} else {
@@ -1992,6 +1973,8 @@ export default class TeamRelayPlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("create", (tfile) => {
 				// NOTE: Obsidian fires this for every existing file on vault load too.
+				// Recreate (or any new folder at that path) starts a dormant share.
+				if (tfile instanceof TFolder) this.shareRegistry.wakeAt(tfile.path);
 				const folder = this.shareRegistry.shareFor(tfile.path);
 				if (folder) {
 					// claimAndUploadFile() runs the same upload-claim protection
@@ -2010,8 +1993,8 @@ export default class TeamRelayPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
-				if (file instanceof TFolder && this.pathOnlyPolledShares.size > 0) {
-					this.inboundSyncPoller?.retainOnly(this.keepPollingShare);
+				if (file instanceof TFolder && this.folderShares?.hasPathOnlyShares) {
+					this.folderShares.retain();
 				}
 				if (file instanceof TFolder) {
 					const folder = this.shareRegistry.locate(

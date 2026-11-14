@@ -608,11 +608,18 @@
 	// Local folder connection
 	let isConnectedLocally = false;
 	let localFolderPath = "";
+	let localFolderMissing = false;
 
 	function checkLocalConnection() {
 		const localFolder = live.shareRegistry.locate((sf) => sf.entityGuid === share.id);
 		isConnectedLocally = !!localFolder;
 		localFolderPath = localFolder ? localFolder.path : "";
+		localFolderMissing = localFolder ? localFolder.folderMissing : false;
+	}
+
+	/** Opens Synced folders -> "Folder not found" (Re-link, Recreate, Remove). */
+	function fixFolder() {
+		void live.showSettingsTab(`/shared-folders?id=${share.id}`);
 	}
 
 	// Check on mount and whenever loading finishes
@@ -680,16 +687,27 @@
 					<div class="evc-connection-row">
 						<div class="evc-connection-info">
 							<span class="evc-connection-path">{localFolderPath}</span>
-							<span class="evc-connection-status">{uiText("shareDetail.localFolder.connectedStatus")}</span>
+							{#if localFolderMissing}
+								<span class="evc-connection-status evc-connection-missing">{uiText("shareDetail.localFolder.missingStatus")}</span>
+							{:else}
+								<span class="evc-connection-status">{uiText("shareDetail.localFolder.connectedStatus")}</span>
+							{/if}
 						</div>
-						<button class="evc-btn-danger evc-small-btn" on:click={disconnectFolder}>{uiText("shareDetail.localFolder.disconnectButton")}</button>
+						<div class="evc-connection-actions">
+							{#if localFolderMissing}
+								<button class="mod-cta evc-small-btn" on:click={fixFolder}>{uiText("shareDetail.localFolder.fixButton")}</button>
+							{/if}
+							<button class="evc-btn-danger evc-small-btn" on:click={disconnectFolder}>{uiText("shareDetail.localFolder.disconnectButton")}</button>
+						</div>
 					</div>
 				{:else}
 					<div class="evc-connection-row">
 						<div class="evc-connection-info">
 							<span class="evc-connection-status">{uiText("shareDetail.localFolder.notConnectedStatus")}</span>
 						</div>
-						<button class="mod-cta" on:click={connectToFolder}>{uiText("shareDetail.localFolder.connectButton")}</button>
+						<div class="evc-connection-actions">
+							<button class="mod-cta" on:click={connectToFolder}>{uiText("shareDetail.localFolder.connectButton")}</button>
+						</div>
 					</div>
 				{/if}
 			</div>
@@ -996,13 +1014,23 @@
 		background: var(--background-secondary);
 		border-radius: 6px;
 		gap: 12px;
+		flex-wrap: wrap;
 	}
 
+	/* Keeps the status readable on a narrow pane: the buttons move below it. */
 	.evc-connection-info {
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
+		flex: 1 1 14em;
 		min-width: 0;
+	}
+
+	.evc-connection-actions {
+		display: flex;
+		gap: 8px;
+		flex-shrink: 0;
+		margin-left: auto;
 	}
 
 	.evc-connection-path {
@@ -1013,6 +1041,10 @@
 	.evc-connection-status {
 		font-size: 0.85em;
 		color: var(--text-muted);
+	}
+
+	.evc-connection-missing {
+		color: var(--text-error);
 	}
 
 	/* Members */

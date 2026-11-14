@@ -92,12 +92,15 @@
 
 <NavTrail waypoints={crumbs} />
 
-<div style={NOTICE_WRAPPER_STYLE}>
-	<p style={NOTICE_TEXT_STYLE}>
-		This Shared Folder is not on a Relay Server, or else you do not have permission to access
-		it.
-	</p>
-</div>
+<!-- Off for a missing folder: the share is fine, its folder is what is gone. -->
+{#if !folderMissing}
+	<div style={NOTICE_WRAPPER_STYLE}>
+		<p style={NOTICE_TEXT_STYLE}>
+			This Shared Folder is not on a Relay Server, or else you do not have permission to access
+			it.
+		</p>
+	</div>
+{/if}
 
 {#if folderMissing}
 	<ConfigSectionHeading heading="Folder not found" />

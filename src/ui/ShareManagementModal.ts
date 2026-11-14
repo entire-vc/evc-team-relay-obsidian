@@ -497,24 +497,41 @@ export class ShareManagementModal extends Modal {
 		contentEl.createEl("h4", { text: "Local folder" });
 
 		if (localFolder) {
-			new Setting(contentEl)
+			const missing = localFolder.folderMissing;
+			const row = new Setting(contentEl)
 				.setName(localFolder.path)
-				.setDesc("Connected and syncing")
-				.addButton((button) => {
-					setDestructiveButton(button)
-						.setButtonText("Disconnect")
-						.onClick(async () => {
-							const ok = await confirmDialog(
-								this.app,
-								`Disconnect local folder "${localFolder.path}" from this share? Local files will not be deleted.`
-							);
-							if (!ok) return;
-							this.plugin.shareRegistry.delete(localFolder);
-							this.plugin.explorerDecorations?.refreshExistingRows();
-							new Notice("Folder disconnected");
-							this.renderContent();
+				.setDesc(
+					missing
+						? "Folder not found. Nothing syncs until it is re-linked or recreated."
+						: "Connected and syncing",
+				);
+			if (missing) {
+				// Synced folders -> "Folder not found": Re-link, Recreate, Remove.
+				row.addButton((button) => {
+					button
+						.setButtonText("Fix folder")
+						.setCta()
+						.onClick(() => {
+							this.close();
+							void this.plugin.showSettingsTab(`/shared-folders?id=${localFolder.entityGuid}`);
 						});
 				});
+			}
+			row.addButton((button) => {
+				setDestructiveButton(button)
+					.setButtonText("Disconnect")
+					.onClick(async () => {
+						const ok = await confirmDialog(
+							this.app,
+							`Disconnect local folder "${localFolder.path}" from this share? Local files will not be deleted.`
+						);
+						if (!ok) return;
+						this.plugin.shareRegistry.delete(localFolder);
+						this.plugin.explorerDecorations?.refreshExistingRows();
+						new Notice("Folder disconnected");
+						this.renderContent();
+					});
+			});
 		} else {
 			new Setting(contentEl)
 				.setName("Not connected")
