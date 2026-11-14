@@ -1,4 +1,7 @@
 import { TFile, TFolder, type TAbstractFile } from "obsidian";
+import * as Y from "yjs";
+import type { AttachmentSyncSettings } from "../src/AttachmentSyncSettings";
+import type { FolderIndex } from "../src/FolderIndex";
 import { ShareRegistry, VaultShare } from "../src/VaultShare";
 import { STUCK_UPLOAD_MS, uploadNotice } from "../src/stuckUploads";
 
@@ -122,17 +125,53 @@ describe("files not uploaded for more than 7 days", () => {
 		expect(STUCK_UPLOAD_MS).toBe(7 * DAY);
 	});
 
-	test("a claim without an age is stamped, and an age without a claim is dropped", () => {
+	test("a new claim gets its age when it is minted, not when the panel first reads it", () => {
+		// Empty start: no claims, so no retry timer and no reconcile runs later.
+		const t0 = Date.UTC(2026, 10, 1);
+		const claims = new Map<string, string>();
+		const ages = new Map<string, number>();
+		const { share } = makeShare("Shared", makeVault({ Shared: [] }), {
+			uploadClaims: claims,
+			uploadClaimAges: ages,
+			crdtDoc: new Y.Doc(),
+			attachmentSettings: {
+				subscribe: () => () => {},
+				isFileTypeAllowed: () => true,
+			} as unknown as AttachmentSyncSettings,
+		});
+		const index = (share as unknown as { _buildSyncStore(): FolderIndex })
+			._buildSyncStore();
+		const now = jest.spyOn(Date, "now").mockReturnValue(t0);
+		try {
+			index.new("late.md");
+		} finally {
+			now.mockRestore();
+		}
+		// First look at the panel eight days later.
+		expect(share.stuckUploadPaths(t0 + 8 * DAY)).toEqual(["late.md"]);
+		expect(share.stuckUploadPaths(t0 + 8 * DAY)).toEqual(["late.md"]);
+	});
+
+	test("reading never stamps an age; reconcile backfills with mtime and drops finished ages", () => {
 		const now = Date.now();
 		const claims = new Map([["fresh.md", "g-fresh"]]);
 		const ages = new Map([["g-done", now - 30 * DAY]]);
-		const { share } = makeShare("Shared", makeVault({ Shared: ["fresh.md"] }), {
+		const vault = makeVault({ Shared: ["fresh.md"] });
+		const { share } = makeShare("Shared", vault, {
 			uploadClaims: claims,
 			uploadClaimAges: ages,
 		});
 		expect(share.stuckUploadPaths(now)).toEqual([]);
+		expect(ages.has("g-fresh")).toBe(false);
+
+		const mtime = now - 20 * DAY;
+		const file = vault.nodes.get("Shared/fresh.md");
+		if (!(file instanceof TFile)) throw new Error("fixture: Shared/fresh.md is not a file");
+		file.stat.mtime = mtime;
+		(share as unknown as { _reconcileUploadClaimAges(): void })._reconcileUploadClaimAges();
 		expect(ages.has("g-done")).toBe(false);
-		expect(ages.get("g-fresh")).toBeGreaterThanOrEqual(now - 1000);
+		expect(ages.get("g-fresh")).toBe(mtime);
+		expect(share.stuckUploadPaths(now)).toEqual(["fresh.md"]);
 	});
 });
 

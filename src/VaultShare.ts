@@ -286,17 +286,16 @@ export class VaultShare extends ProviderBacked {
 
 		this.isAuthority = !hasPendingUpdates;
 
-		this.attachmentSettings = this._buildSyncSettingsManager();
-		this.folderIndex = this._buildSyncStore();
-		this._pruneStalePendingUploads();
 		this.uploadClaimAges = new VaultScopedMap<number>(
 			`${hostAppId}-evc-team-relay/folders/${this.entityGuid}/pendingUploadsSince`,
 			this.obsidianApp,
 		);
-		// Claims written before ages were tracked get the file's mtime: the
-		// claim cannot be older than the file content it is waiting to upload
-		// is recent, and it makes an already month-old claim visible at once.
-		this._reconcileUploadClaimAges((vpath) => this._fileMtime(vpath) ?? Date.now());
+		this.attachmentSettings = this._buildSyncSettingsManager();
+		this.folderIndex = this._buildSyncStore();
+		this._pruneStalePendingUploads();
+		// Claims written before ages were tracked get the file's mtime: it
+		// makes an already month-old claim visible at once.
+		this._reconcileUploadClaimAges();
 		this._wireSyncStoreListener();
 		this.docActivity = new DocActivityChannel(this.crdtDoc);
 
@@ -390,16 +389,34 @@ export class VaultShare extends ProviderBacked {
 		return typeof mtime === "number" ? mtime : undefined;
 	}
 
-	/** Stamps claims that have no age yet with `firstSeen`, drops ages of finished claims. */
-	private _reconcileUploadClaimAges(firstSeen: (vpath: string) => number = () => Date.now()): void {
+	/**
+	 * Ages are stamped when a claim is minted (`FolderIndex.new`); this only
+	 * backfills a claim that has none (written before ages were tracked) with
+	 * the file's mtime, and drops ages of finished claims.
+	 */
+	private _reconcileUploadClaimAges(): void {
 		if (!this.uploadClaimAges) return;
-		reconcileClaimAges(this.uploadClaims, this.uploadClaimAges, firstSeen);
+		reconcileClaimAges(
+			this.uploadClaims,
+			this.uploadClaimAges,
+			(vpath) => this._fileMtime(vpath) ?? Date.now(),
+		);
 	}
 
-	/** Files whose first upload has been pending for more than `STUCK_UPLOAD_MS`. */
+	/** Records when a new upload claim appeared, before anyone reads it. */
+	private _stampClaimAge(guid: string): void {
+		if (this.uploadClaimAges && this.uploadClaimAges.get(guid) === undefined) {
+			this.uploadClaimAges.set(guid, Date.now());
+		}
+	}
+
+	/**
+	 * Files whose first upload has been pending for more than `STUCK_UPLOAD_MS`.
+	 * Read-only: reading never stamps an age, so opening the panel cannot
+	 * restart the clock of a claim.
+	 */
 	public stuckUploadPaths(now: number = Date.now()): string[] {
 		if (!this.uploadClaimAges) return [];
-		this._reconcileUploadClaimAges();
 		return stuckClaimPaths(this.uploadClaims, this.uploadClaimAges, now, STUCK_UPLOAD_MS);
 	}
 
@@ -501,6 +518,7 @@ export class VaultShare extends ProviderBacked {
 			this.path,
 			this.uploadClaims,
 			this.attachmentSettings,
+			(_vpath, guid) => this._stampClaimAge(guid),
 		);
 	}
 
