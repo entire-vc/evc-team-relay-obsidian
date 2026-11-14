@@ -8,6 +8,7 @@
 	import SettingsCluster from "./SettingsCluster.svelte";
 	import ConfigRow from "./ConfigRow.svelte";
 	import ConfigSectionHeading from "./ConfigSectionHeading.svelte";
+	import StuckUploadsBlock from "./StuckUploadsBlock.svelte";
 
 	export let live: TeamRelayPlugin;
 	export let syncedFolder: VaultShare;
@@ -32,7 +33,6 @@
 	const folderMissing = syncedFolder ? syncedFolder.folderMissing : false;
 	let pendingUploads = syncedFolder ? syncedFolder.pendingUploadCount() : 0;
 	let stuckPaths: string[] = syncedFolder ? syncedFolder.stuckUploadPaths() : [];
-	let showStuck = false;
 	$: notice = uploadNotice(pendingUploads, stuckPaths.length);
 	let retrying = false;
 
@@ -132,36 +132,12 @@
 
 {#if notice?.kind === "stuck"}
 	<ConfigSectionHeading heading="Files not uploaded" />
-	<SettingsCluster>
-		<ConfigRow
-			heading="{notice.stuck} file{notice.stuck === 1 ? '' : 's'} not uploaded for more than 7 days"
-			caption="The files stay on this device."
-		>
-			<button on:click={() => (showStuck = !showStuck)}>
-				{showStuck ? "Hide files" : "Show files"}
-			</button>
-			<button class="mod-cta" disabled={retrying} on:click={debounce(retryStuck)}>
-				{retrying ? "Retrying..." : "Retry"}
-			</button>
-		</ConfigRow>
-		{#if notice.more > 0}
-			<!-- A setting-item row without a control: same padding as the row above it. -->
-			<div class="setting-item">
-				<div class="setting-item-info">
-					<div class="setting-item-description">
-						{notice.more} more file{notice.more === 1 ? "" : "s"} waiting to upload
-					</div>
-				</div>
-			</div>
-		{/if}
-	</SettingsCluster>
-	{#if showStuck}
-		<ul class="evc-stuck-upload-list">
-			{#each stuckPaths as path (path)}
-				<li>{path}</li>
-			{/each}
-		</ul>
-	{/if}
+	<StuckUploadsBlock
+		{stuckPaths}
+		more={notice.more}
+		{retrying}
+		onRetry={debounce(retryStuck)}
+	/>
 {:else if notice?.kind === "pending"}
 	<div style={NOTICE_WRAPPER_STYLE}>
 		<p style={NOTICE_TEXT_STYLE}>

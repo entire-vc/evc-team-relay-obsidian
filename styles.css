@@ -586,10 +586,15 @@
 	border: 1px solid var(--background-modifier-border);
 }
 
+/* The expanded file list is a row of the stuck-uploads block, not a box under it. */
+.evc-stuck-upload-files {
+	display: block;
+}
+
 .evc-stuck-upload-list {
 	max-height: 240px;
 	overflow-y: auto;
-	margin: 0 1em 1em;
+	margin: 0;
 	padding: 0.5em 0.5em 0.5em 2em;
 	background: var(--background-secondary);
 	border-radius: var(--radius-s);
