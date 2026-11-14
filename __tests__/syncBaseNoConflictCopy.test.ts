@@ -27,6 +27,7 @@
  */
 
 import { describe, test, expect, jest } from "@jest/globals";
+import { createHash } from "crypto";
 import * as Y from "yjs";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
@@ -374,5 +375,56 @@ describe("uploadDocumentViaSocket — relay moved and the file holds a local edi
 		await makeQueue().uploadDocumentViaSocket(fakeDoc);
 
 		expect(writeContents).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * Replay of a live two-peer run on 0.1.33 (Entire relay, peer B reconnects
+ * after an offline edit). The texts are the run's own: the base hashes to the
+ * recorded sha256 prefixes (k1 aa83f8529d171b57, k2 bab1089c4fb9a892). Peer A
+ * deleted "ABC" while B was offline; B appended a line to k1 and left k2 alone.
+ * Recorded on 0.1.33: B's copy held A's text, the note kept "ABC" and the
+ * deletion was reverted on A too; k2 (control) took A's text with no copy.
+ */
+describe("live replay: reconnect after an offline edit while a peer deleted text", () => {
+	const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+	const base = (k: string) => `KEEP ABC ${k} entire-1793841371\nUnicode: café, заметка, 日本語\n`;
+	const remote = (k: string) => `KEEP  ${k} entire-1793841371\nUnicode: café, заметка, 日本語\n`;
+	const localK1 = base("k1") + "LOCAL EDIT MADE OFFLINE ON B\n";
+
+	test("the replayed texts are the recorded ones", () => {
+		expect(sha256(base("k1")).slice(0, 16)).toBe("aa83f8529d171b57");
+		expect(sha256(base("k2")).slice(0, 16)).toBe("bab1089c4fb9a892");
+	});
+
+	test("k1: the copy keeps the full local text, the note takes the remote deletion, a restart adds no copy", async () => {
+		const b = makeFakeDoc({ syncedText: remote("k1"), vaultContents: localK1, initialBase: base("k1") });
+
+		await makeQueue().uploadDocumentViaSocket(b.fakeDoc);
+
+		expect(b.writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(sha256(b.writeConflictCopy.mock.calls[0][1])).toBe(sha256(localK1));
+		expect(b.writeContents).toHaveBeenCalledWith(b.fakeDoc, remote("k1"));
+		// Nothing is pushed back: peer A keeps its deletion.
+		expect(b.fakeDoc.content).toBe(remote("k1"));
+
+		const restarted = makeFakeDoc({
+			syncedText: remote("k1"),
+			vaultContents: remote("k1"),
+			initialBase: b.getBase(),
+		});
+		await makeQueue().uploadDocumentViaSocket(restarted.fakeDoc);
+		expect(restarted.writeConflictCopy).not.toHaveBeenCalled();
+		expect(restarted.writeContents).not.toHaveBeenCalled();
+	});
+
+	test("k2 control: an unmodified note takes the remote text with no copy", async () => {
+		const b = makeFakeDoc({ syncedText: remote("k2"), vaultContents: base("k2"), initialBase: base("k2") });
+
+		await makeQueue().uploadDocumentViaSocket(b.fakeDoc);
+
+		expect(b.writeConflictCopy).not.toHaveBeenCalled();
+		expect(b.writeContents).toHaveBeenCalledWith(b.fakeDoc, remote("k2"));
+		expect(b.fakeDoc.content).toBe(remote("k2"));
 	});
 });
