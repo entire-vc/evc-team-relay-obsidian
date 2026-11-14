@@ -63,3 +63,24 @@ export function stuckClaimPaths(
 	});
 	return out.sort();
 }
+
+/**
+ * What the share settings page says about pending uploads: one block, never
+ * two competing "not uploaded" lines.
+ * - some claims are stuck: `stuck` with the stuck count and how many other
+ *   files are still waiting (`more`, shown as a muted line in the same block);
+ * - nothing stuck but something pending: `pending` with the total;
+ * - nothing pending: null.
+ */
+export type UploadNotice =
+	| { kind: "stuck"; stuck: number; more: number }
+	| { kind: "pending"; count: number }
+	| null;
+
+export function uploadNotice(pendingCount: number, stuckCount: number): UploadNotice {
+	if (stuckCount > 0) {
+		return { kind: "stuck", stuck: stuckCount, more: Math.max(0, pendingCount - stuckCount) };
+	}
+	if (pendingCount > 0) return { kind: "pending", count: pendingCount };
+	return null;
+}

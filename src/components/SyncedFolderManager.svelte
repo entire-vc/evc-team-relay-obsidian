@@ -3,6 +3,7 @@
 	import { createEventDispatcher } from "svelte";
 	import type TeamRelayPlugin from "src/main";
 	import { type VaultShare } from "src/VaultShare";
+	import { uploadNotice } from "src/stuckUploads";
 	import NavTrail from "./NavTrail.svelte";
 	import SettingsCluster from "./SettingsCluster.svelte";
 	import ConfigRow from "./ConfigRow.svelte";
@@ -32,6 +33,7 @@
 	let pendingUploads = syncedFolder ? syncedFolder.pendingUploadCount() : 0;
 	let stuckPaths: string[] = syncedFolder ? syncedFolder.stuckUploadPaths() : [];
 	let showStuck = false;
+	$: notice = uploadNotice(pendingUploads, stuckPaths.length);
 	let retrying = false;
 
 	const relinkTargets: string[] =
@@ -128,12 +130,12 @@
 	</SettingsCluster>
 {/if}
 
-{#if stuckPaths.length > 0}
+{#if notice?.kind === "stuck"}
 	<ConfigSectionHeading heading="Files not uploaded" />
 	<SettingsCluster>
 		<ConfigRow
-			heading="{stuckPaths.length} file{stuckPaths.length === 1 ? '' : 's'} not uploaded"
-			caption="Waiting for upload for more than 7 days. The files stay on this device."
+			heading="{notice.stuck} file{notice.stuck === 1 ? '' : 's'} not uploaded for more than 7 days"
+			caption="The files stay on this device."
 		>
 			<button on:click={() => (showStuck = !showStuck)}>
 				{showStuck ? "Hide files" : "Show files"}
@@ -142,6 +144,16 @@
 				{retrying ? "Retrying..." : "Retry"}
 			</button>
 		</ConfigRow>
+		{#if notice.more > 0}
+			<!-- A setting-item row without a control: same padding as the row above it. -->
+			<div class="setting-item">
+				<div class="setting-item-info">
+					<div class="setting-item-description">
+						{notice.more} more file{notice.more === 1 ? "" : "s"} waiting to upload
+					</div>
+				</div>
+			</div>
+		{/if}
 	</SettingsCluster>
 	{#if showStuck}
 		<ul class="evc-stuck-upload-list">
@@ -150,12 +162,10 @@
 			{/each}
 		</ul>
 	{/if}
-{/if}
-
-{#if pendingUploads > 0}
+{:else if notice?.kind === "pending"}
 	<div style={NOTICE_WRAPPER_STYLE}>
 		<p style={NOTICE_TEXT_STYLE}>
-			{pendingUploads} file{pendingUploads === 1 ? "" : "s"} not uploaded yet. They stay on this
+			{notice.count} file{notice.count === 1 ? "" : "s"} not uploaded yet. They stay on this
 			device and the upload is retried automatically.
 		</p>
 	</div>

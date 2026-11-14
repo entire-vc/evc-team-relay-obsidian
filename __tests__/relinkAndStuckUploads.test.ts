@@ -1,6 +1,6 @@
 import { TFile, TFolder, type TAbstractFile } from "obsidian";
 import { ShareRegistry, VaultShare } from "../src/VaultShare";
-import { STUCK_UPLOAD_MS } from "../src/stuckUploads";
+import { STUCK_UPLOAD_MS, uploadNotice } from "../src/stuckUploads";
 
 const DAY = 24 * 60 * 60 * 1000;
 // The Jest mock (mocks/obsidian.ts) gives TFile/TFolder path constructors the real typings lack.
@@ -133,5 +133,17 @@ describe("files not uploaded for more than 7 days", () => {
 		expect(share.stuckUploadPaths(now)).toEqual([]);
 		expect(ages.has("g-done")).toBe(false);
 		expect(ages.get("g-fresh")).toBeGreaterThanOrEqual(now - 1000);
+	});
+});
+
+describe("one upload notice block", () => {
+	test("stuck files: one block with the stuck count and the rest as 'more'", () => {
+		expect(uploadNotice(5, 3)).toEqual({ kind: "stuck", stuck: 3, more: 2 });
+		expect(uploadNotice(3, 3)).toEqual({ kind: "stuck", stuck: 3, more: 0 });
+	});
+
+	test("nothing stuck: the plain pending count, or no block at all", () => {
+		expect(uploadNotice(4, 0)).toEqual({ kind: "pending", count: 4 });
+		expect(uploadNotice(0, 0)).toBeNull();
 	});
 });
