@@ -61,7 +61,12 @@ jobs:
         with:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
-      - name: Require the accepted candidate on main; preserve existing tag identity
+      - name: Require the accepted candidate on main or at the head of its release branch; preserve existing tag identity
+        # A candidate is either on main or EXACTLY the head of release/<version>.
+        # The release branch carries the version bump so main keeps the published
+        # version until this release exists; the bump is merged into main with a
+        # merge commit afterwards. Only the head is accepted, never an older
+        # commit of that branch, because the branch itself is not protected.
         id: dispatch
         env:
           VERSION: ${{ inputs.version }}
@@ -69,7 +74,15 @@ jobs:
         run: |
           set -eu
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          git merge-base --is-ancestor "$CANDIDATE_SHA" origin/main
+          if git merge-base --is-ancestor "$CANDIDATE_SHA" origin/main; then
+            echo "candidate $CANDIDATE_SHA is on main"
+          elif RELEASE_HEAD=$(git rev-parse --verify --quiet "refs/remotes/origin/release/$VERSION^{commit}") \
+               && [ "$RELEASE_HEAD" = "$CANDIDATE_SHA" ]; then
+            echo "candidate $CANDIDATE_SHA is the head of release/$VERSION"
+          else
+            echo "::error::candidate $CANDIDATE_SHA is neither on main nor the head of release/$VERSION"
+            exit 1
+          fi
           if git show-ref --verify --quiet "refs/tags/$VERSION"; then
             test "$(git rev-parse "refs/tags/$VERSION^{commit}")" = "$CANDIDATE_SHA" || {
               echo '::error::existing tag belongs to a different candidate'; exit 1;
