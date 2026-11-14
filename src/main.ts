@@ -128,6 +128,7 @@ import { confirmDialog } from "./ui/dialogs";
 import { VaultScopedMap } from "./VaultScopedMap";
 import { collectWebFolderItems, isRootSharePath, joinFolderPath, resolveShareFolder } from "./vaultRootPath";
 import { FolderShareTracker } from "./FolderShareTracker";
+import { openSettingsAt } from "./settingsNavigation";
 
 interface LoggingSettings {
 	debugging: boolean;
@@ -624,8 +625,8 @@ export default class TeamRelayPlugin extends Plugin {
 		// Store app reference for reload function (avoid window.app per Obsidian guidelines)
 		const appRef = this.app as unknown as ObsidianApp;
 		appRef.reloadRelay = async () => {
-			await appRef.plugins.disablePlugin("team-relay");
-			await appRef.plugins.enablePlugin("team-relay");
+			await appRef.plugins.disablePlugin(this.manifest.id);
+			await appRef.plugins.enablePlugin(this.manifest.id);
 		};
 
 		this.addCommand({
@@ -1838,10 +1839,8 @@ export default class TeamRelayPlugin extends Plugin {
 	}
 
 	async showSettingsTab(path: string = "/") {
-		const setting = (this.app as unknown as ObsidianApp).setting;
-		await setting.open();
-		await setting.openTabById("team-relay");
-		this.settingsPage.showPath(path);
+		// The tab is registered under the manifest id (see settingsNavigation.ts).
+		await openSettingsAt((this.app as unknown as ObsidianApp).setting, this.manifest.id, this.settingsPage, path);
 	}
 
 	installWebviewerPatch(): void {

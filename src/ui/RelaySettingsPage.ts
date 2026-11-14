@@ -5,6 +5,7 @@ import type { SettingDefinitionItem } from "obsidian";
 import TeamRelayPlugin from "src/main";
 import SettingsPanel from "src/components/SettingsPanel.svelte";
 import { mountComponent, type MountedComponent } from "src/svelteMount";
+import { SettingsPathRouter } from "src/settingsNavigation";
 
 type CloseableSetting = { setting: { close: () => void } };
 
@@ -24,6 +25,7 @@ export class RelaySettingsPage extends PluginSettingTab {
 	plugin: TeamRelayPlugin;
 	mountEl!: HTMLElement;
 	private panel?: MountedComponent<Record<string, unknown>>;
+	private readonly router = new SettingsPathRouter();
 
 	constructor(app: App, plugin: TeamRelayPlugin) {
 		super(app, plugin);
@@ -94,15 +96,19 @@ export class RelaySettingsPage extends PluginSettingTab {
 				onClose: () => (this as unknown as CloseableSetting).setting.close(),
 			},
 		});
+		this.router.attach(this.panel);
 	}
 
 	showPath(path: string): void {
-		this.panel?.update({ initialPath: path });
+		this.router.show(path);
 	}
 
 	hide(): void {
+		this.router.detach();
+		const panel = this.panel;
+		this.panel = undefined;
 		try {
-			this.panel?.destroy();
+			panel?.destroy();
 		} catch (e: unknown) {
 			console.warn(e);
 		}
