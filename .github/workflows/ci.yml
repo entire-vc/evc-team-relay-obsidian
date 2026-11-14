@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
 
 permissions:
   contents: read
@@ -44,8 +44,12 @@ jobs:
         run: npm run build
 
   # Release candidate bytes for batched acceptance. Built once per push to main
-  # with the same steps as release.yml, so the stable build of the accepted SHA
-  # must reproduce these digests. No tag is pushed and nothing is published.
+  # or to a release/** branch with the same steps as release.yml, so the stable
+  # build of the accepted SHA must reproduce these digests. No tag is pushed and
+  # nothing is published. A release/** branch carries the version bump while
+  # main keeps the published version, so the community catalog always finds a
+  # release for main's manifest; the bump reaches main with a merge commit after
+  # acceptance, which keeps the accepted SHA an ancestor of main for release.yml.
   candidate:
     name: Release candidate bundle
     if: github.event_name == 'push'
