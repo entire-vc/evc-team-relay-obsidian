@@ -272,6 +272,7 @@ export class VaultShare extends ProviderBacked {
 		this.setLoggers(`[VaultShare](${this.path})`);
 		this.fileOps = fileOps;
 		this.vaultApi = vaultApi;
+		this.dormant = isRestore && !resolveShareFolder(vaultApi, path);
 		this.trackedEntries = new Map();
 		this.pathSet = new FileSet();
 		this.uploadClaims = new VaultScopedMap<string>(
@@ -292,10 +293,9 @@ export class VaultShare extends ProviderBacked {
 		);
 		this.attachmentSettings = this._buildSyncSettingsManager();
 		this.folderIndex = this._buildSyncStore();
-		this._pruneStalePendingUploads();
-		// Claims written before ages were tracked get the file's mtime: it
-		// makes an already month-old claim visible at once.
-		this._reconcileUploadClaimAges();
+		// A dormant share keeps its claims as they are: with no folder on disk
+		// every one of them would look unfulfillable and be dropped.
+		if (!this.dormant) this._settleUploadClaims();
 		this._wireSyncStoreListener();
 		this.docActivity = new DocActivityChannel(this.crdtDoc);
 
@@ -308,6 +308,58 @@ export class VaultShare extends ProviderBacked {
 		// change can reach the index (bringOnline() waits for the same load).
 		if (!this.freshlyCreated) void this.recordsBeforeSync();
 
+		this.blobs = new BlobClient(this);
+
+		if (this.dormant) {
+			this.warn(
+				`no folder at ${this.path} -- listed as "Folder not found"; nothing syncs until it is recreated or re-linked`,
+			);
+		} else {
+			this._startLifecycle(isRestore);
+		}
+
+		instanceLabels.set(this, this.path);
+	}
+
+	/**
+	 * Restored from settings while no folder backs `path`: the share is listed
+	 * (Synced folders shows "Folder not found" with Re-link, Recreate and
+	 * Remove) but nothing runs for it -- no connection, no sync pass, no
+	 * upload, no claim pruning. `wake()` starts it once a folder is back.
+	 */
+	private dormant: boolean;
+
+	public get isDormant(): boolean {
+		return this.dormant;
+	}
+
+	/**
+	 * Starts a dormant share once a folder exists at its path again (Recreate,
+	 * or the folder moved back) or its record points at another folder
+	 * (Re-link): the same start a share restored with its folder gets.
+	 * Returns false when there is nothing to start.
+	 */
+	public wake(): boolean {
+		if (!this.dormant || this.isTornDown || this.folderMissing) return false;
+		this.dormant = false;
+		this.missingFolderWarned = false;
+		this.log(`folder found at ${this.path}; starting sync`);
+		this._settleUploadClaims();
+		// Restored from a prior session's settings, like any dormant share.
+		this._startLifecycle(true);
+		return true;
+	}
+
+	/** Drops claims that can never complete and dates the rest (see stuckUploads.ts). */
+	private _settleUploadClaims(): void {
+		this._pruneStalePendingUploads();
+		// Claims written before ages were tracked get the file's mtime: it
+		// makes an already month-old claim visible at once.
+		this._reconcileUploadClaimAges();
+	}
+
+	/** Connection and the startup sync sequences; deferred while the share is dormant. */
+	private _startLifecycle(isRestore: boolean): void {
 		// TR-multi-server: `loginManager.isAuthenticated` only reflects the single
 		// legacy/active-server session. A relay-onprem folder knows which
 		// server it belongs to via config.onpremServerId (set by every
@@ -333,15 +385,13 @@ export class VaultShare extends ProviderBacked {
 		// terminal).
 		const onpremServerId = this.config.onpremServerId;
 		const isLoggedInForThisFolder = onpremServerId
-			? loginManager.isLoggedInToServer(onpremServerId)
+			? this.authSession.isLoggedInToServer(onpremServerId)
 			: isRestore
-				? loginManager.isAuthenticated
+				? this.authSession.isAuthenticated
 				: false;
 		if (isLoggedInForThisFolder) {
 			void this.bringOnline();
 		}
-
-		this.blobs = new BlobClient(this);
 
 		// Three independent lifecycle sequences kicked off from the
 		// constructor -- each named method below is the exact body that
@@ -350,8 +400,6 @@ export class VaultShare extends ProviderBacked {
 		void this.awaitReady().then(() => this._onReady());
 		void this.awaitSynced().then(() => this._onSynced());
 		void this._ensureServerSyncMarked();
-
-		instanceLabels.set(this, this.path);
 	}
 
 	/**
@@ -426,7 +474,7 @@ export class VaultShare extends ProviderBacked {
 	 * resumes the backoff timer from its first step.
 	 */
 	public async retryPendingUploads(): Promise<void> {
-		if (this.isTornDown) return;
+		if (this.isTornDown || this.dormant) return;
 		if (this.uploadRetryTimer !== undefined) {
 			window.clearTimeout(this.uploadRetryTimer);
 			this.uploadRetryTimer = undefined;
@@ -483,7 +531,7 @@ export class VaultShare extends ProviderBacked {
 	 * claim is still pending, with backoff, until none remain.
 	 */
 	public _scheduleUploadRetry(): void {
-		if (this.isTornDown || this.uploadRetryTimer !== undefined) return;
+		if (this.isTornDown || this.dormant || this.uploadRetryTimer !== undefined) return;
 		if (this.pendingUploadCount() === 0) {
 			this.uploadRetryAttempt = 0;
 			return;
@@ -810,6 +858,7 @@ export class VaultShare extends ProviderBacked {
 	 * non-timing-out wait for a fresh sync).
 	 */
 	private adoptLocalFiles = async (allowMint = true) => {
+		if (this.dormant) return;
 		let syncTFiles = this.vaultFilesInScope().filter(
 			(tfile) => !this.removedWhileAway(this.toVirtualPath(tfile.path)),
 		);
@@ -1319,6 +1368,7 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	async refreshFromServer() {
+		if (this.dormant) return;
 		await this.awaitReady();
 		// Wait for a FRESH provider sync (not onceProviderSynced()'s sticky
 		// "ever synced" featureKey, see its own doc comment) before reconciling.
@@ -1371,7 +1421,8 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	async bringOnline(): Promise<boolean> {
-		if (!this.mayConnect()) return false;
+		// Covers every caller (login, reconnect timers, the connect menu, docs).
+		if (this.dormant || !this.mayConnect()) return false;
 		// A server delete that lands before the stored records load hides the
 		// path from recordsBeforeSync(), and the old local copy is shared again.
 		await this.awaitSynced();
@@ -2017,6 +2068,7 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	async scanFileTree(folderIndex: FolderIndex): Promise<void> {
+		if (this.dormant) return;
 		// Do not start SingleFlight's stall timer while waiting for the first
 		// connection; offline startup may legitimately wait indefinitely.
 		if (!(await this.awaitFolderTreeReady()) || this.isTornDown) return;
@@ -2947,6 +2999,7 @@ export class VaultShare extends ProviderBacked {
 	 * a different Obsidian event.
 	 */
 	async claimAndUploadFile(tfile: TAbstractFile): Promise<void> {
+		if (this.dormant) return;
 		// Local recovery copies stay local (GH #4) -- this handler also sees
 		// the ones this client writes itself.
 		if (isConflictCopyPath(tfile.path)) return;
@@ -3265,10 +3318,25 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 			throw new Error(`No folder at ${target}.`);
 		}
 		share.relocate(target);
+		// A share restored without its folder never started: start it now.
+		// Its startup sequence runs the same adoption and sync pass.
+		if (!share.wake()) {
+			void share
+				.refreshFromServer()
+				.catch((e: unknown) => this.warn(`sync after re-link to ${target} failed:`, e));
+		}
 		this.notifySubscribers();
-		void share
-			.refreshFromServer()
-			.catch((e: unknown) => this.warn(`sync after re-link to ${target} failed:`, e));
+	}
+
+	/**
+	 * Starts the dormant share whose folder just appeared at `path` (Recreate,
+	 * a folder created or moved back there). Returns the share it started.
+	 */
+	wakeAt(path: string): VaultShare | null {
+		const share = this.locate((s) => s.isDormant && s.path === path);
+		if (!share?.wake()) return null;
+		this.notifySubscribers();
+		return share;
 	}
 
 	public get registry(): RelayRegistry {
@@ -3359,10 +3427,11 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 				);
 				return;
 			}
-			const tFolder = resolveShareFolder(this.vaultApi, folder.path);
-			if (!tFolder) {
-				this.warn(`settings reference a path that doesn't exist: ${folder.path}`);
-				return;
+			// A record whose folder is missing is still restored: the share is
+			// listed as "Folder not found" (Re-link, Recreate, Remove) and stays
+			// dormant -- no connection, no sync -- until a folder backs it again.
+			if (!resolveShareFolder(this.vaultApi, folder.path)) {
+				this.warn(`settings reference a path that doesn't exist: ${folder.path} -- restoring it as "Folder not found"`);
 			}
 			const workspaceId = folder?.relay;
 			try {

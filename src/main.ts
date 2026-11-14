@@ -820,7 +820,7 @@ export default class TeamRelayPlugin extends Plugin {
 					// A share polled by path that now has a VaultShare follows the
 					// VaultShare from here on: disconnecting it stops the polling.
 					for (const shareId of [...this.pathOnlyPolledShares.keys()]) {
-						if (this.shareRegistry.locate((sf) => sf.entityGuid === shareId)) {
+						if (this.liveShareFor(shareId)) {
 							this.pathOnlyPolledShares.delete(shareId);
 						}
 					}
@@ -1272,6 +1272,8 @@ export default class TeamRelayPlugin extends Plugin {
 			this.webSyncManager?.onFileRenamed(file.path, oldPath);
 			return;
 		}
+		// A folder moved back to a dormant share's path starts that share.
+		if (file instanceof TFolder) this.shareRegistry.wakeAt(file.path);
 
 		const fromFolder = this.shareRegistry.shareFor(oldPath);
 		const toFolder = this.shareRegistry.shareFor(file.path);
@@ -1301,8 +1303,17 @@ export default class TeamRelayPlugin extends Plugin {
 	private pathOnlyPolledShares = new Map<string, string>();
 
 	/** Whether a polled share still has a VaultShare, or still has its folder. */
+	/**
+	 * The VaultShare of `shareId` unless it is dormant (restored without its
+	 * folder): pollers and the share-list load treat a dormant share as not
+	 * here, as before it was listed.
+	 */
+	private liveShareFor(shareId: string): VaultShare | undefined {
+		return this.shareRegistry.locate((sf) => sf.entityGuid === shareId && !sf.isDormant);
+	}
+
 	private keepPollingShare = (shareId: string): boolean => {
-		if (this.shareRegistry.locate((sf) => sf.entityGuid === shareId)) return true;
+		if (this.liveShareFor(shareId)) return true;
 		const path = this.pathOnlyPolledShares.get(shareId);
 		return path !== undefined && !!resolveShareFolder(this.app.vault, path);
 	};
@@ -1322,7 +1333,7 @@ export default class TeamRelayPlugin extends Plugin {
 		// Re-run after a listed check's download: once it has written the
 		// folder, the share is polled.
 		const isLocal = (): boolean => {
-			const registered = !!this.shareRegistry.locate((sf) => sf.entityGuid === shareId);
+			const registered = !!this.liveShareFor(shareId);
 			const pathOnly = !registered && !!resolveShareFolder(this.app.vault, sharePath);
 			if (pathOnly) this.pathOnlyPolledShares.set(shareId, sharePath);
 			else this.pathOnlyPolledShares.delete(shareId);
@@ -1361,7 +1372,10 @@ export default class TeamRelayPlugin extends Plugin {
 						) : undefined;
 						const existing = byGuid || byPath;
 
-						if (existing && (existing.entityGuid !== share.id || !existing.workspaceId)) {
+						if (existing?.isDormant) {
+							// Restored without its folder: waits for Re-link or Recreate.
+							log(`Share "${share.path}" has no local folder (${existing.path}); not connecting`);
+						} else if (existing && (existing.entityGuid !== share.id || !existing.workspaceId)) {
 							// Migrate: guid mismatch or missing workspaceId — recreate
 							log(`Migrating VaultShare ${share.path} (guid: ${existing.entityGuid} → ${share.id})`);
 							this.shareRegistry.delete(existing);
@@ -1458,7 +1472,10 @@ export default class TeamRelayPlugin extends Plugin {
 						) : undefined;
 						const existing = byGuid || byPath;
 
-						if (existing && (existing.entityGuid !== share.id || !existing.workspaceId)) {
+						if (existing?.isDormant) {
+							// Restored without its folder: waits for Re-link or Recreate.
+							log(`Share "${share.path}" has no local folder (${existing.path}); not connecting`);
+						} else if (existing && (existing.entityGuid !== share.id || !existing.workspaceId)) {
 							// Migrate: guid mismatch or missing workspaceId — recreate
 							log(`Migrating VaultShare ${share.path} (guid: ${existing.entityGuid} → ${share.id})`);
 							this.shareRegistry.delete(existing);
@@ -1638,7 +1655,9 @@ export default class TeamRelayPlugin extends Plugin {
 			for (const share of shares) {
 				if (share.kind === "folder") {
 					const folder = this.shareRegistry.locate(sf => sf.entityGuid === share.id);
-					if (folder) {
+					if (folder?.isDormant) {
+						// No local folder: nothing to sync until Re-link or Recreate.
+					} else if (folder) {
 						void folder.bringOnline();
 						relaySynced++;
 					} else {
@@ -1992,6 +2011,8 @@ export default class TeamRelayPlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("create", (tfile) => {
 				// NOTE: Obsidian fires this for every existing file on vault load too.
+				// Recreate (or any new folder at that path) starts a dormant share.
+				if (tfile instanceof TFolder) this.shareRegistry.wakeAt(tfile.path);
 				const folder = this.shareRegistry.shareFor(tfile.path);
 				if (folder) {
 					// claimAndUploadFile() runs the same upload-claim protection

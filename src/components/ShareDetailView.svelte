@@ -608,11 +608,18 @@
 	// Local folder connection
 	let isConnectedLocally = false;
 	let localFolderPath = "";
+	let localFolderMissing = false;
 
 	function checkLocalConnection() {
 		const localFolder = live.shareRegistry.locate((sf) => sf.entityGuid === share.id);
 		isConnectedLocally = !!localFolder;
 		localFolderPath = localFolder ? localFolder.path : "";
+		localFolderMissing = localFolder ? localFolder.folderMissing : false;
+	}
+
+	/** Opens Synced folders -> "Folder not found" (Re-link, Recreate, Remove). */
+	function fixFolder() {
+		void live.showSettingsTab(`/shared-folders?id=${share.id}`);
 	}
 
 	// Check on mount and whenever loading finishes
@@ -680,8 +687,15 @@
 					<div class="evc-connection-row">
 						<div class="evc-connection-info">
 							<span class="evc-connection-path">{localFolderPath}</span>
-							<span class="evc-connection-status">{uiText("shareDetail.localFolder.connectedStatus")}</span>
+							{#if localFolderMissing}
+								<span class="evc-connection-status evc-connection-missing">{uiText("shareDetail.localFolder.missingStatus")}</span>
+							{:else}
+								<span class="evc-connection-status">{uiText("shareDetail.localFolder.connectedStatus")}</span>
+							{/if}
 						</div>
+						{#if localFolderMissing}
+							<button class="mod-cta evc-small-btn" on:click={fixFolder}>{uiText("shareDetail.localFolder.fixButton")}</button>
+						{/if}
 						<button class="evc-btn-danger evc-small-btn" on:click={disconnectFolder}>{uiText("shareDetail.localFolder.disconnectButton")}</button>
 					</div>
 				{:else}
@@ -1013,6 +1027,10 @@
 	.evc-connection-status {
 		font-size: 0.85em;
 		color: var(--text-muted);
+	}
+
+	.evc-connection-missing {
+		color: var(--text-error);
 	}
 
 	/* Members */
