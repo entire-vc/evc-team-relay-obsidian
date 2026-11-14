@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.34
+- Fixed: a shared folder deleted while Obsidian was closed disappeared from settings after the restart. It now stays in Synced folders as "Folder not found" and nothing syncs or downloads for it until you re-link it to another folder or recreate it. In the shared folder's settings, "Fix folder" in the Local folder section opens the synced folder page.
+- Added: "Folder not found" can re-link the shared folder to another existing folder in the vault; its files then sync with the server without a restart.
+- Added: shared folder settings show files that have not uploaded for more than 7 days, with options to list them and retry.
+
 ## 0.1.33
 - Fixed: a closed note could stay stuck after a device lost its own initial sync record when another collaborator's record had already incorporated it. The plugin now recognizes that case and resumes updates when text history is intact; notes with genuinely incomplete history remain protected from being overwritten.
 - Fixed: when another device removed text from a note while this device had an unsent edit to it, reconnecting brought the removed text back on every device, and the conflict copy held the other device's text instead of yours. The note now takes the other device's version and your full edit is kept in a conflict copy. If the copy cannot be written, the note is left untouched.
