@@ -440,6 +440,50 @@ export const englishPhrasebook = {
 	"agentKeys.revokePrefix": "Revoke ",
 	"agentKeys.revokeSuffix": "? This cannot be undone — any agent using this key will lose access immediately.",
 	"agentKeys.revokeSubmitButton": "Revoke key",
+	// Synced folder page -- src/components/SyncedFolderManager.svelte
+	"syncedFolder.notOnServer":
+		"This Shared Folder is not on a Relay Server, or else you do not have permission to access it.",
+	"syncedFolder.missing.heading": "Folder not found",
+	"syncedFolder.missing.recreateHeading": "Recreate folder",
+	"syncedFolder.missing.recreateCaption":
+		"Recreates the folder at {path} and reconnects it to the same shared folder. Files are downloaded again from the server.",
+	"syncedFolder.missing.recreateButton": "Recreate",
+	"syncedFolder.missing.relinkHeading": "Re-link to another folder",
+	"syncedFolder.missing.relinkCaption":
+		"Connects an existing folder in this vault to the same shared folder. Its files are synced with the server.",
+	"syncedFolder.missing.relinkNoTargets":
+		"No folder in this vault can be used: every folder is shared already or contains a shared folder.",
+	"syncedFolder.missing.relinkButton": "Re-link",
+	"syncedFolder.missing.relinkFailedNotice": "Re-link failed: {error}",
+	"syncedFolder.missing.relinkedNotice": "Shared folder re-linked to {path}.",
+	"syncedFolder.missing.removeHeading": "Remove from this device",
+	"syncedFolder.missing.removeCaption":
+		"Removes only this device's record of the shared folder. The shared folder on the server and other people's access are not changed.",
+	"syncedFolder.missing.removeButton": "Remove",
+	"syncedFolder.uploads.stuckHeading": "Files not uploaded",
+	"syncedFolder.uploads.pendingOne":
+		"{count} file not uploaded yet. They stay on this device and the upload is retried automatically.",
+	"syncedFolder.uploads.pendingOther":
+		"{count} files not uploaded yet. They stay on this device and the upload is retried automatically.",
+	"syncedFolder.irreversible.heading": "Irreversible actions",
+	"syncedFolder.irreversible.deleteMetadataHeading": "Delete metadata",
+	"syncedFolder.irreversible.deleteMetadataCaption": "Deletes edit history and disables change tracking.",
+	"syncedFolder.irreversible.deleteMetadataButton": "Delete metadata",
+	"syncedFolder.irreversible.deleteFromVaultHeading": "Delete from vault",
+	"syncedFolder.irreversible.deleteFromVaultCaption":
+		"Delete the local Shared Folder and all of its contents.",
+	"syncedFolder.irreversible.moveToTrashButton": "Move to trash",
+
+	// Stuck uploads block -- src/components/StuckUploadsBlock.svelte
+	"stuckUploads.headingOne": "{count} file not uploaded for more than 7 days",
+	"stuckUploads.headingOther": "{count} files not uploaded for more than 7 days",
+	"stuckUploads.caption": "The files stay on this device.",
+	"stuckUploads.showFilesButton": "Show files",
+	"stuckUploads.hideFilesButton": "Hide files",
+	"stuckUploads.retryButton": "Retry",
+	"stuckUploads.retryingButton": "Retrying...",
+	"stuckUploads.moreOne": "{count} more file waiting to upload",
+	"stuckUploads.moreOther": "{count} more files waiting to upload",
 } as const satisfies Record<string, string>;
 
 /** Every key the phrasebook defines -- the only valid input to `uiText()`. */
@@ -892,6 +936,51 @@ export const ruPhrasebook = {
 	"agentKeys.revokePrefix": "Отозвать ",
 	"agentKeys.revokeSuffix": "? Это действие нельзя отменить — агент с этим ключом сразу потеряет доступ.",
 	"agentKeys.revokeSubmitButton": "Отозвать ключ",
+	// Russian avoids count agreement with the "<noun>: {count}" form, so one
+	// template serves 1, 2 and 5 alike; the One/Other pair exists for English.
+	"syncedFolder.notOnServer":
+		"Этот общий доступ не размещён на сервере Relay, или у вас нет прав на него.",
+	"syncedFolder.missing.heading": "Папка не найдена",
+	"syncedFolder.missing.recreateHeading": "Создать папку заново",
+	"syncedFolder.missing.recreateCaption":
+		"Создаёт папку {path} заново и подключает её к тому же общему доступу. Файлы снова загрузятся с сервера.",
+	"syncedFolder.missing.recreateButton": "Создать заново",
+	"syncedFolder.missing.relinkHeading": "Привязать другую папку",
+	"syncedFolder.missing.relinkCaption":
+		"Подключает существующую папку этого хранилища к тому же общему доступу. Её файлы синхронизируются с сервером.",
+	"syncedFolder.missing.relinkNoTargets":
+		"В этом хранилище нет подходящей папки: каждая папка уже в общем доступе или содержит папку в общем доступе.",
+	"syncedFolder.missing.relinkButton": "Привязать",
+	"syncedFolder.missing.relinkFailedNotice": "Не удалось привязать папку: {error}",
+	"syncedFolder.missing.relinkedNotice": "Общий доступ привязан к папке {path}.",
+	"syncedFolder.missing.removeHeading": "Удалить с этого устройства",
+	"syncedFolder.missing.removeCaption":
+		"Удаляет только запись об общем доступе на этом устройстве. Общий доступ на сервере и доступ других участников не меняются.",
+	"syncedFolder.missing.removeButton": "Удалить",
+	"syncedFolder.uploads.stuckHeading": "Файлы не загружены",
+	"syncedFolder.uploads.pendingOne":
+		"Не загружено файлов: {count}. Они остаются на этом устройстве, загрузка повторится автоматически.",
+	"syncedFolder.uploads.pendingOther":
+		"Не загружено файлов: {count}. Они остаются на этом устройстве, загрузка повторится автоматически.",
+	"syncedFolder.irreversible.heading": "Необратимые действия",
+	"syncedFolder.irreversible.deleteMetadataHeading": "Удалить метаданные",
+	"syncedFolder.irreversible.deleteMetadataCaption":
+		"Удаляет историю правок и отключает отслеживание изменений.",
+	"syncedFolder.irreversible.deleteMetadataButton": "Удалить метаданные",
+	"syncedFolder.irreversible.deleteFromVaultHeading": "Удалить из хранилища",
+	"syncedFolder.irreversible.deleteFromVaultCaption":
+		"Удаляет локальную папку общего доступа со всем содержимым.",
+	"syncedFolder.irreversible.moveToTrashButton": "Переместить в корзину",
+
+	"stuckUploads.headingOne": "Файлов не загружено дольше 7 дней: {count}",
+	"stuckUploads.headingOther": "Файлов не загружено дольше 7 дней: {count}",
+	"stuckUploads.caption": "Файлы остаются на этом устройстве.",
+	"stuckUploads.showFilesButton": "Показать файлы",
+	"stuckUploads.hideFilesButton": "Скрыть файлы",
+	"stuckUploads.retryButton": "Повторить",
+	"stuckUploads.retryingButton": "Повтор...",
+	"stuckUploads.moreOne": "Ещё файлов ждут загрузки: {count}",
+	"stuckUploads.moreOther": "Ещё файлов ждут загрузки: {count}",
 } satisfies Phrasebook;
 
 /**

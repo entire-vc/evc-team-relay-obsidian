@@ -11,10 +11,14 @@ let component: ReturnType<typeof mountComponent> | undefined;
 let doc: Document;
 let closeDom: () => void;
 
-beforeAll(() => {
+beforeAll(async () => {
 	const loaded = loadSvelteComponent(
 		path.resolve(__dirname, "../src/components/StuckUploadsBlock.svelte"),
-		{ obsidian: { requireApiVersion: () => true } },
+		{
+			obsidian: { requireApiVersion: () => true },
+			// The interface language comes from the shared Obsidian mock (English).
+			"../wording/uiText": await import("../src/wording/uiText"),
+		},
 	);
 	closeDom = () => loaded.dom.window.close();
 	doc = loaded.dom.window.document;
