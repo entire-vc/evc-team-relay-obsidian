@@ -127,6 +127,7 @@ import { QuickShareModal } from "./ui/QuickShareModal";
 import { confirmDialog } from "./ui/dialogs";
 import { VaultScopedMap } from "./VaultScopedMap";
 import { collectWebFolderItems, isRootSharePath, joinFolderPath, resolveShareFolder } from "./vaultRootPath";
+import { FolderShareTracker } from "./FolderShareTracker";
 
 interface LoggingSettings {
 	debugging: boolean;
@@ -815,18 +816,13 @@ export default class TeamRelayPlugin extends Plugin {
 			// menu, the share view or the management modal) leaves the
 			// registry; stop polling a share that no longer has a VaultShare
 			// or, for one polled by path alone, its folder.
-			this.register(
-				this.shareRegistry.on(() => {
-					// A share polled by path that now has a VaultShare follows the
-					// VaultShare from here on: disconnecting it stops the polling.
-					for (const shareId of [...this.pathOnlyPolledShares.keys()]) {
-						if (this.liveShareFor(shareId)) {
-							this.pathOnlyPolledShares.delete(shareId);
-						}
-					}
-					this.inboundSyncPoller?.retainOnly(this.keepPollingShare);
-				}),
+			const folderShares = new FolderShareTracker(
+				this.shareRegistry,
+				this.app.vault,
+				() => this.inboundSyncPoller,
 			);
+			this.folderShares = folderShares;
+			this.register(this.shareRegistry.on(() => folderShares.onRegistryChange()));
 		}
 
 		// Add status bar item for Relay On-Prem (v1.8.2)
@@ -1296,50 +1292,16 @@ export default class TeamRelayPlugin extends Plugin {
 		this.webSyncManager?.onFileRenamed(file.path, oldPath);
 	}
 
-	/**
-	 * Folder shares polled because a folder sits at their path although no
-	 * VaultShare was made for it; keyed by share id, valued by that path.
-	 */
-	private pathOnlyPolledShares = new Map<string, string>();
+	/** Share-list routing of folder shares to the inbound poller; see FolderShareTracker. */
+	private folderShares?: FolderShareTracker;
 
-	/** Whether a polled share still has a VaultShare, or still has its folder. */
-	/**
-	 * The VaultShare of `shareId` unless it is dormant (restored without its
-	 * folder): pollers and the share-list load treat a dormant share as not
-	 * here, as before it was listed.
-	 */
-	private liveShareFor(shareId: string): VaultShare | undefined {
-		return this.shareRegistry.locate((sf) => sf.entityGuid === shareId && !sf.isDormant);
-	}
-
-	private keepPollingShare = (shareId: string): boolean => {
-		if (this.liveShareFor(shareId)) return true;
-		const path = this.pathOnlyPolledShares.get(shareId);
-		return path !== undefined && !!resolveShareFolder(this.app.vault, path);
-	};
-
-	/**
-	 * Hand a folder share from the share list to the inbound poller: polled
-	 * if it has a VaultShare or a folder in this vault, otherwise checked
-	 * from the listed timestamp.
-	 */
 	private trackFolderShare(
 		shareId: string,
 		serverId: string,
 		sharePath: string,
 		listedUpdatedAt: string | null | undefined,
 	): void {
-		if (!this.inboundSyncPoller) return;
-		// Re-run after a listed check's download: once it has written the
-		// folder, the share is polled.
-		const isLocal = (): boolean => {
-			const registered = !!this.liveShareFor(shareId);
-			const pathOnly = !registered && !!resolveShareFolder(this.app.vault, sharePath);
-			if (pathOnly) this.pathOnlyPolledShares.set(shareId, sharePath);
-			else this.pathOnlyPolledShares.delete(shareId);
-			return registered || pathOnly;
-		};
-		this.inboundSyncPoller.track(shareId, serverId, isLocal(), listedUpdatedAt, isLocal);
+		this.folderShares?.track(shareId, serverId, sharePath, listedUpdatedAt);
 	}
 
 	private async loadRelayOnPremShares() {
@@ -2031,8 +1993,8 @@ export default class TeamRelayPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
-				if (file instanceof TFolder && this.pathOnlyPolledShares.size > 0) {
-					this.inboundSyncPoller?.retainOnly(this.keepPollingShare);
+				if (file instanceof TFolder && this.folderShares?.hasPathOnlyShares) {
+					this.folderShares.retain();
 				}
 				if (file instanceof TFolder) {
 					const folder = this.shareRegistry.locate(
