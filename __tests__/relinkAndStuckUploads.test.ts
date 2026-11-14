@@ -16,6 +16,8 @@ function makeVault(tree: Record<string, string[]>) {
 		nodes.set(folderPath, folder);
 		for (const child of folder.children) nodes.set(child.path, child);
 	}
+	// Obsidian lists the vault root among loaded files, with path "/".
+	nodes.set("/", new MockFolder("/", []));
 	return {
 		nodes,
 		getAbstractFileByPath: (p: string) => nodes.get(p) ?? null,
@@ -89,6 +91,7 @@ describe("re-link a share to another existing folder", () => {
 		expect(() => registry.relink(share, "Taken")).toThrow(/Another shared folder/);
 		expect(() => registry.relink(share, "Taken/Sub")).toThrow(/Nested/);
 		expect(() => registry.relink(share, "")).toThrow(/vault root/);
+		expect(() => registry.relink(share, "/")).toThrow(/vault root/);
 		expect(() => registry.relink(share, "Missing")).toThrow(/No folder/);
 		expect(share.path).toBe("Gone");
 		expect(registry.relinkTargets(share)).toEqual(["Free"]);

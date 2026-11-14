@@ -13,7 +13,8 @@ export function relinkTargetError(
 	otherSharePaths: readonly string[],
 	sep = "/",
 ): string | null {
-	if (isRootSharePath(target)) return "The vault root cannot be used.";
+	// Obsidian's own root TFolder has path "/"; shares spell the root "".
+	if (isRootSharePath(target) || target === "/") return "The vault root cannot be used.";
 	if (target === sharePath) return "This is already the folder of this share.";
 	if (otherSharePaths.includes(target)) return "Another shared folder uses this folder.";
 	const conflict = findNestingConflictPath(target, [...otherSharePaths], sep);
