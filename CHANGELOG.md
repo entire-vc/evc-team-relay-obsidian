@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.33
+- Fixed: a closed note could stay stuck after a device lost its own initial sync record when another collaborator's record had already incorporated it. The plugin now recognizes that case and resumes updates when text history is intact; notes with genuinely incomplete history remain protected from being overwritten.
+- Fixed: when another device removed text from a note while this device had an unsent edit to it, reconnecting brought the removed text back on every device, and the conflict copy held the other device's text instead of yours. The note now takes the other device's version and your full edit is kept in a conflict copy. If the copy cannot be written, the note is left untouched.
+- Fixed: files a shared folder does not sync, such as .json or .log files when those types are off, could stay listed as pending uploads indefinitely. Pending uploads are now cleaned up, and uploads that can still go through are retried.
+- Fixed: a share whose folder had been removed from the vault interrupted syncing of the other shares. It is now skipped, and settings show "Folder not found" with options to re-link the folder or remove it from this device only. Settings also show how many files are not uploaded yet.
+
 ## 0.1.32
 - Fixed: some older closed notes could remain stuck after a device lost its initial sync records. After confirming the missing records across two connections, the plugin now resumes updates when text history is intact. If the first update would remove existing file content, a conflict copy preserves the previous text.
 
