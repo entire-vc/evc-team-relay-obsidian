@@ -1203,7 +1203,11 @@ export class TransferQueue extends Loggable {
 				const localText = await this.deliverIfNoLocalEdit(doc, currentVaultContents);
 				baseSettled = localText === undefined;
 				if (localText !== undefined && !sameTextContent(doc.content, localText)) {
-					await this.reconcileRelayContent(doc, localText);
+					if (await this.deliverPreservingLocalEdit(doc, localText)) {
+						baseSettled = true;
+					} else {
+						await this.reconcileRelayContent(doc, localText);
+					}
 				}
 			}
 		}
@@ -1280,6 +1284,66 @@ export class TransferQueue extends Loggable {
 			`[uploadDocumentViaSocket] relay moved, no local edit in ${doc.entryPath}; delivered its text`,
 		);
 		return undefined;
+	}
+
+	/**
+	 * The relay moved AND the file holds a local edit (it is off the last
+	 * agreed text): keep the file's text in full as a conflict copy, then
+	 * write the relay's text to disk. The CRDT is not touched. Same outcome
+	 * as pullIfUnchanged() for the same state.
+	 *
+	 * Before, reconcileRelayContent() pushed the file over the relay and kept
+	 * the relay's text as the copy. When the peer's edit removed text, every
+	 * participant got the removed text back and the copy held the peer's
+	 * version, not the local one (live on 0.1.33: copy without the full local
+	 * text, note without the remote deletion).
+	 *
+	 * Returns false when this does not apply and the caller reconciles as
+	 * before: no base yet (nothing tells which side moved), the relay did not
+	 * move, or its text is empty (also what an unloaded room reads as).
+	 * Returns true when the base is settled here: the relay text was
+	 * delivered and recorded, or nothing was written and the base stays
+	 * where it was, so the next sync sees the same divergence and preserves
+	 * the edit again. That covers a failed copy: moving the base to the
+	 * relay text would read the stale file as an own edit next time and push
+	 * it over the relay without a copy.
+	 */
+	private async deliverPreservingLocalEdit(doc: Document, localText: string): Promise<boolean> {
+		const base = await doc.getSyncBase();
+		const remoteText = doc.content;
+		if (base === undefined) return false;
+		if (sameTextContent(remoteText, base)) return false;
+		if (!hasPreservableContent(remoteText)) return false;
+		if (doc.vaultShare.isDeletePending(doc.entryPath)) return true;
+		const current = await this.readVaultContents(doc);
+		// "" is also a failed read: nothing safe to copy, write or record.
+		if (current === "") return true;
+		if (!sameTextContent(current, localText)) return true;
+		if (!sameTextContent(current, base) && hasPreservableContent(current)) {
+			const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+			try {
+				await doc.vaultShare.writeConflictCopy(doc, current, `relay conflict ${timestamp}`);
+			} catch (e) {
+				this.warn(
+					`[uploadDocumentViaSocket] could not preserve the local edit of ${doc.entryPath}; ` +
+						`file and sync base left as they are`,
+					e,
+				);
+				return true;
+			}
+		}
+		// The copy write can take a while: never overwrite an edit made meanwhile.
+		const afterCopy = await this.readVaultContents(doc);
+		if (!sameTextContent(afterCopy, current)) return true;
+		if (doc.vaultShare.isDeletePending(doc.entryPath)) return true;
+		await doc.vaultShare.writeContents(doc, remoteText);
+		await doc.setSyncBase(remoteText);
+		this.log(
+			`[uploadDocumentViaSocket] relay moved and ${doc.entryPath} held a local edit; ` +
+				`local text kept as a conflict copy, relay text written ` +
+				`(relay=${remoteText.length}, local=${current.length})`,
+		);
+		return true;
 	}
 
 	/**

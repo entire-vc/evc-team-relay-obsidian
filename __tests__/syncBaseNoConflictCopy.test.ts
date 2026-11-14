@@ -43,6 +43,8 @@ interface FakeDocOptions {
 	laterVaultReads?: string[];
 	/** Whether the note is being deleted. */
 	deletePending?: boolean;
+	/** Makes writeConflictCopy() reject, like a failed vault create. */
+	conflictCopyFails?: boolean;
 }
 
 function makeFakeDoc(opts: FakeDocOptions) {
@@ -50,9 +52,12 @@ function makeFakeDoc(opts: FakeDocOptions) {
 	ydoc.getText("contents").insert(0, opts.syncedText);
 
 	let base = opts.initialBase;
-	const writeConflictCopy = jest
-		.fn<(doc: unknown, content: string, label: string) => Promise<string>>()
-		.mockResolvedValue("note (relay conflict TIMESTAMP).md");
+	const writeConflictCopy = jest.fn<(doc: unknown, content: string, label: string) => Promise<string>>();
+	if (opts.conflictCopyFails) {
+		writeConflictCopy.mockRejectedValue(new Error("vault create failed"));
+	} else {
+		writeConflictCopy.mockResolvedValue("note (relay conflict TIMESTAMP).md");
+	}
 	const writeContents = jest
 		.fn<(doc: unknown, content: string) => Promise<void>>()
 		.mockResolvedValue(undefined);
@@ -120,12 +125,13 @@ describe("uploadDocumentViaSocket — sync-base gates the conflict-copy preserve
 		expect(getBase()).toBe("verify272f EDITED-FROM-B content");
 	});
 
-	test("REGRESSION: relay moved since our last sync (genuine conflict) still preserves a conflict copy", async () => {
+	test("REGRESSION: relay moved since our last sync and the file diverged: local text kept in full as a conflict copy, relay text lands on disk", async () => {
 		// Our recorded base is the ORIGINAL pre-conflict text, but the synced
 		// text we just read (post-connect) already includes another client's
-		// edit that merged in over the wire -- a real divergence, not just our
-		// own pending write.
-		const { fakeDoc, writeConflictCopy, getBase } = makeFakeDoc({
+		// edit -- a real divergence. Pushing the file over the relay would
+		// revert that edit for every peer; instead the file's text is kept
+		// as a copy and the relay's text is delivered, as pullIfUnchanged() does.
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
 			syncedText: "base content [edit from client A]",
 			vaultContents: "base content [edit from client B]",
 			initialBase: "base content",
@@ -138,11 +144,12 @@ describe("uploadDocumentViaSocket — sync-base gates the conflict-copy preserve
 		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
 		expect(writeConflictCopy).toHaveBeenCalledWith(
 			fakeDoc,
-			"base content [edit from client A]",
+			"base content [edit from client B]",
 			expect.stringMatching(/^relay conflict /),
 		);
-		expect(fakeDoc.content).toBe("base content [edit from client B]");
-		expect(getBase()).toBe("base content [edit from client B]");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "base content [edit from client A]");
+		expect(fakeDoc.content).toBe("base content [edit from client A]");
+		expect(getBase()).toBe("base content [edit from client A]");
 	});
 
 	test("no recorded base yet (first divergence ever seen for this doc): defaults to the safe, preserving path", async () => {
@@ -192,8 +199,8 @@ describe("uploadDocumentViaSocket — relay moved, file still holds the agreed t
 		expect(getBase()).toBe("a1-1 by A");
 	});
 
-	test("a local edit made while connecting is reconciled, never overwritten", async () => {
-		const { fakeDoc, writeContents } = makeFakeDoc({
+	test("a local edit made while connecting is never lost: kept in full as a copy before the relay text lands", async () => {
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
 			syncedText: "a1-1 by A",
 			vaultContents: "a1-0",
 			initialBase: "a1-0",
@@ -202,12 +209,15 @@ describe("uploadDocumentViaSocket — relay moved, file still holds the agreed t
 
 		await makeQueue().uploadDocumentViaSocket(fakeDoc);
 
-		expect(writeContents).not.toHaveBeenCalled();
-		// The relay moved too, so the safe path keeps the peer's text as a copy.
-		expect(fakeDoc.content).toBe("a1-0 typed on B");
+		// The relay moved too: the edit typed meanwhile is the copy, the peer's text the note.
+		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(writeConflictCopy.mock.calls[0][1]).toBe("a1-0 typed on B");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "a1-1 by A");
+		expect(fakeDoc.content).toBe("a1-1 by A");
+		expect(getBase()).toBe("a1-1 by A");
 	});
 
-	test("REGRESSION: a file off the base still reconciles as a local edit", async () => {
+	test("REGRESSION: a file off the base is never written over before its text is kept as a copy", async () => {
 		const { fakeDoc, writeConflictCopy, writeContents } = makeFakeDoc({
 			syncedText: "base [peer edit]",
 			vaultContents: "base [my edit]",
@@ -216,9 +226,13 @@ describe("uploadDocumentViaSocket — relay moved, file still holds the agreed t
 
 		await makeQueue().uploadDocumentViaSocket(fakeDoc);
 
-		expect(writeContents).not.toHaveBeenCalled();
 		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
-		expect(fakeDoc.content).toBe("base [my edit]");
+		expect(writeConflictCopy.mock.calls[0][1]).toBe("base [my edit]");
+		expect(writeConflictCopy.mock.invocationCallOrder[0]).toBeLessThan(
+			writeContents.mock.invocationCallOrder[0],
+		);
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "base [peer edit]");
+		expect(fakeDoc.content).toBe("base [peer edit]");
 	});
 
 	test("a failed final read writes nothing and keeps the base at the disk text", async () => {
@@ -252,5 +266,113 @@ describe("uploadDocumentViaSocket — relay moved, file still holds the agreed t
 		expect(writeContents).not.toHaveBeenCalled();
 		expect(fakeDoc.content).toBe("a1-1 by A");
 		expect(getBase()).toBe("a1-0");
+	});
+});
+
+describe("uploadDocumentViaSocket — relay moved and the file holds a local edit", () => {
+	test("character loss: a remote edit removed text still in the local file -- the copy holds the full original local text, the note gets the remote text", async () => {
+		const original = "line one\nline two to be deleted remotely\nline three";
+		const local = original + "\nlocal tail";
+		const remote = "line one\nline three";
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
+			syncedText: remote,
+			vaultContents: local,
+			initialBase: original,
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(writeConflictCopy.mock.calls[0][1]).toBe(local);
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, remote);
+		// The CRDT keeps the remote deletion: nothing is pushed back over it.
+		expect(fakeDoc.content).toBe(remote);
+		expect(getBase()).toBe(remote);
+	});
+
+	test("the next sync after the delivery makes no second copy", async () => {
+		const original = "line one\nline two\nline three";
+		const remote = "line one\nline three";
+		const first = makeFakeDoc({
+			syncedText: remote,
+			vaultContents: original + " local",
+			initialBase: original,
+		});
+		await makeQueue().uploadDocumentViaSocket(first.fakeDoc);
+		expect(first.writeConflictCopy).toHaveBeenCalledTimes(1);
+
+		// The restart: the disk holds what was delivered, the base was recorded.
+		const second = makeFakeDoc({
+			syncedText: remote,
+			vaultContents: remote,
+			initialBase: first.getBase(),
+		});
+		await makeQueue().uploadDocumentViaSocket(second.fakeDoc);
+
+		expect(second.writeConflictCopy).not.toHaveBeenCalled();
+		expect(second.writeContents).not.toHaveBeenCalled();
+		expect(second.fakeDoc.content).toBe(remote);
+	});
+
+	test("a failed conflict copy leaves the file and the base alone, so the next sync preserves it again", async () => {
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
+			syncedText: "line one\nline three",
+			vaultContents: "line one\nline two\nline three local",
+			initialBase: "line one\nline two\nline three",
+			conflictCopyFails: true,
+		});
+
+		const result = await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(result).toBe(true);
+		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(writeContents).not.toHaveBeenCalled();
+		// Neither the file text pushed over the relay nor the relay text recorded as agreed.
+		expect(fakeDoc.content).toBe("line one\nline three");
+		expect(getBase()).toBe("line one\nline two\nline three");
+	});
+
+	test("an edit typed while the copy was written is not overwritten", async () => {
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
+			syncedText: "base [peer edit]",
+			vaultContents: "base [my edit]",
+			initialBase: "base",
+			laterVaultReads: ["base [my edit]", "base [my edit]", "base [my edit] more"],
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(fakeDoc.content).toBe("base [peer edit]");
+		expect(getBase()).toBe("base");
+	});
+
+	test("a note being deleted gets no copy and no write", async () => {
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
+			syncedText: "base [peer edit]",
+			vaultContents: "base [my edit]",
+			initialBase: "base",
+			deletePending: true,
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeConflictCopy).not.toHaveBeenCalled();
+		expect(writeContents).not.toHaveBeenCalled();
+		expect(fakeDoc.content).toBe("base [peer edit]");
+		expect(getBase()).toBe("base");
+	});
+
+	test("control: an empty relay text (room not loaded) keeps the old reconcile path", async () => {
+		const { fakeDoc, writeContents } = makeFakeDoc({
+			syncedText: "",
+			vaultContents: "local text",
+			initialBase: "base",
+		});
+
+		await makeQueue().uploadDocumentViaSocket(fakeDoc);
+
+		expect(writeContents).not.toHaveBeenCalled();
 	});
 });
