@@ -2,7 +2,8 @@
 	import { debounce, Notice } from "obsidian";
 	import { createEventDispatcher } from "svelte";
 	import type TeamRelayPlugin from "src/main";
-	import { type VaultShare } from "src/VaultShare";
+	import type { VaultShare } from "src/VaultShare";
+	import { uiText } from "../wording/uiText";
 	import { uploadNotice } from "src/stuckUploads";
 	import NavTrail from "./NavTrail.svelte";
 	import SettingsCluster from "./SettingsCluster.svelte";
@@ -45,10 +46,14 @@
 		try {
 			live.shareRegistry.relink(syncedFolder, relinkTarget);
 		} catch (e: unknown) {
-			new Notice(`Re-link failed: ${e instanceof Error ? e.message : String(e)}`);
+			new Notice(
+				uiText("syncedFolder.missing.relinkFailedNotice", {
+					error: e instanceof Error ? e.message : String(e),
+				}),
+			);
 			return;
 		}
-		new Notice(`Shared folder re-linked to ${relinkTarget}.`);
+		new Notice(uiText("syncedFolder.missing.relinkedNotice", { path: relinkTarget }));
 		dispatch("goBack", {});
 	}
 
@@ -95,46 +100,49 @@
 <!-- Off for a missing folder: the share is fine, its folder is what is gone. -->
 {#if !folderMissing}
 	<div style={NOTICE_WRAPPER_STYLE}>
-		<p style={NOTICE_TEXT_STYLE}>
-			This Shared Folder is not on a Relay Server, or else you do not have permission to access
-			it.
-		</p>
+		<p style={NOTICE_TEXT_STYLE}>{uiText("syncedFolder.notOnServer")}</p>
 	</div>
 {/if}
 
 {#if folderMissing}
-	<ConfigSectionHeading heading="Folder not found" />
+	<ConfigSectionHeading heading={uiText("syncedFolder.missing.heading")} />
 	<SettingsCluster>
 		<ConfigRow
-			heading="Recreate folder"
-			caption="Recreates the folder at {syncedFolder.path} and reconnects it to the same shared folder. Files are downloaded again from the server."
+			heading={uiText("syncedFolder.missing.recreateHeading")}
+			caption={uiText("syncedFolder.missing.recreateCaption", { path: syncedFolder.path })}
 		>
-			<button on:click={debounce(relinkFolder)}>Recreate</button>
+			<button on:click={debounce(relinkFolder)}>
+				{uiText("syncedFolder.missing.recreateButton")}
+			</button>
 		</ConfigRow>
 		<ConfigRow
-			heading="Re-link to another folder"
+			heading={uiText("syncedFolder.missing.relinkHeading")}
 			caption={relinkTargets.length > 0
-				? "Connects an existing folder in this vault to the same shared folder. Its files are synced with the server."
-				: "No folder in this vault can be used: every folder is shared already or contains a shared folder."}
+				? uiText("syncedFolder.missing.relinkCaption")
+				: uiText("syncedFolder.missing.relinkNoTargets")}
 		>
 			<select class="dropdown" bind:value={relinkTarget} disabled={relinkTargets.length === 0}>
 				{#each relinkTargets as target (target)}
 					<option value={target}>{target}</option>
 				{/each}
 			</select>
-			<button disabled={!relinkTarget} on:click={debounce(relinkToOther)}>Re-link</button>
+			<button disabled={!relinkTarget} on:click={debounce(relinkToOther)}>
+				{uiText("syncedFolder.missing.relinkButton")}
+			</button>
 		</ConfigRow>
 		<ConfigRow
-			heading="Remove from this device"
-			caption="Removes only this device's record of the shared folder. The shared folder on the server and other people's access are not changed."
+			heading={uiText("syncedFolder.missing.removeHeading")}
+			caption={uiText("syncedFolder.missing.removeCaption")}
 		>
-			<button class="mod-warning" on:click={debounce(removeLocalEntry)}>Remove</button>
+			<button class="mod-warning" on:click={debounce(removeLocalEntry)}>
+				{uiText("syncedFolder.missing.removeButton")}
+			</button>
 		</ConfigRow>
 	</SettingsCluster>
 {/if}
 
 {#if notice?.kind === "stuck"}
-	<ConfigSectionHeading heading="Files not uploaded" />
+	<ConfigSectionHeading heading={uiText("syncedFolder.uploads.stuckHeading")} />
 	<StuckUploadsBlock
 		{stuckPaths}
 		more={notice.more}
@@ -144,31 +152,36 @@
 {:else if notice?.kind === "pending"}
 	<div style={NOTICE_WRAPPER_STYLE}>
 		<p style={NOTICE_TEXT_STYLE}>
-			{notice.count} file{notice.count === 1 ? "" : "s"} not uploaded yet. They stay on this
-			device and the upload is retried automatically.
+			{uiText(
+				notice.count === 1 ? "syncedFolder.uploads.pendingOne" : "syncedFolder.uploads.pendingOther",
+				{ count: notice.count },
+			)}
 		</p>
 	</div>
 {/if}
 
 {#if syncedFolder}
-	<ConfigSectionHeading heading="Irreversible actions" />
+	<ConfigSectionHeading heading={uiText("syncedFolder.irreversible.heading")} />
 	<SettingsCluster>
 		<ConfigRow
-			heading="Delete metadata"
-			caption="Deletes edit history and disables change tracking."
+			heading={uiText("syncedFolder.irreversible.deleteMetadataHeading")}
+			caption={uiText("syncedFolder.irreversible.deleteMetadataCaption")}
 		>
 			<button class="mod-destructive" on:click={debounce(deleteMetadata)}>
-				Delete metadata
+				{uiText("syncedFolder.irreversible.deleteMetadataButton")}
 			</button>
 		</ConfigRow>
 
-		<ConfigRow
-			heading="Delete from vault"
-			caption="Delete the local Shared Folder and all of its contents."
-		>
-			<button class="mod-warning" on:click={debounce(deleteLocalCopy)}>
-				Move to trash
-			</button>
-		</ConfigRow>
+		<!-- Off for a missing folder: there is nothing local to trash. -->
+		{#if !folderMissing}
+			<ConfigRow
+				heading={uiText("syncedFolder.irreversible.deleteFromVaultHeading")}
+				caption={uiText("syncedFolder.irreversible.deleteFromVaultCaption")}
+			>
+				<button class="mod-warning" on:click={debounce(deleteLocalCopy)}>
+					{uiText("syncedFolder.irreversible.moveToTrashButton")}
+				</button>
+			</ConfigRow>
+		{/if}
 	</SettingsCluster>
 {/if}

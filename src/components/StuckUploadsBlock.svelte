@@ -1,6 +1,7 @@
 <script lang="ts">
 	import SettingsCluster from "./SettingsCluster.svelte";
 	import ConfigRow from "./ConfigRow.svelte";
+	import { uiText } from "../wording/uiText";
 
 	/** Files pending for more than 7 days. */
 	export let stuckPaths: string[];
@@ -16,14 +17,16 @@
 <!-- One block: the stuck row, its file list right under it, the "more" line last. -->
 <SettingsCluster>
 	<ConfigRow
-		heading="{stuck} file{stuck === 1 ? '' : 's'} not uploaded for more than 7 days"
-		caption="The files stay on this device."
+		heading={uiText(stuck === 1 ? "stuckUploads.headingOne" : "stuckUploads.headingOther", {
+			count: stuck,
+		})}
+		caption={uiText("stuckUploads.caption")}
 	>
 		<button on:click={() => (showFiles = !showFiles)}>
-			{showFiles ? "Hide files" : "Show files"}
+			{showFiles ? uiText("stuckUploads.hideFilesButton") : uiText("stuckUploads.showFilesButton")}
 		</button>
 		<button class="mod-cta" disabled={retrying} on:click={onRetry}>
-			{retrying ? "Retrying..." : "Retry"}
+			{retrying ? uiText("stuckUploads.retryingButton") : uiText("stuckUploads.retryButton")}
 		</button>
 	</ConfigRow>
 	{#if showFiles}
@@ -40,7 +43,7 @@
 		<div class="setting-item evc-stuck-upload-more">
 			<div class="setting-item-info">
 				<div class="setting-item-description">
-					{more} more file{more === 1 ? "" : "s"} waiting to upload
+					{uiText(more === 1 ? "stuckUploads.moreOne" : "stuckUploads.moreOther", { count: more })}
 				</div>
 			</div>
 		</div>
