@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.35
+- Fixed: the synced folder page, opened with "Fix folder" or "Show files", was in English when Obsidian was set to Russian. It is now translated. For a folder that is not found, the "Delete from vault" row is no longer shown, since there is nothing in the vault to delete; "Delete metadata" stays.
+- Fixed: the share page said a connected share you have access to was "not on a Relay Server", for example when opened with "Show files". The notice now appears only for a share with no Relay server behind it or one you do not have access to.
+- Fixed: notes edited or created in Obsidian reached other apps and agents that read the shared folder through the server's file sync only after a web publish. They are now sent there a few seconds after the edit, on servers that support it.
+- Fixed: on the Plans screen, the current plan was not marked on some servers, and "Included" could overlap long feature names. Settings now scroll in one area instead of two, and when prices are in rubles, links to the offer and refund terms appear under the payment buttons.
+- Fixed: in the Relay server list, the buttons of a server row could move while the list was loading server details, so a click on "Shares" or "Plan & Usage" could land on another button. "Plan & Usage" now appears in its place right away and stays disabled until the server answers, and the buttons no longer move.
+
 ## 0.1.34
 - Fixed: a shared folder deleted while Obsidian was closed disappeared from settings after the restart. It now stays in Synced folders as "Folder not found" and nothing syncs or downloads for it until you re-link it to another folder or recreate it. In the shared folder's settings, "Fix folder" in the Local folder section opens the synced folder page.
 - Added: "Folder not found" can re-link the shared folder to another existing folder in the vault; its files then sync with the server without a restart.
