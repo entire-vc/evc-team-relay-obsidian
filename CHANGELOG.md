@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.36
+- Fixed: when the server moved folders of a shared folder into "artifacts" while Obsidian was open, the old copies could stay in the vault and be published again, so they reappeared on the web page and blocked the next move. These leftover copies are no longer published, the web page list is refreshed once they are found, and notes in them sync under the path the server records for them. No files are moved or deleted.
+- Fixed: on a client that started without a stored copy of a shared note, edits made in Obsidian did not reach other apps and agents that read the shared folder through the server's file sync. When the local note already contains the server version, the client now takes it as the base and sends its edits; otherwise it shows a conflict that says where the local text came from.
+- Fixed: "Use server version" in a sync conflict moved the shared note to the trash instead of replacing its text. It now writes the server text into the note.
+- Fixed: a note deleted or renamed in Obsidian stayed available through the server's file sync under its old path. The delete is now sent to the server, unless the note was changed there in the meantime; deletes made offline are sent after reconnecting.
+- Fixed: with several Relay accounts, one signed-out account could disconnect or block shared folders of an account that was still signed in. Sign-in is now checked per shared folder, against its own account.
+- Fixed: "Use server version" on a note that was not open in an editor changed it only on this device, so members ended up with different text. The server version now reaches everyone; if the server is not ready, the action fails without changing anything.
+- Fixed: when another member moved or deleted a folder, files in it that are not synced (for example with "Other files" turned off) were moved to the trash with it. They now stay in place, together with the folders above them, and those kept folders are not shared back or listed on the web page.
+
 ## 0.1.35
 - Fixed: the synced folder page, opened with "Fix folder" or "Show files", was in English when Obsidian was set to Russian. It is now translated. For a folder that is not found, the "Delete from vault" row is no longer shown, since there is nothing in the vault to delete; "Delete metadata" stays.
 - Fixed: the share page said a connected share you have access to was "not on a Relay Server", for example when opened with "Show files". The notice now appears only for a share with no Relay server behind it or one you do not have access to.
