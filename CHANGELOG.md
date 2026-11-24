@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.37
+- Fixed: after the Settings window or a pop-out window was closed, other members stopped seeing your cursor and selection for the rest of the session, while text kept syncing. Your presence now stays visible until Obsidian itself is closed.
+- Updated development dependencies (ESLint 10, typescript-eslint 8.73) and several libraries to newer patch and minor versions.
+
 ## 0.1.36
 - Fixed: when the server moved folders of a shared folder into "artifacts" while Obsidian was open, the old copies could stay in the vault and be published again, so they reappeared on the web page and blocked the next move. These leftover copies are no longer published, the web page list is refreshed once they are found, and notes in them sync under the path the server records for them. No files are moved or deleted.
 - Fixed: on a client that started without a stored copy of a shared note, edits made in Obsidian did not reach other apps and agents that read the shared folder through the server's file sync. When the local note already contains the server version, the client now takes it as the base and sends its edits; otherwise it shows a conflict that says where the local text came from.
