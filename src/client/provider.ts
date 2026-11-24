@@ -479,6 +479,9 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 		origin: unknown,
 	) => void;
 	private _unloadHandler: () => void;
+	// The window the unload listener was added to, so destroy() removes it
+	// from the same one.
+	private _unloadTarget: Window | null = null;
 
 	constructor(
 		serverUrl: string,
@@ -554,8 +557,14 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 				"window unload",
 			);
 		};
-		if (typeof activeWindow !== "undefined") {
-			activeWindow.addEventListener("unload", this._unloadHandler);
+		// The main app window, never activeWindow: a provider
+		// created while a popout or the Settings window had focus would
+		// otherwise clear our own presence when that window closes, and
+		// setLocalStateField() never restores a null state, so the cursor
+		// stays gone until restart.
+		if (typeof window !== "undefined") {
+			this._unloadTarget = window;
+			this._unloadTarget.addEventListener("unload", this._unloadHandler);
 		} else if (typeof process !== "undefined") {
 			process.on("exit", this._unloadHandler);
 		}
@@ -733,8 +742,9 @@ export class YSweetProvider extends ObservableV2<YSweetProviderEvents> {
 			}
 		}
 		this.disconnect();
-		if (typeof activeWindow !== "undefined") {
-			activeWindow.removeEventListener("unload", this._unloadHandler);
+		if (this._unloadTarget !== null) {
+			this._unloadTarget.removeEventListener("unload", this._unloadHandler);
+			this._unloadTarget = null;
 		} else if (typeof process !== "undefined") {
 			process.off("exit", this._unloadHandler);
 		}

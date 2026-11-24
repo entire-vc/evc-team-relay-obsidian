@@ -1173,7 +1173,7 @@ export class ViewBindingRegistry {
 
 		await this.awaitOpenFoldersReady();
 
-		let views: ViewBinding[] = [];
+		let views: ViewBinding[];
 		try {
 			views = this.collectOpenViews();
 		} catch (e: unknown) {

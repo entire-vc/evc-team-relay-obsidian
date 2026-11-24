@@ -19,6 +19,15 @@ function makeShare(opts: { files: Record<string, boolean>; claims: string[]; fol
 	}
 	const share = Object.create(VaultShare.prototype) as VaultShare;
 	Object.assign(share, {
+		// Object.create skips the constructor, so class-field initialisers do not
+		// run. Without these two, _scheduleUploadRetry reads
+		// UPLOAD_RETRY_BACKOFF_MS[Math.min(undefined, 3)] === undefined, i.e. a
+		// 0 ms delay: the retry re-arms every fake millisecond and
+		// advanceTimersByTimeAsync(61_000) fires ~61k timers, each followed by a
+		// real macrotask yield. That costs ~1 s idle and exceeds the 5 s test
+		// timeout under CPU load.
+		uploadRetryAttempt: 0,
+		uploadRetryTimer: undefined,
 		path: "Shared",
 		uploadClaims: claims,
 		warn,
@@ -37,6 +46,10 @@ function makeShare(opts: { files: Record<string, boolean>; claims: string[]; fol
 }
 
 describe("pending upload claims", () => {
+	afterEach(() => {
+		jest.useRealTimers();
+	});
+
 	test("claim for a non-syncable file is dropped, syncable file's claim is kept", () => {
 		const { share, claims } = makeShare({
 			files: { ".artifacts/a.bin": false, "note.md": true },
@@ -71,10 +84,18 @@ describe("pending upload claims", () => {
 		const adopt = jest.fn().mockResolvedValue(undefined);
 		Object.assign(share, { adoptLocalFiles: adopt });
 		share._scheduleUploadRetry();
-		await jest.advanceTimersByTimeAsync(61_000);
+		await jest.advanceTimersByTimeAsync(59_999);
+		expect(adopt).not.toHaveBeenCalled();
+		await jest.advanceTimersByTimeAsync(1_001);
+		// Exactly one retry at the first backoff step, then the next one is armed.
+		expect(adopt).toHaveBeenCalledTimes(1);
 		expect(adopt).toHaveBeenCalledWith(false);
+		expect(jest.getTimerCount()).toBe(1);
 		expect(claims.has("n.md")).toBe(true);
-		jest.useRealTimers();
+		// Second step of the backoff (300 s) fires the retry again.
+		await jest.advanceTimersByTimeAsync(300_000);
+		expect(adopt).toHaveBeenCalledTimes(2);
+		expect(claims.has("n.md")).toBe(true);
 	});
 });
 

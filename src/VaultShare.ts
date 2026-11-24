@@ -828,7 +828,7 @@ export class VaultShare extends ProviderBacked {
 	retainedLocalOnlyFolders(): Set<string> {
 		const kept = new Set<string>();
 		if (this.isTornDown || !this.folderIndex) return kept;
-		let entries: TAbstractFile[] = [];
+		let entries: TAbstractFile[];
 		try {
 			entries = this.vaultFilesInScope();
 		} catch {
