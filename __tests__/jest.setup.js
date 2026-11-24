@@ -19,8 +19,8 @@ if (typeof testGlobal.window === "undefined") {
 // window/activeWindow, it has no addEventListener/removeEventListener. Code
 // that calls window.addEventListener/activeWindow.addEventListener (e.g. an
 // "unload" cleanup listener) throws in this test env otherwise. No-op stubs
-// are enough here: nothing in this test suite depends on these listeners
-// actually firing, only on constructing/tearing down without throwing.
+// by default; a test that needs these listeners to fire installs its own
+// (see provider.unloadWindow.test.ts).
 if (typeof testGlobal.addEventListener !== "function") {
 	testGlobal.addEventListener = () => {};
 }
