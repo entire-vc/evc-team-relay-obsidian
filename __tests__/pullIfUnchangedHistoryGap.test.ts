@@ -19,7 +19,7 @@
 
 import { describe, test, expect, jest } from "@jest/globals";
 import * as Y from "yjs";
-import type { Clock } from "../src/Clock";
+import { SystemClock, type Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
 import { hasHistoryGap, keepsAllText, noteCompletedSync } from "../src/preserveBeforeTrash";
@@ -514,7 +514,9 @@ describe("a gap only in the presence map does not hold the text back", () => {
 		const local = FULL_TEXT + "LOCAL LINE\n";
 		const runUpload = async (crdtDoc: Y.Doc) => {
 			const { fakeDoc, writeConflictCopy, state } = makeFakeDoc(crdtDoc, local, FULL_TEXT);
-			await makeQueue().uploadDocumentViaSocket(fakeDoc);
+			// A real clock: the instant one fires the reconcile claim's outer
+			// bound before the claim settles, which is the lost-claim path.
+			await makeQueue(new SystemClock()).uploadDocumentViaSocket(fakeDoc);
 			return {
 				text: crdtDoc.getText("contents").toString(),
 				conflictCopies: writeConflictCopy.mock.calls.length,

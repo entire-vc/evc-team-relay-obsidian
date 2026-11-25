@@ -153,8 +153,10 @@ describe("uploadDocumentViaSocket — sync-base gates the conflict-copy preserve
 		expect(getBase()).toBe("base content [edit from client A]");
 	});
 
-	test("no recorded base yet (first divergence ever seen for this doc): defaults to the safe, preserving path", async () => {
-		const { fakeDoc, writeConflictCopy } = makeFakeDoc({
+	test("no recorded base yet (first divergence ever seen for this doc): the file text is the copy, the relay text lands on disk, the CRDT is untouched", async () => {
+		// No common text to merge from: a diff from the relay text to the
+		// file would mix with a collaborator's concurrent typing (GH #113).
+		const { fakeDoc, writeConflictCopy, writeContents, getBase } = makeFakeDoc({
 			syncedText: "old synced text",
 			vaultContents: "new vault text",
 			initialBase: undefined,
@@ -164,6 +166,10 @@ describe("uploadDocumentViaSocket — sync-base gates the conflict-copy preserve
 		await queue.uploadDocumentViaSocket(fakeDoc);
 
 		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(writeConflictCopy.mock.calls[0][1]).toBe("new vault text");
+		expect(fakeDoc.content).toBe("old synced text");
+		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "old synced text");
+		expect(getBase()).toBe("old synced text");
 	});
 
 	test("content already in sync: no conflict copy, and the base is (re)recorded", async () => {
