@@ -434,11 +434,15 @@ export class CrdtBackgroundSyncPoller {
 	private onAnnounced(folder: VaultShare, guid: string, expected: string): void {
 		if (this.destroyed) return;
 		const file = folder.trackedEntries.get(guid);
-		if (!file || !isDocument(file) || !this.isClosed(file)) return;
+		if (!file || !isDocument(file)) return;
+		// A note being pulled is online because of that pull, not because it is open: its
+		// newer marker must still reach the pull, or the pull waits for a text that is gone.
+		const pulling = this.pulling.has(guid) || this.abandonedWrites.has(guid);
+		if (!pulling && !this.isClosed(file)) return;
 		const now = this.timeProvider.now();
 		// A newer marker supersedes whatever re-check the older one left behind.
 		this.cancelRecheck(guid);
-		if (this.pulling.has(guid) || this.abandonedWrites.has(guid)) {
+		if (pulling) {
 			this.announcedWhilePulling.set(guid, { expected, at: now });
 			return;
 		}
