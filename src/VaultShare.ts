@@ -7,6 +7,7 @@ import {
 	TAbstractFile,
 	TFile,
 	TFolder,
+	Notice,
 	Vault,
 	debounce,
 	normalizePath,
@@ -64,6 +65,11 @@ import { currentToggles } from "./featureToggleState";
 import { findNestingConflictPath } from "./vaultShareNesting";
 import { isRootSharePath, resolveShareFolder } from "./vaultRootPath";
 import { buildConflictCopyPath, isConflictCopyPath } from "./conflictCopyPath";
+import {
+	ATTACH_SUMMARY_NOTICE_MS,
+	AttachConflictSummary,
+	isDivergenceCopyLabel,
+} from "./attachConflictSummary";
 import { partitionByKnownGuid } from "./mintGate";
 import { DocActivityChannel } from "./docActivity";
 import {
@@ -226,6 +232,8 @@ export class VaultShare extends ProviderBacked {
 	private treeScanInFlight: SingleFlight<void> | null = null;
 	private initialFolderSync: Promise<boolean> | null = null;
 	private cancelInitialFolderSync: (() => void) | null = null;
+	/** Set while this device syncs the folder for the first time (#114). */
+	private attachConflictSummary?: AttachConflictSummary;
 
 	// -- Readiness / persistence promises (memoized -- see awaitReady/awaitSynced) --
 	private readyValue: LazyValue<VaultShare> | null = null;
@@ -967,9 +975,24 @@ export class VaultShare extends ProviderBacked {
 	private async _ensureServerSyncMarked(): Promise<void> {
 		const serverSynced = await this.readServerSynced();
 		if (!serverSynced) {
+			this.beginAttachConflictSummary();
 			await this.onceEverSynced();
 			await this.noteSynced();
 		}
+	}
+
+	/**
+	 * This device has never synced the folder: it was just attached (or its
+	 * local store is new). Every local/server difference of this first sync
+	 * becomes a conflict copy; report them in one summary notice instead of
+	 * leaving the user with unexplained files (see attachConflictSummary.ts).
+	 */
+	private beginAttachConflictSummary(): void {
+		if (this.isTornDown || this.attachConflictSummary?.isOpen) return;
+		const folderName = this.path.split(sep).pop() ?? this.path;
+		this.attachConflictSummary = new AttachConflictSummary(folderName, (message) => {
+			new Notice(message, ATTACH_SUMMARY_NOTICE_MS);
+		});
 	}
 
 	/**
@@ -2493,6 +2516,9 @@ export class VaultShare extends ProviderBacked {
 			normalizePath(this.absolutePath(conflictDocPath)),
 			content,
 		);
+		if (isDivergenceCopyLabel(label)) {
+			this.attachConflictSummary?.record(doc.entryPath, conflictDocPath);
+		}
 		return conflictDocPath;
 	}
 
@@ -3458,6 +3484,7 @@ export class VaultShare extends ProviderBacked {
 
 	dismantle() {
 		this.isTornDown = true;
+		this.attachConflictSummary?.close();
 		this.lostClaimSettler.cancelAll();
 		this.cancelInitialFolderSync?.();
 		this.cancelInitialFolderSync = null;
