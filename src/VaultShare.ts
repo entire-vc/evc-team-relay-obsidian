@@ -2175,7 +2175,7 @@ export class VaultShare extends ProviderBacked {
 		// the file outright instead of overwriting it. Preserve any
 		// unsynced edit as a conflict-copy first;
 		// folders have no content of their own to preserve. Fail
-		// CLOSED like 's reconcileWithConflictCopy: if we can't
+		// CLOSED like copy-first reconcile: if we can't
 		// positively confirm it's safe (nothing to preserve, or the
 		// preserve step actually succeeded), skip the trash this
 		// cycle rather than risk destroying an edit we couldn't check.
@@ -2218,7 +2218,7 @@ export class VaultShare extends ProviderBacked {
 	 * in response to a remote delete, so for an entry whose session hasn't
 	 * restarted since it was last synced, its in-memory content still
 	 * reflects that state. Comparing the on-disk file against it is the
-	 * same technique 's reconcileWithConflictCopy uses, applied to the
+	 * same technique copy-first reconcile uses, applied to the
 	 * delete path.
 	 *
 	 * `find` resolves the live Document/CanvasDocument for `vpath` (or undefined if
@@ -2229,7 +2229,7 @@ export class VaultShare extends ProviderBacked {
 	 * pretty-printed while the exported Y.Doc state isn't).
 	 *
 	 * Returns whether it's safe to proceed with the trash. Fails CLOSED,
-	 * matching 's reconcileWithConflictCopy: any step we can't
+	 * matching copy-first reconcile: any step we can't
 	 * positively confirm (couldn't read the file, couldn't write the
 	 * conflict-copy) returns false rather than falling through to trash —
 	 * an orphaned local file left behind for the next cleanup pass to

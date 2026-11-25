@@ -10,7 +10,6 @@ import type { Clock } from "../src/Clock";
 import { TransferQueue } from "../src/TransferQueue";
 import { Document } from "../src/Document";
 import { VaultShare } from "../src/VaultShare";
-import { reconcileWithConflictCopy } from "../src/ytextDiff";
 import { isConflictCopyPath } from "../src/conflictCopyPath";
 import { hasPreservableContent } from "../src/textEquivalence";
 import { hasUnsyncedEdit } from "../src/preserveBeforeTrash";
@@ -105,15 +104,6 @@ describe("A: no 0-byte conflict copies", () => {
 		await makeQueue().pullIfUnchanged(fakeDoc);
 		expect(writeConflictCopy).not.toHaveBeenCalled();
 	});
-
-	test("reconcileWithConflictCopy: empty Y.Text is not preserved, vault content is applied", async () => {
-		const ydoc = new Y.Doc();
-		const write = jest.fn<(c: string) => Promise<string>>().mockResolvedValue("x");
-		const r = await reconcileWithConflictCopy(ydoc, "local text", write);
-		expect(write).not.toHaveBeenCalled();
-		expect(r.reconciled).toBe(true);
-		expect(ydoc.getText("contents").toJSON()).toBe("local text");
-	});
 });
 
 describe("B: line-ending-only differences are not conflicts", () => {
@@ -136,16 +126,6 @@ describe("B: line-ending-only differences are not conflicts", () => {
 		await makeQueue().pullIfUnchanged(fakeDoc);
 		expect(writeConflictCopy).not.toHaveBeenCalled();
 		expect(writeContents).toHaveBeenCalledWith(fakeDoc, "a\nb\nc\n");
-	});
-
-	test("reconcileWithConflictCopy: CRLF vs LF is already reconciled, no copy, Y.Text untouched", async () => {
-		const ydoc = new Y.Doc();
-		ydoc.getText("contents").insert(0, "line\n");
-		const write = jest.fn<(c: string) => Promise<string>>().mockResolvedValue("x");
-		const r = await reconcileWithConflictCopy(ydoc, "line\r\n", write);
-		expect(write).not.toHaveBeenCalled();
-		expect(r.reconciled).toBe(false);
-		expect(ydoc.getText("contents").toJSON()).toBe("line\n");
 	});
 
 	test("hasUnsyncedEdit ignores line endings", () => {

@@ -2147,7 +2147,7 @@ export default class TeamRelayPlugin extends Plugin {
 				// handler firing, the echoed sync would treat the (now-stale)
 				// inbound content as the "local edit" and reconcile against it,
 				// demoting the second client's genuine edit into a conflict-copy
-				// file ('s reconcileWithConflictCopy prevents outright data
+				// file (copy-first reconcile prevents outright data
 				// loss, but this is still a spurious, avoidable conflict).
 				// Previously only the web-auto-sync branch below checked this
 				// (v1.9); this mirrors the same guard onto the VaultShare/Document
