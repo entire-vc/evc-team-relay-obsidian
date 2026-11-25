@@ -328,6 +328,14 @@ export class VaultShare extends ProviderBacked {
 	 */
 	private attachTripped?: Map<string, Document | CanvasDocument>;
 	private attachFromBarrier = false;
+	/**
+	 * Guids minted locally by claimPaths() in this session (GH #114).
+	 * FolderIndex.put() removes the path from uploadClaims when ensureFileMetadata()
+	 * publishes the record, so scanFileTree() -> _reconcileNewDoc() can run right
+	 * after without seeing uploadClaims; tracking the minted guid keeps our own
+	 * new local-only notes from tripping holdForAttachCheck().
+	 */
+	private locallyMintedGuids?: Set<string>;
 
 	// -- Readiness / persistence promises (memoized -- see awaitReady/awaitSynced) --
 	private readyValue: LazyValue<VaultShare> | null = null;
@@ -1456,7 +1464,7 @@ export class VaultShare extends ProviderBacked {
 	private async attachCandidateFor(vpath: string, localPath?: string): Promise<AttachCandidate | null> {
 		const guid = this.folderIndex.guidFor(vpath);
 		const type = this.folderIndex.recordFor(vpath)?.type;
-		if (!guid || type === undefined) return null;
+		if (!guid || type === undefined || this.locallyMintedGuids?.has(guid)) return null;
 		const tracked = this.trackedEntries.has(guid);
 		let item: Document | CanvasDocument;
 		if (type === ItemKind.Document && Document.matchesTrackedExtension(vpath)) {
@@ -1843,6 +1851,8 @@ export class VaultShare extends ProviderBacked {
 		diverged: (local: string, winner: S) => boolean,
 		winnerEmpty: (winner: S) => boolean,
 	): Promise<T> {
+		const lostGuid = this.uploadClaims.get(vpath);
+		if (lostGuid) this.locallyMintedGuids?.delete(lostGuid);
 		this.folderIndex.clearPendingUpload(vpath);
 		await this.awaitVpathResolved(vpath);
 
@@ -3368,7 +3378,8 @@ export class VaultShare extends ProviderBacked {
 					continue;
 				}
 				this.log("claiming a fresh guid for:", vpath);
-				this.folderIndex.new(vpath);
+				const guid = this.folderIndex.new(vpath);
+				(this.locallyMintedGuids ??= new Set()).add(guid);
 				claimed.push(vpath);
 			}
 		}, this);
@@ -3433,18 +3444,26 @@ export class VaultShare extends ProviderBacked {
 		return canvas;
 	}
 
+	private isLocallyMinted(item: Document | CanvasDocument): boolean {
+		return (
+			Boolean(this.uploadClaims.get(item.entryPath)) ||
+			this.locallyMintedGuids?.has(item.entityGuid) === true
+		);
+	}
+
 	private async _reconcileNewCanvas(canvas: CanvasDocument): Promise<void> {
 		if (this.attachHeld && !this.attachFromBarrier) return;
 		const synced = await canvas.getServerAcked();
+		if (synced) this.locallyMintedGuids?.delete(canvas.entityGuid);
 		if (this.attachHeld) {
-			if (!synced && this.workspaceId && !this.uploadClaims.get(canvas.entryPath)) {
+			if (!synced && this.workspaceId && !this.isLocallyMinted(canvas)) {
 				this.holdForAttachCheck(canvas);
 			}
 			return;
 		}
 		if (canvas.crdtStat.size === 0 && !synced) {
 			void this.transfers.enqueueCanvasFetch(canvas);
-		} else if (this.uploadClaims.get(canvas.entryPath)) {
+		} else if (this.isLocallyMinted(canvas)) {
 			void this.transfers.enqueueUpload(canvas);
 		} else if (!synced && this.workspaceId) {
 			// GH #114: same rule as notes. The fetch's WS fallback (the relay-onprem
@@ -3646,16 +3665,17 @@ export class VaultShare extends ProviderBacked {
 	private async _reconcileNewDoc(doc: Document): Promise<void> {
 		if (this.attachHeld && !this.attachFromBarrier) return;
 		const synced = await doc.getServerAcked();
+		if (synced) this.locallyMintedGuids?.delete(doc.entityGuid);
 		if (this.attachHeld) {
 			// A hold the barrier started: only note what the check must compare.
-			if (!synced && this.workspaceId && !this.uploadClaims.get(doc.entryPath)) {
+			if (!synced && this.workspaceId && !this.isLocallyMinted(doc)) {
 				this.holdForAttachCheck(doc);
 			}
 			return;
 		}
 		if (doc.obsidianFile?.stat.size === 0 && !synced) {
 			void this.transfers.enqueueFetch(doc);
-		} else if (this.uploadClaims.get(doc.entryPath)) {
+		} else if (this.isLocallyMinted(doc)) {
 			void this.transfers.enqueueUpload(doc);
 		} else if (!synced && this.workspaceId) {
 			// GH #114: the server tracks this note, this device never agreed with
@@ -4001,6 +4021,7 @@ export class VaultShare extends ProviderBacked {
 				void doc.dispose();
 				this.pathSet.delete(doc);
 				this.trackedEntries.delete(doc.entityGuid);
+				this.locallyMintedGuids?.delete(doc.entityGuid);
 			}
 		}, this);
 		// Fully tear down the Document/CanvasDocument after removing from folderIndex:
@@ -4128,6 +4149,7 @@ export class VaultShare extends ProviderBacked {
 
 	dismantle() {
 		this.isTornDown = true;
+		this.locallyMintedGuids?.clear();
 		this.attachConflictSummary?.close();
 		this.lostClaimSettler.cancelAll();
 		if (this.attachEntry) attachReviewUi?.finished(this, null);

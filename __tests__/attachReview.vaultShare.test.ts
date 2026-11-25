@@ -1327,3 +1327,150 @@ describe("a server move that brings a note onto a tracked path", () => {
 		expect(finalSummary).toContain("new (relay conflict");
 	});
 });
+
+describe("GH #114: local-only note adopted after attach check must not re-hold the folder", () => {
+	beforeEach(() => setUi(null));
+
+	function makeAdoptedShare(localFiles: { path: string; text: string }[]) {
+		const ydoc = new Y.Doc();
+		const uploadClaims = new Map<string, string>();
+		const folderIndex = new FolderIndex(ydoc, FOLDER, uploadClaims, {
+			subscribe: () => () => {},
+		} as unknown as ConstructorParameters<typeof FolderIndex>[3]);
+		const vault = makeVault();
+		const tfiles: TFile[] = [];
+		for (const f of localFiles) {
+			const full = `${FOLDER}/${f.path}`;
+			vault.files.set(full, f.text);
+			const tfile = new TFile(full);
+			tfile.stat.size = f.text.length;
+			tfiles.push(tfile);
+		}
+		const uploads: string[] = [];
+		const fetches: string[] = [];
+		const queue = Object.create(TransferQueue.prototype) as TransferQueue;
+		Object.defineProperty(queue, "enqueueUpload", {
+			value: async (doc: Document) => {
+				uploads.push(doc.entryPath);
+			},
+		});
+		Object.defineProperty(queue, "enqueueFetch", {
+			value: async (doc: Document) => {
+				fetches.push(doc.entryPath);
+			},
+		});
+		Object.defineProperty(queue, "enqueueCanvasFetch", {
+			value: async (doc: { entryPath: string }) => {
+				fetches.push(doc.entryPath);
+			},
+		});
+		Object.defineProperty(queue, "readRelayText", { value: async () => "" });
+
+		let config: Record<string, unknown> = { guid: "f", path: FOLDER };
+		const share = Object.create(VaultShare.prototype) as VaultShare;
+		const define = (key: string, value: unknown) =>
+			Object.defineProperty(share, key, { value, writable: true, configurable: true });
+		define("path", FOLDER);
+		define("workspaceId", "relay-onprem");
+		define("freshlyCreated", false);
+		define("isTornDown", false);
+		define("attachEntry", null);
+		define("crdtDoc", ydoc);
+		define("uploadClaims", uploadClaims);
+		define("folderIndex", folderIndex);
+		define("transfers", queue);
+		define("trackedEntries", new Map());
+		define("deletedEntries", new Set());
+		define("isDeletePending", () => false);
+		define("isSyncableVaultFile", () => true);
+		define("vaultApi", { adapter: vault.adapter, getName: () => "Vault" });
+		define("pathSet", { include: () => {}, update: () => {} });
+		define("log", () => {});
+		define("warn", () => {});
+		define("debug", () => {});
+		define("error", () => {});
+		define("_config", {
+			readValue: () => config,
+			mutateValue: async (fn: (c: Record<string, unknown>) => Record<string, unknown>) => {
+				config = fn(config);
+			},
+		});
+		define("runDeferredAttachCheck", async () => {});
+
+		return { share, folderIndex, uploadClaims, tfiles, uploads, fetches };
+	}
+
+	test("ensureFileMetadata clears uploadClaims, but _reconcileNewDoc still uploads the locally-minted note without re-holding", async () => {
+		const { share, folderIndex, uploadClaims, tfiles, uploads } = makeAdoptedShare([
+			{ path: "local-only.md", text: "Local-only note from participant 2\n" },
+		]);
+
+		const claimed = share.claimPaths(tfiles as unknown as Parameters<VaultShare["claimPaths"]>[0]);
+		expect(claimed).toEqual(["local-only.md"]);
+		const guid = folderIndex.guidFor("local-only.md")!;
+		expect(guid).toBeTruthy();
+		expect(uploadClaims.get("local-only.md")).toBe(guid);
+
+		// ensureFileMetadata() -> FolderIndex.put() writes records and deletes mintedGuids (uploadClaims),
+		// which synchronously triggers scanFileTree() -> newDoc() -> _reconcileNewDoc() on live vaults.
+		(share as unknown as { ensureFileMetadata(files: TFile[]): void }).ensureFileMetadata(tfiles);
+		expect(uploadClaims.get("local-only.md")).toBeUndefined();
+
+		const { doc } = makeDoc(guid, "local-only.md", "", false);
+		(doc as unknown as { obsidianFile: TFile }).obsidianFile = tfiles[0];
+
+		await (share as unknown as Internals)._reconcileNewDoc(doc);
+
+		expect((share as unknown as Internals).attachHeld).toBe(false);
+		expect(uploads).toEqual(["local-only.md"]);
+
+		// Also skipped by attachCandidateFor even if another barrier hold runs before sync acks.
+		const cand = await (
+			share as unknown as { attachCandidateFor(vpath: string): Promise<unknown> }
+		).attachCandidateFor("local-only.md");
+		expect(cand).toBeNull();
+	});
+
+	test("ensureFileMetadata clears uploadClaims for .canvas, _reconcileNewCanvas still uploads without re-holding", async () => {
+		const { share, folderIndex, uploadClaims, tfiles, uploads } = makeAdoptedShare([
+			{ path: "board.canvas", text: '{"nodes":[],"edges":[]}' },
+		]);
+
+		expect(share.claimPaths(tfiles as unknown as Parameters<VaultShare["claimPaths"]>[0])).toEqual([
+			"board.canvas",
+		]);
+		const guid = folderIndex.guidFor("board.canvas")!;
+		expect(uploadClaims.get("board.canvas")).toBe(guid);
+
+		(share as unknown as { ensureFileMetadata(files: TFile[]): void }).ensureFileMetadata(tfiles);
+		expect(uploadClaims.get("board.canvas")).toBeUndefined();
+
+		const canvas = {
+			entityGuid: guid,
+			entryPath: "board.canvas",
+			crdtStat: { size: 22 },
+			obsidianFile: tfiles[0],
+			getServerAcked: async () => false,
+		};
+		await (share as unknown as { _reconcileNewCanvas(c: unknown): Promise<void> })._reconcileNewCanvas(canvas);
+
+		expect((share as unknown as Internals).attachHeld).toBe(false);
+		expect(uploads).toEqual(["board.canvas"]);
+	});
+
+	test("positive control: a server-minted guid on the same path still triggers holdForAttachCheck", async () => {
+		const { share, folderIndex, tfiles, uploads } = makeAdoptedShare([
+			{ path: "server-note.md", text: "Local diverging text\n" },
+		]);
+		const serverGuid = "11111111-1111-4111-8111-111111111111";
+		folderIndex.ensureMeta("server-note.md", { version: 0, id: serverGuid, type: ItemKind.Document });
+
+		const { doc } = makeDoc(serverGuid, "server-note.md", "Server text\n", false);
+		(doc as unknown as { obsidianFile: TFile }).obsidianFile = tfiles[0];
+
+		await (share as unknown as Internals)._reconcileNewDoc(doc);
+
+		expect((share as unknown as Internals).attachHeld).toBe(true);
+		expect(uploads).toEqual([]);
+	});
+});
