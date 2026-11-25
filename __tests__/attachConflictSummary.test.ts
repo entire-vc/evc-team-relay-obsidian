@@ -36,6 +36,20 @@ describe("AttachConflictSummary", () => {
 		summary.close();
 	});
 
+	test("the quiet period ends the collection: a later copy is not recorded or shown", () => {
+		const shown: string[] = [];
+		const summary = new AttachConflictSummary("F", (m) => shown.push(m), { quietMs: 100 });
+
+		summary.record("a.md", "a (relay conflict 1).md");
+		jest.advanceTimersByTime(100);
+		expect(summary.isOpen).toBe(false);
+		expect(summary.record("b.md", "b (relay conflict 2).md")).toBe(false);
+		jest.advanceTimersByTime(60 * 60 * 1000);
+
+		expect(shown).toHaveLength(1);
+		expect(shown[0]).toContain("1 file differed");
+	});
+
 	test("closed collector records nothing and shows nothing", () => {
 		const shown: string[] = [];
 		const summary = new AttachConflictSummary("F", (m) => shown.push(m));

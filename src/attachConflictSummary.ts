@@ -11,10 +11,11 @@
  * how many files differed and which copies were created.
  *
  * The first sync is not one awaitable operation: uploads run through the
- * transfer queue long after the folder is adopted. So a batch is reported
- * once no new copy arrived for `quietMs`, and collection stops `windowMs`
- * after the first sync began. Copies written after that are left to the
- * ordinary sync passes, which this module does not touch.
+ * transfer queue long after the folder is adopted. So the summary is shown
+ * once no new copy arrived for `quietMs`, or `windowMs` after the first sync
+ * began, whichever comes first. That ends the collection: one first sync,
+ * at most one notice. Copies written after it are left to the ordinary sync
+ * passes, which this module does not touch.
  */
 
 /** Labels of copies that hold one side of a local/server divergence. */
@@ -22,8 +23,8 @@ const DIVERGENCE_LABEL = /^(?:relay conflict|upload race)\b/;
 
 /** Copies listed by name before the rest is folded into "+K more". */
 export const ATTACH_SUMMARY_MAX_NAMES = 10;
-/** A batch is reported once no new copy arrived for this long. */
-export const ATTACH_SUMMARY_QUIET_MS = 5000;
+/** The summary is shown once no new copy arrived for this long. */
+export const ATTACH_SUMMARY_QUIET_MS = 10000;
 /** Collection stops this long after the first sync began. */
 export const ATTACH_SUMMARY_WINDOW_MS = 10 * 60 * 1000;
 /** How long the summary notice stays on screen. */
@@ -114,12 +115,12 @@ export class AttachConflictSummary {
 		this.originals.add(originalPath);
 		this.copies.push(copyPath);
 		if (this.quietTimer !== undefined) this.timers.clear(this.quietTimer);
-		this.quietTimer = this.timers.set(() => this.flush(), this.quietMs);
+		this.quietTimer = this.timers.set(() => this.close(), this.quietMs);
 		return true;
 	}
 
-	/** Shows the pending batch, if any, as one notice. */
-	flush(): void {
+	/** Shows what was collected, if anything, as one notice. */
+	private report(): void {
 		if (this.quietTimer !== undefined) {
 			this.timers.clear(this.quietTimer);
 			this.quietTimer = undefined;
@@ -136,11 +137,11 @@ export class AttachConflictSummary {
 		this.show(message);
 	}
 
-	/** Ends the window: reports what is pending and stops collecting. */
+	/** Ends the collection: shows the one summary, if any copy was taken. */
 	close(): void {
 		if (this.closed) return;
 		this.closed = true;
 		this.timers.clear(this.windowTimer);
-		this.flush();
+		this.report();
 	}
 }

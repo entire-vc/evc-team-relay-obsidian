@@ -60,7 +60,7 @@ async function syncWithDifferingFiles(share: VaultShare, paths: string[]): Promi
 			),
 		);
 	}
-	await jest.advanceTimersByTimeAsync(10_000);
+	await jest.advanceTimersByTimeAsync(15_000);
 	return copies;
 }
 
@@ -127,13 +127,27 @@ describe("attach: first sync of a folder with diverged server copies (#114)", ()
 		expect(noticeTexts()).toHaveLength(0);
 	});
 
+	test("one first sync, one notice: a copy after the summary adds no second notice", async () => {
+		const { share, written } = makeShare({ serverSynced: false });
+		const internals = share as unknown as Internals;
+
+		await syncWithDifferingFiles(share, ["a.md", "b.md"]);
+		await jest.advanceTimersByTimeAsync(30_000);
+		await internals.writeConflictCopy({ entryPath: "c.md" }, "text", "relay conflict later");
+		await jest.advanceTimersByTimeAsync(60 * 60 * 1000);
+
+		expect(written).toHaveLength(3);
+		expect(noticeTexts()).toHaveLength(1);
+		expect(noticeTexts()[0]).toContain("2 files differed between local and server");
+	});
+
 	test("copies a linked delete preserves are not counted as local/server differences", async () => {
 		const { share } = makeShare({ serverSynced: false });
 		const internals = share as unknown as Internals;
 		await internals._ensureServerSyncMarked();
 
 		await internals.writeConflictCopy({ entryPath: "gone.md" }, "text", "relay deleted 2026-11-25");
-		await jest.advanceTimersByTimeAsync(10_000);
+		await jest.advanceTimersByTimeAsync(15_000);
 
 		expect(noticeTexts()).toHaveLength(0);
 	});
@@ -145,7 +159,7 @@ describe("attach: first sync of a folder with diverged server copies (#114)", ()
 
 		await jest.advanceTimersByTimeAsync(11 * 60 * 1000);
 		await internals.writeConflictCopy({ entryPath: "late.md" }, "text", "relay conflict late");
-		await jest.advanceTimersByTimeAsync(10_000);
+		await jest.advanceTimersByTimeAsync(15_000);
 
 		expect(noticeTexts()).toHaveLength(0);
 	});
