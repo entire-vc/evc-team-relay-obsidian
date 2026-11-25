@@ -142,6 +142,17 @@ describe("GH #113: reconcile without a common base keeps one version whole", () 
 		expect(fake.getBase()).toBeUndefined();
 	});
 
+	test("a base differing from the relay text only by line endings is still the common base: the own edit is applied, no copy", async () => {
+		// Windows: the base was recorded with CRLF, the relay holds LF.
+		const a = new Y.Doc();
+		a.getText("contents").insert(0, "a\nb\n");
+		const fake = makeFakeDoc(a, "a\r\nb edited\r\n", "a\r\nb\r\n");
+		const queue = new TransferQueue({} as never, new SystemClock(), {} as never);
+		await queue.uploadDocumentViaSocket(fake.d);
+		expect(fake.writeConflictCopy).not.toHaveBeenCalled();
+		expect(a.getText("contents").toJSON()).toBe("a\r\nb edited\r\n");
+	});
+
 	test("a collaborator's edit landing during the reconcile claim: the note is a whole version, the file text is the copy", async () => {
 		// The base equals the relay text, so this takes the claim path; the
 		// collaborator's edit arrives mid-settle, the claim is not used, and

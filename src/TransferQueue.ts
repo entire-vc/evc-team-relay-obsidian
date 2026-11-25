@@ -16,7 +16,7 @@ import { CanvasDocument } from "./CanvasDocument";
 import { deepValueEquals } from "./deepValueEquals";
 import type { CanvasData } from "./HostCanvasView";
 import { AttachmentFile, isAttachmentFile } from "./AttachmentFile";
-import { applyDiffToYText, reconcileWithConflictCopy } from "./ytextDiff";
+import { applyDiffToYText } from "./ytextDiff";
 import { hasPreservableContent, sameTextContent } from "./textEquivalence";
 import { waitForBufferFlush } from "./websocketFlush";
 import { textFingerprint } from "./docActivity";
@@ -1182,8 +1182,8 @@ export class TransferQueue extends Loggable {
 		// syncing with the relay, reconcile content. The vault file is treated as
 		// the source of truth for edits that weren't committed to Y.Doc (e.g. the
 		// file was modified without an active editor binding) — but see
-		// reconcileRelayContent()/reconcileWithConflictCopy: it never discards
-		// divergent Y.Doc content without preserving it first.
+		// deliverPreservingLocalEdit()/reconcileRelayContent(): without a common
+		// base the file text is kept as a copy and the CRDT is not rewritten.
 		// A doc with a history gap shows empty or partial text: reconciling
 		// would seed the file into it (duplicated once the gap closes) and
 		// record that text as the agreed base.
@@ -1685,8 +1685,7 @@ export class TransferQueue extends Loggable {
 				// edit (e.g. app.vault.modify() with no live editor binding),
 				// not staleness from our own in-flight push. Preserve it
 				// before overwriting -- never silently discard, same
-				// invariant as reconcileRelayContent()/
-				// reconcileWithConflictCopy.
+				// invariant as deliverPreservingLocalEdit().
 				const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 				await doc.vaultShare.writeConflictCopy(
 					doc,
@@ -2068,7 +2067,7 @@ export class TransferQueue extends Loggable {
 			// preserving as before -- noisy-but-safe over silently discarding
 			// someone else's edit.
 			const base = await doc.getSyncBase();
-			if (base !== undefined && base === syncedText) {
+			if (base !== undefined && sameTextContent(base, syncedText)) {
 				// This snapshot alone can't tell "only I moved" apart from "a
 				// GENUINELY CONCURRENT client is about to reach the exact same
 				// conclusion against the exact same stale base" --
@@ -2116,7 +2115,7 @@ export class TransferQueue extends Loggable {
 					baseSettled = hasPreservableContent(doc.content)
 						? await this.keepLocalTextAndDeliverRelay(doc, vaultContents, base)
 						: true;
-				} else if (wonReconcileClaim(doc.crdtDoc) && doc.content === base) {
+				} else if (wonReconcileClaim(doc.crdtDoc) && sameTextContent(doc.content, base)) {
 					// Won the claim AND the settled text still matches what we
 					// started with -- re-checked, not assumed, in case some
 					// THIRD update landed during the settle window itself.
@@ -2142,10 +2141,10 @@ export class TransferQueue extends Loggable {
 						: true;
 				}
 			} else {
-				// Reached only for a relay text with nothing to preserve
-				// (whitespace): any other divergence without a usable base
-				// went through deliverPreservingLocalEdit() already.
-				await this.reconcileWithVaultFileSafely(doc, vaultContents, syncedText);
+				// No base, or the relay moved off it: normally settled by
+				// deliverPreservingLocalEdit() already, unless the relay text
+				// changed since. Same outcome; never a diff without a base.
+				baseSettled = await this.keepLocalTextAndDeliverRelay(doc, vaultContents, base);
 			}
 		}
 
@@ -2156,46 +2155,6 @@ export class TransferQueue extends Loggable {
 		// disconnecting at that point drops it silently.
 		await waitForBufferFlush(doc._liveProvider.ws);
 		return baseSettled;
-	}
-
-	/**
-	 * The conflict-preserving reconcile path: whatever the Y.Doc CURRENTLY
-	 * holds (read fresh inside reconcileWithConflictCopy() itself, not from
-	 * `priorSyncedText` — that parameter is only for the log line) may
-	 * include edits from OTHER clients that just merged in, or from the
-	 * winner of a reconcileClaim race; a plain text diff can't
-	 * tell those apart from this device's own unsynced edits, so before
-	 * rewriting the Y.Doc to match the vault file we preserve whatever it
-	 * currently holds as a conflict-copy file — nothing is silently
-	 * discarded, and if the preserve step itself fails we skip reconciling
-	 * rather than risk it.
-	 */
-	private async reconcileWithVaultFileSafely(
-		doc: Document,
-		vaultContents: string,
-		priorSyncedText: string,
-	): Promise<void> {
-		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const result = await reconcileWithConflictCopy(
-			doc.crdtDoc,
-			vaultContents,
-			(relayContent) =>
-				doc.vaultShare.writeConflictCopy(doc, relayContent, `relay conflict ${timestamp}`),
-			undefined,
-			(...args) => this.log("[uploadDocumentViaSocket]", ...args),
-		);
-		if (result.reconciled) {
-			this.log(
-				`[uploadDocumentViaSocket] Reconciled ${doc.entryPath} with vault file ` +
-					`(relay=${priorSyncedText.length}, vault=${vaultContents.length}); ` +
-					`prior relay content preserved at ${result.conflictPath}`,
-			);
-		} else {
-			this.warn(
-				`[uploadDocumentViaSocket] Skipped reconciliation for ${doc.entryPath} — ` +
-					`could not safely preserve relay content before overwriting`,
-			);
-		}
 	}
 
 	/**
