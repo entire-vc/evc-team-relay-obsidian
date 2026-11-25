@@ -254,6 +254,8 @@ const AWAIT_CONTENT_RECONNECT_MS = 4_000;
 const UNSEEDED_CONFIRM_MS = 60_000;
 /** probeRelay(): cap on each of its two phases. */
 const PROBE_PHASE_TIMEOUT_MS = 30_000;
+/** Extra reads of a relay text that came back empty before it is taken as empty. */
+const ATTACH_EMPTY_RETRIES = 2;
 /**
  * Outer safety bound on reconcileRelayContent()'s claim+settle fast path
  *. awaitReconcileSettled already has its own internal
@@ -800,6 +802,7 @@ export class TransferQueue extends Loggable {
 		item: AttachmentFile | Document | CanvasDocument,
 		options: EnqueueOptions = {},
 	): Promise<void> {
+		if (this.refuseHeld(item, "enqueueUpload")) return;
 		if (this.syncLane.inFlight.has(item.entityGuid)) {
 			this.debug(`[enqueueUpload] Item ${item.entityGuid} already in progress, skipping`);
 			if (this.isRunning(this.syncLane, item.entityGuid)) {
@@ -839,6 +842,7 @@ export class TransferQueue extends Loggable {
 		item: AttachmentFile | Document | CanvasDocument,
 		options: EnqueueOptions = {},
 	): Promise<void> {
+		if (this.refuseHeld(item, "enqueueFetch")) return Promise.resolve();
 		if (this.downloadLane.inFlight.has(item.entityGuid)) {
 			this.debug(
 				`[enqueueFetch] Item ${item.entityGuid} already in progress, skipping`,
@@ -862,6 +866,17 @@ export class TransferQueue extends Loggable {
 		this.batches.put(item.vaultShare, group);
 
 		return this.pushToLane(this.downloadLane, item, options.priority ?? false);
+	}
+
+	/**
+	 * A folder held for the attach check (attachReview.ts, GH #114) writes
+	 * nothing to disk or to the server until the user decides. Callers are
+	 * gated too; this is the backstop for one that was missed.
+	 */
+	private refuseHeld(item: AttachmentFile | Document | CanvasDocument, op: string): boolean {
+		if (!item.vaultShare?.attachHeld) return false;
+		this.warn(`[${op}] ${item.entryPath}: folder is held for the attach check, not queued`);
+		return true;
 	}
 
 	/**
@@ -1894,6 +1909,99 @@ export class TransferQueue extends Loggable {
 	 * `await doc.awaitFirstSync()` (CanvasDocument) has resolved — see the
 	 * comment on that await above.
 	 */
+	/**
+	 * Connects `doc` long enough to read what the relay holds and returns
+	 * it, writing nothing to disk or to the relay (attach check, GH #114).
+	 * A canvas is returned as its JSON, "" when it has no nodes or edges.
+	 * An empty answer is re-read: a relay room that is still loading can
+	 * answer the first sync empty. Null when the relay could
+	 * not be reached.
+	 */
+	async readRelayText(doc: Document | CanvasDocument): Promise<string | null> {
+		await doc.awaitFirstSync();
+		for (let attempt = 0; ; attempt++) {
+			const text = await this.withRelayConnection(doc, () => this.relayTextOf(doc));
+			if (text === null) return null;
+			if (text !== "" || attempt >= ATTACH_EMPTY_RETRIES) return text;
+			if (!doc.editLock) doc.goOffline();
+			await this.delay(PULL_SYNC_GRACE_MS * (attempt + 1));
+		}
+	}
+
+	/**
+	 * Makes `local` the relay's text for `doc` (attach check, keep local).
+	 * The relay's current text goes to `preserve` first; when `preserve`
+	 * throws, the relay is left as it is. Returns
+	 * whether the relay was rewritten.
+	 */
+	async replaceRelayText(
+		doc: Document | CanvasDocument,
+		local: string,
+		preserve: (relayText: string) => Promise<void>,
+	): Promise<boolean> {
+		await doc.awaitFirstSync();
+		const result = await this.withRelayConnection(doc, async () => {
+			if (isDocument(doc)) {
+				const relayText = doc.content;
+				if (sameTextContent(relayText, local)) return true;
+				if (hasPreservableContent(relayText)) {
+					try {
+						await preserve(relayText);
+					} catch (e: unknown) {
+						this.warn("[replaceRelayText] could not save the relay text, left as it is", e);
+						return false;
+					}
+				}
+				applyDiffToYText(doc.crdtDoc, local);
+				await waitForBufferFlush(doc._liveProvider.ws);
+				return true;
+			}
+			const relayJson = this.relayTextOf(doc);
+			if (relayJson !== "") {
+				try {
+					await preserve(relayJson);
+				} catch (e: unknown) {
+					this.warn("[replaceRelayText] could not save the relay canvas, left as it is", e);
+					return false;
+				}
+			}
+			doc.applyJsonPayload(local);
+			await waitForBufferFlush(doc._liveProvider.ws);
+			return true;
+		});
+		return result === true;
+	}
+
+	private relayTextOf(doc: Document | CanvasDocument): string {
+		if (isDocument(doc)) return doc.content;
+		const data = CanvasDocument.exportData(doc.crdtDoc);
+		return data.nodes.length === 0 && data.edges.length === 0 ? "" : JSON.stringify(data);
+	}
+
+	/**
+	 * Runs `fn` on a connection that synced just now. Null when the relay
+	 * could not be reached, or the connection dropped before `fn` returned:
+	 * a sync from an earlier connection does not count, so the attach check
+	 * never takes an old relay text for the current one.
+	 */
+	private async withRelayConnection<T>(
+		doc: Document | CanvasDocument,
+		fn: () => T | Promise<T>,
+	): Promise<T | null> {
+		const intent = doc.connectionIntent;
+		const connected = await doc.bringOnline();
+		if (!connected) return null;
+		try {
+			const ok = await this.awaitProviderSyncWithTimeout(doc, doc.onceFreshlySynced());
+			if (!ok || !doc._liveProvider.synced) return null;
+			if (intent === "disconnected") await this.delay(PULL_SYNC_GRACE_MS);
+			const result = await fn();
+			return doc._liveProvider.synced ? result : null;
+		} finally {
+			if (intent === "disconnected" && !doc.editLock) doc.goOffline();
+		}
+	}
+
 	private readSyncedContent(doc: Document | CanvasDocument): {
 		text: string;
 		canvasData: CanvasData | null;

@@ -55,8 +55,12 @@ import { relative } from "path-browserify";
 import { Plugin } from "obsidian";
 
 // Core sync/data model
-import { VaultShare, ShareRegistry } from "./VaultShare";
+import { VaultShare, ShareRegistry, setAttachReviewUi } from "./VaultShare";
 import { holdsOnlySyncedText, uploadsOnModify } from "./uploadOnModify";
+import { isAttachDeclined, withDeclinedAttach, withoutDeclinedAttach } from "./attachReview";
+import type { AttachEntryPoint } from "./attachReview";
+import { AttachReviewPresenter } from "./ui/AttachReviewModal";
+import { uiText } from "./wording/uiText";
 import { AppWriteLog, PathQueue, onBoundNoteModified } from "./externalDiskChange";
 import type { VaultShareSettings } from "./VaultShare";
 import { ViewBindingRegistry } from "./ViewBindings";
@@ -145,6 +149,12 @@ interface StoredSettings extends FeatureToggles, LoggingSettings {
 	sharedFolders: VaultShareSettings[];
 	endpoints: TenantSettings;
 	relayOnPrem: RelayOnPremSettings;
+	/**
+	 * "<shareId>:<path>" pairs whose startup auto-connect the user cancelled
+	 * in the attach check (GH #114). Auto-connect skips them; connecting the
+	 * folder by hand clears the entry.
+	 */
+	declinedAutoAttach?: string[];
 }
 
 const DEFAULT_SETTINGS: StoredSettings = {
@@ -239,6 +249,7 @@ export default class TeamRelayPlugin extends Plugin {
 	// /v1/server/info answers for the server list, kept across its mounts.
 	readonly serverInfoCache = new ServerInfoCache();
 	pluginSettings!: Settings<StoredSettings>;
+	private attachReviewPresenter?: AttachReviewPresenter;
 
 	// Persisted-settings namespaces
 	private featureToggleSettings!: SettingsScope<FeatureToggles>;
@@ -692,6 +703,22 @@ export default class TeamRelayPlugin extends Plugin {
 			this.sharedFolderSettings,
 		);
 
+		// The attach check's UI (GH #114). Registered before any share comes
+		// online so a restored held folder finds it.
+		this.attachReviewPresenter = new AttachReviewPresenter(this.app, (share, entry) =>
+			this.onAttachCancelled(share, entry),
+		);
+		setAttachReviewUi(this.attachReviewPresenter);
+		this.addCommand({
+			id: "review-folders-waiting-to-connect",
+			name: uiText("attachReview.reviewCommand"),
+			callback: () => {
+				if (!this.attachReviewPresenter?.reviewPending()) {
+					new Notice(uiText("attachReview.nothingPending"));
+				}
+			},
+		});
+
 		// Initialize relay-onprem token providers and share client if enabled
 		const relayOnPremSettings = this.relayOnPremSettings.readValue();
 		const defaultServer = getDefaultServer(relayOnPremSettings);
@@ -792,6 +819,10 @@ export default class TeamRelayPlugin extends Plugin {
 				this.shareClientManager,
 				this.webSyncManager,
 				hashManifestStore,
+			);
+			this.inboundFileDownloader.setAttachHeldProbe(
+				(shareId) =>
+					!!this.shareRegistry?.locate((vs) => vs.entityGuid === shareId && vs.attachHeld),
 			);
 
 			// Outbound mirror of local edits into the sync protocol.
@@ -1251,6 +1282,7 @@ export default class TeamRelayPlugin extends Plugin {
 		hasPendingUpdates?: boolean,
 		isRestore?: boolean,
 		freshlyCreated?: boolean,
+		attach?: AttachEntryPoint,
 	): VaultShare {
 		// Address this folder's settings slice by its guid, not array index.
 		// Validates the guid before anything is written (GH #116).
@@ -1259,7 +1291,11 @@ export default class TeamRelayPlugin extends Plugin {
 			path,
 			guid,
 			workspaceId,
+			!!attach && !!workspaceId,
 		);
+		if (attach === "manual") {
+			void this.forgetDeclinedAutoAttach(guid, path);
+		}
 
 		const folder = new VaultShare(
 			this.instanceAppId,
@@ -1278,8 +1314,41 @@ export default class TeamRelayPlugin extends Plugin {
 			hasPendingUpdates,
 			isRestore,
 			freshlyCreated,
+			attach,
 		);
 		return folder;
+	}
+
+	/** Did the user cancel the auto-connect of this share into this folder? */
+	private isAutoAttachDeclined(shareId: string, path: string): boolean {
+		return isAttachDeclined(this.pluginSettings.snapshot()?.declinedAutoAttach, shareId, path);
+	}
+
+	private async rememberDeclinedAutoAttach(shareId: string, path: string): Promise<void> {
+		if (this.isAutoAttachDeclined(shareId, path)) return;
+		await this.pluginSettings.mutate((settings) => ({
+			...settings,
+			declinedAutoAttach: withDeclinedAttach(settings.declinedAutoAttach, shareId, path),
+		}));
+	}
+
+	private async forgetDeclinedAutoAttach(shareId: string, path: string): Promise<void> {
+		if (!this.isAutoAttachDeclined(shareId, path)) return;
+		await this.pluginSettings.mutate((settings) => ({
+			...settings,
+			declinedAutoAttach: withoutDeclinedAttach(settings.declinedAutoAttach, shareId, path),
+		}));
+	}
+
+	/** Cancel in the attach check: the folder is not connected, nothing on disk changes. */
+	private onAttachCancelled(share: VaultShare, entry: AttachEntryPoint): void {
+		// The share's guid is the server share id (the auto-connect passes share.id).
+		const shareId = share.entityGuid;
+		const path = share.path;
+		this.shareRegistry?.delete(share);
+		if (entry === "auto") {
+			void this.rememberDeclinedAutoAttach(shareId, path);
+		}
 	}
 
 	/**
@@ -1410,7 +1479,9 @@ export default class TeamRelayPlugin extends Plugin {
 								share.path,
 								share.id,
 								"relay-onprem",
-								false
+								false,
+								undefined,
+								"auto",
 							);
 							if (vaultShare) {
 								await vaultShare.setOnpremServerId(share.serverId);
@@ -1421,12 +1492,16 @@ export default class TeamRelayPlugin extends Plugin {
 						} else if (!existing) {
 							// Only auto-create if the folder exists locally in vault
 							const vaultFolder = resolveShareFolder(this.app.vault, share.path);
-							if (vaultFolder) {
+							if (vaultFolder && this.isAutoAttachDeclined(share.id, share.path)) {
+								log(`Share "${share.path}" not connected: the user cancelled its attach check`);
+							} else if (vaultFolder) {
 								const vaultShare = this.shareRegistry.new(
 									share.path,
 									share.id,
 									"relay-onprem",
-									true
+									true,
+									undefined,
+									"auto",
 								);
 								if (vaultShare) {
 									await vaultShare.setOnpremServerId(share.serverId);
@@ -1515,7 +1590,9 @@ export default class TeamRelayPlugin extends Plugin {
 								share.path,
 								share.id,
 								"relay-onprem",
-								false
+								false,
+								undefined,
+								"auto",
 							);
 							if (vaultShare) {
 								await vaultShare.setOnpremServerId(defaultServerId);
@@ -1526,12 +1603,16 @@ export default class TeamRelayPlugin extends Plugin {
 						} else if (!existing) {
 							// Only auto-create if the folder exists locally in vault
 							const vaultFolder = resolveShareFolder(this.app.vault, share.path);
-							if (vaultFolder) {
+							if (vaultFolder && this.isAutoAttachDeclined(share.id, share.path)) {
+								log(`Share "${share.path}" not connected: the user cancelled its attach check`);
+							} else if (vaultFolder) {
 								const vaultShare = this.shareRegistry.new(
 									share.path,
 									share.id,
 									"relay-onprem",
-									true
+									true,
+									undefined,
+									"auto",
 								);
 								if (vaultShare) {
 									await vaultShare.setOnpremServerId(defaultServerId);
@@ -2402,6 +2483,9 @@ export default class TeamRelayPlugin extends Plugin {
 		this.activeModals.length = 0;
 
 		this.shareRegistry?.destroy();
+		setAttachReviewUi(null);
+		this.attachReviewPresenter?.hideAll();
+		this.attachReviewPresenter = undefined;
 		this.shareRegistry = null as unknown as ShareRegistry;
 
 		this.settingsPage?.teardown();

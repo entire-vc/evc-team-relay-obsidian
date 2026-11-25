@@ -108,6 +108,7 @@ export class InboundFileDownloader {
 	// or null when the path has no CRDT document; then the
 	// caller writes the file as an ordinary edit.
 	private liveTextTarget: ((vaultPath: string) => Promise<LiveText | null>) | null = null;
+	private isAttachHeld: ((shareId: string) => boolean) | null = null;
 
 	constructor(
 		vault: Vault,
@@ -142,6 +143,14 @@ export class InboundFileDownloader {
 	}
 
 	/**
+	 * Is this share's local folder held by the attach check (GH #114)? Nothing
+	 * is written into a held folder until the user has decided.
+	 */
+	setAttachHeldProbe(probe: ((shareId: string) => boolean) | null): void {
+		this.isAttachHeld = probe;
+	}
+
+	/**
 	 * Main entry point — called by InboundSyncPoller when web_content_updated_at bumps.
 	 * Resolves the share path, fetches the files index, diffs, and writes new/updated items.
 	 * Returns "skipped" when outbound sync is in flight so the poller can retry.
@@ -149,6 +158,10 @@ export class InboundFileDownloader {
 	async downloadShare(shareId: string, serverId: string): Promise<"ran" | "skipped"> {
 		if (this.webSyncManager.isOutboundSyncing) {
 			log("Skipping — outbound sync in flight", { shareId });
+			return "skipped";
+		}
+		if (this.isAttachHeld?.(shareId)) {
+			log("Skipping — folder held by the attach check", { shareId });
 			return "skipped";
 		}
 

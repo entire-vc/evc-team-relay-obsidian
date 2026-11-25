@@ -222,6 +222,22 @@ export class CanvasDocument extends ProviderBacked implements SyncableEntry, Mim
 		return this._indexeddbPersistence.loadServerSyncFlag();
 	}
 
+	private static readonly SYNC_BASE_KEY = "syncBase";
+
+	/**
+	 * The canvas JSON this device and the relay last agreed on. Written by
+	 * the attach check (GH #114) so a canvas it settled is not offered again;
+	 * same key and meaning as Document.getSyncBase().
+	 */
+	async getSyncBase(): Promise<string | undefined> {
+		const stored: unknown = await this._indexeddbPersistence.get(CanvasDocument.SYNC_BASE_KEY);
+		return typeof stored === "string" ? stored : undefined;
+	}
+
+	async setSyncBase(text: string): Promise<void> {
+		await this._indexeddbPersistence.set(CanvasDocument.SYNC_BASE_KEY, text);
+	}
+
 	async bringOnline(): Promise<boolean> {
 		if (!this.vaultShare) {
 			// dismantle() already detached this entry from its shared folder; a
