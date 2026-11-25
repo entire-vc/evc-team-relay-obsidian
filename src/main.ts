@@ -2179,8 +2179,7 @@ export default class TeamRelayPlugin extends Plugin {
 						} else if (file && isDocument(file) && file.editLock && tfile instanceof TFile) {
 							// Editor-bound note: its edits reach the Y.Doc through the
 							// editor, but another program's rewrite of the file may not.
-							const loadedText = this.loadedEditorText(tfile);
-							void this.boundNoteRewrites.run(tfile.path, () => onBoundNoteModified(tfile.path, file, loadedText, {
+							void onBoundNoteModified(tfile.path, file, this.loadedEditorText(tfile), {
 								writes: this.appWrites,
 								read: () => this.app.vault.read(tfile),
 								writeConflictCopy: (content) =>
@@ -2192,7 +2191,7 @@ export default class TeamRelayPlugin extends Plugin {
 								sleep: (ms) => new Promise<void>((resolve) => this.clock.scheduleTimeout(resolve, ms)),
 								log: (...args: unknown[]) => vaultLog("ExternalRewrite", ...args),
 								notify: (message) => new Notice(message, 15000),
-							}));
+							}, this.boundNoteRewrites);
 						}
 					}
 					// Trigger metadata resolve with the actual TFile (not our Document proxy)

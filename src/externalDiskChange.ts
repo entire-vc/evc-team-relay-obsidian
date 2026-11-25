@@ -36,71 +36,92 @@ import { applyDiffToYText } from "./ytextDiff";
 /** How long the write before the latest one still counts as this app's. */
 export const PREVIOUS_WRITE_WINDOW_MS = 10_000;
 
-interface WriteRecord {
+interface OwnWrite {
 	text: string;
-	previous?: string;
-	previousUntil: number;
-	/** Seen on disk after an outside change, not written by this app. */
-	observed?: boolean;
+	/** Order of the write among this app's writes, see AppWriteLog.mark. */
+	seq: number;
+	at: number;
 }
 
 /**
- * The text this app last wrote to each file, through the vault adapter.
- * Another program's write never passes through it, so a file whose text is
- * not here was changed from outside.
+ * The text this app wrote to each file, through the vault adapter. Another
+ * program's write never passes through it, so a file whose text is not here
+ * was changed from outside.
  */
 export class AppWriteLog {
-	private readonly writes = new Map<string, WriteRecord>();
+	private readonly own = new Map<string, OwnWrite[]>();
+	private readonly last = new Map<string, string>();
+	private seq = 0;
 
 	constructor(private readonly now: () => number) {}
 
 	/**
-	 * The file holds `text`, which this app did not write (an outside change
-	 * just taken into the Y.Doc). It becomes the text "before" the next
-	 * change, but neither it nor the previous write counts as this app's
-	 * own: a quick A -> B -> A from outside must not read as an echo.
+	 * A point in this app's write history. Taken when an outside change is
+	 * noticed and handed to observe(), so writes made after that moment are
+	 * still recognised as this app's own.
 	 */
-	observe(path: string, text: string): void {
-		this.writes.set(path, { text, previousUntil: 0, observed: true });
+	mark(): number {
+		return this.seq;
 	}
 
 	/** This app wrote `text` to `path`. */
 	record(path: string, text: string): void {
-		const last = this.writes.get(path);
-		if (last && last.text === text) return;
-		this.writes.set(path, {
-			text,
-			previous: last?.observed ? undefined : last?.text,
-			previousUntil: this.now() + PREVIOUS_WRITE_WINDOW_MS,
-		});
+		const at = this.now();
+		const kept = (this.own.get(path) ?? []).filter(
+			(w) => w.text !== text && at <= w.at + PREVIOUS_WRITE_WINDOW_MS,
+		);
+		kept.push({ text, seq: ++this.seq, at });
+		this.own.set(path, kept);
+		this.last.set(path, text);
 	}
 
-	/** The file's text as this app last left it, if known. */
+	/**
+	 * The file holds `text`, which this app did not write (an outside change
+	 * just taken into the Y.Doc), noticed at `since` (a mark()). It becomes the
+	 * text "before" the next change. This app's writes up to `since` no longer
+	 * count as its own, so a quick A -> B -> A from outside does not read as
+	 * an echo; writes made after `since` (a disk sync while the change was
+	 * handled) still do, so their own "modify" is not taken for an outside one.
+	 */
+	observe(path: string, text: string, since: number): void {
+		const kept = (this.own.get(path) ?? []).filter((w) => w.seq > since);
+		if (kept.length > 0) this.own.set(path, kept);
+		else this.own.delete(path);
+		// A write made after the change was noticed is newer than it.
+		if (kept.length === 0) this.last.set(path, text);
+	}
+
+	/** The file's text as this app last left or saw it, if known. */
 	lastText(path: string): string | undefined {
-		return this.writes.get(path)?.text;
+		return this.last.get(path);
 	}
 
-	/** Whether `text` is what this app itself last wrote to `path`. */
+	/**
+	 * Whether `text` is what this app itself wrote to `path`: its latest
+	 * write, or an earlier one made within the last few seconds.
+	 */
 	isOwnWrite(path: string, text: string): boolean {
-		const last = this.writes.get(path);
-		if (!last || last.observed) return false;
-		if (sameTextContent(last.text, text)) return true;
-		return (
-			last.previous !== undefined &&
-			this.now() <= last.previousUntil &&
-			sameTextContent(last.previous, text)
+		const writes = this.own.get(path);
+		if (!writes || writes.length === 0) return false;
+		const now = this.now();
+		return writes.some(
+			(w, i) =>
+				sameTextContent(w.text, text) &&
+				(i === writes.length - 1 || now <= w.at + PREVIOUS_WRITE_WINDOW_MS),
 		);
 	}
 
 	forget(path: string): void {
-		this.writes.delete(path);
+		this.own.delete(path);
+		this.last.delete(path);
 	}
 
 	rename(oldPath: string, newPath: string): void {
-		const record = this.writes.get(oldPath);
-		if (!record) return;
-		this.writes.delete(oldPath);
-		this.writes.set(newPath, record);
+		const writes = this.own.get(oldPath);
+		const last = this.last.get(oldPath);
+		this.forget(oldPath);
+		if (writes) this.own.set(newPath, writes);
+		if (last !== undefined) this.last.set(newPath, last);
 	}
 }
 
@@ -113,11 +134,19 @@ export type ExternalRewriteOutcome =
 	| { kind: "merged-with-copy"; conflictPath: string }
 	/** A newer outside change is on disk now; it is handled by its own event. */
 	| { kind: "superseded" }
+	/** The file could not be read again to confirm the change; the Y.Doc was left as it was. */
+	| { kind: "unconfirmed" }
 	/**
 	 * The Y.Doc was left as it was: the conflict copy could not be written,
 	 * or collaborators kept changing the note while copies were written.
 	 */
 	| { kind: "skipped"; reason: "copy-failed" | "kept-changing"; conflictPath?: string };
+
+/**
+ * Whether the text read from a file is still its outside text: "unknown"
+ * when the file could not be read again.
+ */
+export type Recheck = "current" | "superseded" | "unknown";
 
 /** Conflict copies tried while collaborators keep editing, before giving up. */
 export const COPY_ATTEMPTS = 3;
@@ -130,8 +159,8 @@ function alignLineEndings(text: string, current: string): string {
 /**
  * Put an outside rewrite of a note into its Y.Doc. `before` is the file's
  * text before the rewrite (what this app last wrote or loaded), if known.
- * `stillCurrent` reports whether `disk` is still the file's outside text; it
- * is asked after the conflict copy is written, the only wait in here.
+ * `recheck` reports whether `disk` is still the file's outside text; it is
+ * asked after the conflict copy is written, the only wait in here.
  */
 export async function absorbExternalRewrite(
 	ydoc: Y.Doc,
@@ -140,7 +169,7 @@ export async function absorbExternalRewrite(
 	writeConflictCopy: (content: string) => Promise<string>,
 	origin: unknown,
 	log: (...args: unknown[]) => void = () => {},
-	stillCurrent: () => Promise<boolean> = async () => true,
+	recheck: () => Promise<Recheck> = async () => "current",
 ): Promise<ExternalRewriteOutcome> {
 	const ytext = ydoc.getText("contents");
 	let lastCopy: string | undefined;
@@ -167,7 +196,8 @@ export async function absorbExternalRewrite(
 			log("could not keep the replaced text in a copy; the Y.Doc is left as it was", e);
 			return { kind: "skipped", reason: "copy-failed" };
 		}
-		if (!(await stillCurrent())) return { kind: "superseded" };
+		const fresh = await recheck();
+		if (fresh !== "current") return { kind: fresh === "superseded" ? "superseded" : "unconfirmed" };
 		if (ytext.toJSON() === current) {
 			applyDiffToYText(ydoc, incoming, origin);
 			return { kind: "merged-with-copy", conflictPath: lastCopy };
@@ -206,15 +236,21 @@ export interface ExternalRewriteDeps {
 }
 
 export type BoundNoteOutcome =
-	| ExternalRewriteOutcome
+	| Exclude<ExternalRewriteOutcome, { kind: "unconfirmed" }>
 	/** The change is this app's own write. */
 	| { kind: "own-write" }
 	/** The file could not be read; the change is still on disk. */
 	| { kind: "unreadable" }
-	/** The note did not sync in time; the outside text was kept at `conflictPath`. */
-	| { kind: "kept-as-copy"; conflictPath: string }
-	/** The note did not sync in time and the copy failed: the outside text is on this device only. */
-	| { kind: "not-shared" };
+	/**
+	 * The outside text was kept at `conflictPath`, the Y.Doc left as it was:
+	 * the note did not sync in time, or the file could not be read again to
+	 * confirm the change.
+	 */
+	| { kind: "kept-as-copy"; conflictPath: string; reason: KeptReason }
+	/** As kept-as-copy, but the copy failed: the outside text is on this device only. */
+	| { kind: "not-shared"; reason: KeptReason };
+
+export type KeptReason = "not-synced" | "recheck-failed";
 
 async function readWithRetry(deps: ExternalRewriteDeps): Promise<string | null> {
 	for (let attempt = 1; ; attempt++) {
@@ -255,9 +291,13 @@ export function rewriteNotice(path: string, outcome: BoundNoteOutcome): string |
 				: `Team Relay: "${path}" was changed by another program while others kept editing it, so the change was not shared. ${differs}` +
 					(outcome.conflictPath ? ` The latest shared text was saved as "${outcome.conflictPath}".` : "");
 		case "not-shared":
-			return `Team Relay: "${path}" was changed by another program before it finished syncing, and the change could not be saved as a copy, so it was not shared. ${differs}`;
+			return outcome.reason === "not-synced"
+				? `Team Relay: "${path}" was changed by another program before it finished syncing, and the change could not be saved as a copy, so it was not shared. ${differs}`
+				: `Team Relay: "${path}" was changed by another program, but the file could not be read again to confirm the change, nor saved as a copy, so the change was not shared. ${differs}`;
 		case "kept-as-copy":
-			return `Team Relay: "${path}" was changed by another program before it finished syncing. The changed version was saved as "${outcome.conflictPath}"; the shared note is unchanged.`;
+			return outcome.reason === "not-synced"
+				? `Team Relay: "${path}" was changed by another program before it finished syncing. The changed version was saved as "${outcome.conflictPath}"; the shared note is unchanged.`
+				: `Team Relay: "${path}" was changed by another program, but the file could not be read again to confirm the change, so it was not shared. The changed version was saved as "${outcome.conflictPath}". ${differs}`;
 		case "merged-with-copy":
 			return `Team Relay: "${path}" was changed by another program and now shows that version. The shared text it replaced was saved as "${outcome.conflictPath}".`;
 		default:
@@ -285,21 +325,30 @@ export class PathQueue {
 }
 
 /**
- * Handle the vault "modify" of an editor-bound note. Capture `loadedText`,
- * the text the open editor last loaded or saved, synchronously in the event
- * (Obsidian only replaces it after its own asynchronous re-read).
+ * Handle the vault "modify" of an editor-bound note. Call it synchronously
+ * from the event: `loadedText` is the text the open editor last loaded or
+ * saved (Obsidian only replaces it after its own asynchronous re-read), and
+ * the file is read at once, before waiting in `queue` behind earlier changes
+ * of the note -- this app may write the file meanwhile, and an outside text
+ * nobody read would then be gone.
  */
-export async function onBoundNoteModified(
+export function onBoundNoteModified(
 	path: string,
 	note: BoundNote,
 	loadedText: string | undefined,
 	deps: ExternalRewriteDeps,
+	queue?: PathQueue,
 ): Promise<BoundNoteOutcome> {
-	const outcome = await handleBoundNoteModified(path, note, loadedText, deps);
-	deps.log("outside rewrite of an open note", path, outcome.kind);
-	const message = rewriteNotice(path, outcome);
-	if (message !== null) deps.notify?.(message);
-	return outcome;
+	const since = deps.writes.mark();
+	const disk = readWithRetry(deps);
+	const task = async (): Promise<BoundNoteOutcome> => {
+		const outcome = await handleBoundNoteModified(path, note, loadedText, deps, await disk, since);
+		deps.log("outside rewrite of an open note", path, outcome.kind);
+		const message = rewriteNotice(path, outcome);
+		if (message !== null) deps.notify?.(message);
+		return outcome;
+	};
+	return queue ? queue.run(path, task) : task();
 }
 
 async function handleBoundNoteModified(
@@ -307,34 +356,40 @@ async function handleBoundNoteModified(
 	note: BoundNote,
 	loadedText: string | undefined,
 	deps: ExternalRewriteDeps,
+	disk: string | null,
+	since: number,
 ): Promise<BoundNoteOutcome> {
-	const before = deps.writes.lastText(path) ?? loadedText;
-	const disk = await readWithRetry(deps);
 	if (disk === null) return { kind: "unreadable" };
 	if (deps.writes.isOwnWrite(path, disk)) return { kind: "own-write" };
+	const before = deps.writes.lastText(path) ?? loadedText;
 
 	// Whether `disk` is still what another program left in the file. A
 	// different text this app wrote meanwhile (its own disk sync) does not
 	// replace it; a different outside text does, and has its own event.
-	const stillCurrent = async (): Promise<boolean> => {
+	const recheck = async (): Promise<Recheck> => {
 		const now = await readWithRetry(deps);
-		return now === null || sameTextContent(now, disk) || deps.writes.isOwnWrite(path, now);
+		if (now === null) return "unknown";
+		return sameTextContent(now, disk) || deps.writes.isOwnWrite(path, now) ? "current" : "superseded";
+	};
+	// The Y.Doc stays as it is; keep the outside text where the user can find it.
+	const keepAsCopy = async (reason: KeptReason): Promise<BoundNoteOutcome> => {
+		try {
+			return { kind: "kept-as-copy", conflictPath: await deps.writeConflictCopy(disk), reason };
+		} catch (e: unknown) {
+			deps.log("could not keep the outside text in a copy", path, e);
+			return { kind: "not-shared", reason };
+		}
 	};
 
 	if (!note.isSynced) {
-		if (!(await settled(note.onceFreshlySynced(), SYNC_WAIT_MS, deps.sleep))) {
-			if (!(await stillCurrent())) return { kind: "superseded" };
-			// The Y.Doc is not the relay's text yet, so a diff against it would be
-			// against a partial copy, and its next save to disk would overwrite
-			// the outside text. Keep that text where the user can find it.
-			try {
-				return { kind: "kept-as-copy", conflictPath: await deps.writeConflictCopy(disk) };
-			} catch (e: unknown) {
-				deps.log("outside rewrite of a note that did not sync; copy failed", path, e);
-				return { kind: "not-shared" };
-			}
-		}
-		if (!(await stillCurrent())) return { kind: "superseded" };
+		const synced = await settled(note.onceFreshlySynced(), SYNC_WAIT_MS, deps.sleep);
+		const fresh = await recheck();
+		if (fresh === "superseded") return { kind: "superseded" };
+		if (fresh === "unknown") return keepAsCopy("recheck-failed");
+		// Not synced: the Y.Doc is not the relay's text yet, so a diff against
+		// it would be against a partial copy, and its next save to disk would
+		// overwrite the outside text.
+		if (!synced) return keepAsCopy("not-synced");
 	}
 	const outcome = await absorbExternalRewrite(
 		note.crdtDoc,
@@ -343,8 +398,9 @@ async function handleBoundNoteModified(
 		deps.writeConflictCopy,
 		EXTERNAL_REWRITE_ORIGIN,
 		deps.log,
-		stillCurrent,
+		recheck,
 	);
-	if (outcome.kind !== "skipped" && outcome.kind !== "superseded") deps.writes.observe(path, disk);
+	if (outcome.kind === "unconfirmed") return keepAsCopy("recheck-failed");
+	if (outcome.kind !== "skipped" && outcome.kind !== "superseded") deps.writes.observe(path, disk, since);
 	return outcome;
 }

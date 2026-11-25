@@ -14,6 +14,7 @@ import {
 	COPY_ATTEMPTS,
 	PREVIOUS_WRITE_WINDOW_MS,
 	PathQueue,
+	READ_RETRY_MS,
 	absorbExternalRewrite,
 	onBoundNoteModified,
 } from "../src/externalDiskChange";
@@ -212,7 +213,7 @@ describe("GH #117 outside rewrite of an open shared note", () => {
 
 	test("a text seen after an outside change does not become this app's previous write", () => {
 		const s = setup("", "", "");
-		s.writes.observe(PATH, "outside");
+		s.writes.observe(PATH, "outside", s.writes.mark());
 		s.writes.record(PATH, "saved by the editor");
 		expect(s.writes.isOwnWrite(PATH, "outside")).toBe(false);
 		expect(s.writes.isOwnWrite(PATH, "saved by the editor")).toBe(true);
@@ -325,10 +326,10 @@ describe("GH #117 outside rewrite of an open shared note", () => {
 		s.deps.read = async () => disk;
 		s.deps.sleep = () => new Promise<void>(() => {}); // the sync wait does not time out
 		const queue = new PathQueue();
-		const first = queue.run(PATH, () => onBoundNoteModified(PATH, s.doc, "base", s.deps));
+		const first = onBoundNoteModified(PATH, s.doc, "base", s.deps, queue);
 		for (let i = 0; i < 5; i++) await Promise.resolve(); // the first change is read and waits for sync
 		disk = "v2";
-		const second = queue.run(PATH, () => onBoundNoteModified(PATH, s.doc, "base", s.deps));
+		const second = onBoundNoteModified(PATH, s.doc, "base", s.deps, queue);
 		finishSync();
 		expect((await first).kind).toBe("superseded");
 		expect((await second).kind).toBe("merged");
@@ -353,5 +354,85 @@ describe("GH #117 outside rewrite of an open shared note", () => {
 		finishSync();
 		expect((await pending).kind).toBe("merged");
 		expect(s.doc.content).toBe("outside");
+	});
+	/** A note that is still syncing, with a disk the test changes, as the vault "modify" handler sees it. */
+	function syncingNote() {
+		let finishSync!: () => void;
+		const syncing = new Promise<void>((resolve) => {
+			finishSync = resolve;
+		});
+		const s = setup("base", "base", "v1", syncing);
+		const disk = { text: "v1", failReads: false };
+		s.deps.read = async () => {
+			if (disk.failReads) throw new Error("EBUSY: resource busy or locked");
+			return disk.text;
+		};
+		s.deps.sleep = (ms: number) => (ms === READ_RETRY_MS ? Promise.resolve() : new Promise<void>(() => {}));
+		const synced = () => {
+			(s.doc as unknown as { isSynced: boolean }).isSynced = true;
+			finishSync();
+		};
+		const settle = async () => {
+			for (let i = 0; i < 10; i++) await Promise.resolve();
+		};
+		return { s, disk, synced, settle, queue: new PathQueue() };
+	}
+
+	test("this app's own write queued behind an outside change is still its own after that change goes in", async () => {
+		const { s, disk, synced, settle, queue } = syncingNote();
+		const outside = onBoundNoteModified(PATH, s.doc, "base", s.deps, queue);
+		await settle();
+		// While the note syncs, this app writes the file and its "modify" queues.
+		s.writes.record(PATH, "base");
+		disk.text = "base";
+		const echo = onBoundNoteModified(PATH, s.doc, "base", s.deps, queue);
+		synced();
+		expect([(await outside).kind, (await echo).kind]).toEqual(["merged", "own-write"]);
+		expect(s.doc.content).toBe("v1");
+		expect(s.notices).toEqual([]);
+	});
+
+	test("an outside change queued behind another is read when it happens, before this app writes over it", async () => {
+		const { s, disk, synced, settle, queue } = syncingNote();
+		const first = onBoundNoteModified(PATH, s.doc, "base", s.deps, queue);
+		await settle();
+		disk.text = "v2";
+		const second = onBoundNoteModified(PATH, s.doc, "base", s.deps, queue);
+		await settle();
+		s.writes.record(PATH, "base");
+		disk.text = "base";
+		synced();
+		await first;
+		expect((await second).kind).not.toBe("own-write");
+		expect(s.doc.content).toBe("v2");
+	});
+
+	test("a file that cannot be read again after the sync wait keeps the outside text in a copy and says so", async () => {
+		const { s, disk, synced, settle } = syncingNote();
+		const pending = onBoundNoteModified(PATH, s.doc, "base", s.deps);
+		await settle();
+		disk.text = "v2";
+		disk.failReads = true;
+		synced();
+		const r = await pending;
+		expect(r).toEqual({ kind: "kept-as-copy", conflictPath: "Shared/note (outside change).md", reason: "recheck-failed" });
+		expect(s.doc.content).toBe("base");
+		expect(s.copies).toEqual(["v1"]);
+		expect(s.notices).toHaveLength(1);
+		expect(s.notices[0]).toContain("not shared");
+	});
+
+	test("a file that cannot be read again after the conflict copy leaves the Y.Doc alone and keeps the outside text", async () => {
+		const s = setup("live text", "", "rewritten");
+		let reads = 0;
+		s.deps.read = async () => {
+			if (++reads > 1) throw new Error("EBUSY: resource busy or locked");
+			return "rewritten";
+		};
+		const r = await onBoundNoteModified(PATH, s.doc, undefined, s.deps);
+		expect(r.kind).toBe("kept-as-copy");
+		expect(s.doc.content).toBe("live text");
+		expect(s.copies).toEqual(["live text", "rewritten"]);
+		expect(s.notices[0]).toContain("not shared");
 	});
 });
