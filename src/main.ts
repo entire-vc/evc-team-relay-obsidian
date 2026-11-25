@@ -57,6 +57,7 @@ import { Plugin } from "obsidian";
 // Core sync/data model
 import { VaultShare, ShareRegistry } from "./VaultShare";
 import { holdsOnlySyncedText, uploadsOnModify } from "./uploadOnModify";
+import { AppWriteLog, onBoundNoteModified } from "./externalDiskChange";
 import type { VaultShareSettings } from "./VaultShare";
 import { ViewBindingRegistry } from "./ViewBindings";
 import { RelayRegistry } from "./RelayRegistry";
@@ -219,6 +220,8 @@ export default class TeamRelayPlugin extends Plugin {
 
 	// Sync core
 	shareRegistry!: ShareRegistry;
+	/** Text this app last wrote to each shared note (GH #117). */
+	readonly appWrites = new AppWriteLog(() => this.clock.now());
 	relayRegistry!: RelayRegistry;
 	credentialCache!: RelayCredentialCache;
 	fileHashRegistry!: FileHashCache;
@@ -1907,6 +1910,22 @@ export default class TeamRelayPlugin extends Plugin {
 		await openSettingsAt((this.app as unknown as ObsidianApp).setting, this.manifest.id, this.settingsPage, path);
 	}
 
+	/**
+	 * The text an open editor of `file` last loaded from or saved to disk.
+	 * Read synchronously inside the vault "modify" event: Obsidian replaces it
+	 * only after its own asynchronous re-read, so here it is still the text
+	 * the file held before the change.
+	 */
+	private loadedEditorText(file: TFile): string | undefined {
+		for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+			const view = leaf.view as unknown as { file?: TFile | null; lastSavedData?: unknown };
+			if (view.file === file && typeof view.lastSavedData === "string") {
+				return view.lastSavedData;
+			}
+		}
+		return undefined;
+	}
+
 	installWebviewerPatch(): void {
 		// eslint-disable-next-line @typescript-eslint/no-this-alias -- needed to preserve `this` reference inside getPatchRegistry callback functions
 		const plugin = this;
@@ -2069,6 +2088,7 @@ export default class TeamRelayPlugin extends Plugin {
 				// Decided before anything below touches the folder index: a
 				// local delete still has its index entry, a peer's does not.
 				const localRemoval = this.isLocalSyncRemoval(file.path);
+				this.appWrites.forget(file.path);
 				if (file instanceof TFolder && this.folderShares?.hasPathOnlyShares) {
 					this.folderShares.retain();
 				}
@@ -2106,6 +2126,7 @@ export default class TeamRelayPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
+				this.appWrites.rename(oldPath, file.path);
 				this.handleVaultRename(file, oldPath, vaultLog);
 			}),
 		);
@@ -2153,6 +2174,21 @@ export default class TeamRelayPlugin extends Plugin {
 									if (!echo) void folder.transfers.enqueueUpload(file, { priority: true });
 								});
 							}
+						} else if (file && isDocument(file) && file.editLock && tfile instanceof TFile) {
+							// Editor-bound note: its edits reach the Y.Doc through the
+							// editor, but another program's rewrite of the file may not.
+							void onBoundNoteModified(tfile.path, file, this.loadedEditorText(tfile), {
+								writes: this.appWrites,
+								read: () => this.app.vault.read(tfile),
+								writeConflictCopy: (content) =>
+									folder.writeConflictCopy(
+										file,
+										content,
+										`outside change ${new Date().toISOString().replace(/[:.]/g, "-")}`,
+									),
+								sleep: (ms) => new Promise<void>((resolve) => this.clock.scheduleTimeout(resolve, ms)),
+								log: (...args: unknown[]) => vaultLog("ExternalRewrite", ...args),
+							});
 						}
 					}
 					// Trigger metadata resolve with the actual TFile (not our Document proxy)
@@ -2209,6 +2245,38 @@ export default class TeamRelayPlugin extends Plugin {
 					}
 
 					return (old as (...args: unknown[]) => unknown).call(this, tfile, fn, options);
+				};
+			},
+		});
+
+		// Remember the text this app writes to shared notes, so the "modify"
+		// handler can tell another program's rewrite of an open note from an
+		// editor save or our own disk sync (GH #117).
+		const recordAppWrite = (path: unknown, text: unknown) => {
+			if (typeof path !== "string" || typeof text !== "string") return;
+			if (!path.endsWith(".md") || !plugin.shareRegistry?.shareFor(path)) return;
+			plugin.appWrites.record(path, text);
+		};
+		getPatchRegistry().install(this.app.vault.adapter, {
+			write(old: unknown) {
+				return function (this: unknown, path: unknown, data: unknown, options: unknown) {
+					recordAppWrite(path, data);
+					return (old as (...args: unknown[]) => unknown).call(this, path, data, options);
+				};
+			},
+			process(old: unknown) {
+				return function (
+					this: unknown,
+					path: unknown,
+					fn: (data: string) => string,
+					options: unknown,
+				) {
+					const recording = (data: string) => {
+						const text = fn(data);
+						recordAppWrite(path, text);
+						return text;
+					};
+					return (old as (...args: unknown[]) => unknown).call(this, path, recording, options);
 				};
 			},
 		});

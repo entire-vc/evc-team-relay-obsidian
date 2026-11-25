@@ -1,0 +1,226 @@
+/**
+ * GH #117: another program rewrites the file of a shared note that is open in
+ * an editor. The upload lane skips an editor-bound note and the outbound
+ * writer refuses text the relay does not agree with, so before this fix the
+ * rewrite reached neither the Y.Doc nor the relay and members diverged.
+ */
+
+import { describe, test, expect } from "@jest/globals";
+import { TFile } from "obsidian";
+import * as Y from "yjs";
+import { Document } from "../src/Document";
+import {
+	AppWriteLog,
+	PREVIOUS_WRITE_WINDOW_MS,
+	absorbExternalRewrite,
+	onBoundNoteModified,
+} from "../src/externalDiskChange";
+import { readRelaySyncedText } from "../src/outboundSyncWiring";
+import { uploadsOnModify } from "../src/uploadOnModify";
+
+const PATH = "Shared/note.md";
+
+function fakeDoc(ytext: string, base: string, synced = true) {
+	const crdtDoc = new Y.Doc();
+	crdtDoc.getText("contents").insert(0, ytext);
+	const doc = Object.create(Document.prototype) as Document;
+	Object.defineProperty(doc, "crdtDoc", { value: crdtDoc });
+	Object.defineProperty(doc, "content", { get: () => crdtDoc.getText("contents").toJSON() });
+	Object.defineProperty(doc, "isOnline", { value: true });
+	Object.defineProperty(doc, "isSynced", { value: synced });
+	Object.defineProperty(doc, "editLock", { value: true });
+	// A note that is still syncing never finishes within these tests.
+	(doc as unknown as { onceFreshlySynced: () => Promise<void> }).onceFreshlySynced = () =>
+		synced ? Promise.resolve() : new Promise<void>(() => {});
+	(doc as unknown as { getSyncBase: () => Promise<string> }).getSyncBase = async () => base;
+	return doc;
+}
+
+function setup(ytext: string, base: string, disk: string, synced = true) {
+	const doc = fakeDoc(ytext, base, synced);
+	const tfile: TFile = Object.create(TFile.prototype);
+	(tfile as unknown as { path: string }).path = PATH;
+	const vault = {
+		getAbstractFileByPath: () => tfile,
+		read: async () => disk,
+	};
+	const registry = {
+		shareFor: () => ({ isOnline: true, rootRelative: { entryFor: () => doc } }),
+	};
+	const copies: string[] = [];
+	let now = 1_000;
+	const writes = new AppWriteLog(() => now);
+	const deps = {
+		writes,
+		read: async (): Promise<string> => disk,
+		sleep: async (_ms: number) => {},
+		writeConflictCopy: async (content: string) => {
+			copies.push(content);
+			return "Shared/note (outside change).md";
+		},
+		log: () => {},
+	};
+	return {
+		doc,
+		vault,
+		registry,
+		copies,
+		writes,
+		deps,
+		advance: (ms: number) => {
+			now += ms;
+		},
+	};
+}
+
+/** The vault "modify" path for an editor-bound note, then the outbound read. */
+async function afterModify(
+	s: ReturnType<typeof setup>,
+	loadedText: string | undefined,
+) {
+	const uploadLane = uploadsOnModify(s.doc);
+	if (!uploadLane) await onBoundNoteModified(PATH, s.doc, loadedText, s.deps);
+	const outbound = await readRelaySyncedText(s.vault as never, s.registry as never, PATH);
+	return { uploadLane, outbound, ydoc: s.doc.content };
+}
+
+describe("GH #117 outside rewrite of an open shared note", () => {
+	test("positive control: an editor save (disk == Y.Doc) is pushed outbound unchanged", async () => {
+		const s = setup("clean", "garbled", "clean");
+		const r = await afterModify(s, "clean");
+		expect(r.outbound).toBe("clean");
+		expect(r.ydoc).toBe("clean");
+		expect(s.copies).toEqual([]);
+	});
+
+	test("the triage case: Y.Doc=base='garbled', disk rewritten to 'clean' reaches the Y.Doc and the relay", async () => {
+		const s = setup("garbled", "garbled", "clean");
+		const r = await afterModify(s, "garbled");
+		expect(r.uploadLane).toBe(false);
+		expect(r.ydoc).toBe("clean");
+		expect(r.outbound).toBe("clean");
+		expect(s.copies).toEqual([]);
+	});
+
+	test("the text before the rewrite comes from this app's last write when the editor's is unknown", async () => {
+		const s = setup("line one\n", "old base", "line one\nadded outside\n");
+		s.writes.record(PATH, "line one\n");
+		const r = await afterModify(s, undefined);
+		expect(r.ydoc).toBe("line one\nadded outside\n");
+		expect(s.copies).toEqual([]);
+	});
+
+	test("an editor save trailing a collaborator's newer edit is not taken for an outside change", async () => {
+		// The editor saved "A" (through the vault adapter); a collaborator's
+		// edit reached the Y.Doc before the "modify" event was handled.
+		const s = setup("A plus remote edit", "A", "A");
+		s.writes.record(PATH, "A");
+		const r = await afterModify(s, "A");
+		expect(r.ydoc).toBe("A plus remote edit");
+		expect(s.copies).toEqual([]);
+	});
+
+	test("the write before the latest one counts as this app's only for a short window", () => {
+		const s = setup("", "", "");
+		s.writes.record(PATH, "first");
+		s.writes.record(PATH, "second");
+		expect(s.writes.isOwnWrite(PATH, "first")).toBe(true);
+		s.advance(PREVIOUS_WRITE_WINDOW_MS + 1);
+		expect(s.writes.isOwnWrite(PATH, "first")).toBe(false);
+		expect(s.writes.isOwnWrite(PATH, "second")).toBe(true);
+	});
+
+	test("Y.Doc moved on since the file was last written: the rewrite goes in, the replaced text is kept in a copy", async () => {
+		const s = setup("v1 plus remote edit", "v1", "v2 from outside");
+		const r = await afterModify(s, "v1");
+		expect(r.ydoc).toBe("v2 from outside");
+		expect(r.outbound).toBe("v2 from outside");
+		expect(s.copies).toEqual(["v1 plus remote edit"]);
+	});
+
+	test("nothing known about the text before the rewrite: the replaced text is kept in a copy", async () => {
+		const s = setup("live text", "", "rewritten");
+		const r = await afterModify(s, undefined);
+		expect(r.ydoc).toBe("rewritten");
+		expect(s.copies).toEqual(["live text"]);
+	});
+
+	test("a failed conflict copy leaves the Y.Doc untouched", async () => {
+		const ydoc = new Y.Doc();
+		ydoc.getText("contents").insert(0, "live text");
+		const r = await absorbExternalRewrite(
+			ydoc,
+			"rewritten",
+			"older",
+			async () => {
+				throw new Error("disk full");
+			},
+			"test",
+		);
+		expect(r.kind).toBe("skipped");
+		expect(ydoc.getText("contents").toJSON()).toBe("live text");
+	});
+
+	test("a note that does not sync in time keeps the outside text in a copy and its Y.Doc as it was", async () => {
+		const s = setup("partial", "partial", "rewritten", false);
+		const r = await onBoundNoteModified(PATH, s.doc, "partial", s.deps);
+		expect(r.kind).toBe("kept-as-copy");
+		expect(s.doc.content).toBe("partial");
+		expect(s.copies).toEqual(["rewritten"]);
+	});
+
+	test("a file another program still holds locked is read again before giving up", async () => {
+		const s = setup("before", "before", "after");
+		let failures = 2;
+		s.deps.read = async () => {
+			if (failures-- > 0) throw new Error("EBUSY: resource busy or locked");
+			return "after";
+		};
+		const r = await onBoundNoteModified(PATH, s.doc, "before", s.deps);
+		expect(r.kind).toBe("merged");
+		expect(s.doc.content).toBe("after");
+	});
+
+	test("a file that stays unreadable is reported, not taken for no change", async () => {
+		const s = setup("before", "before", "after");
+		s.deps.read = async () => {
+			throw new Error("EBUSY: resource busy or locked");
+		};
+		const r = await onBoundNoteModified(PATH, s.doc, "before", s.deps);
+		expect(r.kind).toBe("unreadable");
+		expect(s.doc.content).toBe("before");
+	});
+
+	test("a quick A -> B -> A from outside is taken in both times, not read as this app's echo", async () => {
+		const s = setup("A", "A", "B");
+		s.writes.record(PATH, "A");
+		expect((await onBoundNoteModified(PATH, s.doc, "A", s.deps)).kind).toBe("merged");
+		expect(s.doc.content).toBe("B");
+		s.deps.read = async () => "A";
+		expect((await onBoundNoteModified(PATH, s.doc, "B", s.deps)).kind).toBe("merged");
+		expect(s.doc.content).toBe("A");
+		expect(s.copies).toEqual([]);
+	});
+
+	test("a text seen after an outside change does not become this app's previous write", () => {
+		const s = setup("", "", "");
+		s.writes.observe(PATH, "outside");
+		s.writes.record(PATH, "saved by the editor");
+		expect(s.writes.isOwnWrite(PATH, "outside")).toBe(false);
+		expect(s.writes.isOwnWrite(PATH, "saved by the editor")).toBe(true);
+	});
+
+	test("a CRLF rewrite of an LF note goes in with LF endings, as an editor reload would", async () => {
+		const s = setup("a\nb\n", "a\nb\n", "a\r\nb changed\r\n");
+		await afterModify(s, "a\r\nb\r\n");
+		expect(s.doc.content).toBe("a\nb changed\n");
+		expect(s.copies).toEqual([]);
+	});
+
+	test("a CRLF-only difference is no change at all", async () => {
+		const s = setup("a\nb\n", "a\nb\n", "a\r\nb\r\n");
+		const r = await afterModify(s, "a\nb\n");
+		expect(r.ydoc).toBe("a\nb\n");
+		expect(s.copies).toEqual([]);
+	});
+});
