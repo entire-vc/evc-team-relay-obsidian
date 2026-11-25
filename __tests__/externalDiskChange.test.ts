@@ -11,32 +11,35 @@ import * as Y from "yjs";
 import { Document } from "../src/Document";
 import {
 	AppWriteLog,
+	COPY_ATTEMPTS,
 	PREVIOUS_WRITE_WINDOW_MS,
+	PathQueue,
 	absorbExternalRewrite,
 	onBoundNoteModified,
 } from "../src/externalDiskChange";
+import { applyDiffToYText } from "../src/ytextDiff";
 import { readRelaySyncedText } from "../src/outboundSyncWiring";
 import { uploadsOnModify } from "../src/uploadOnModify";
 
 const PATH = "Shared/note.md";
 
-function fakeDoc(ytext: string, base: string, synced = true) {
+function fakeDoc(ytext: string, base: string, synced: boolean | Promise<void> = true) {
 	const crdtDoc = new Y.Doc();
 	crdtDoc.getText("contents").insert(0, ytext);
 	const doc = Object.create(Document.prototype) as Document;
 	Object.defineProperty(doc, "crdtDoc", { value: crdtDoc });
 	Object.defineProperty(doc, "content", { get: () => crdtDoc.getText("contents").toJSON() });
 	Object.defineProperty(doc, "isOnline", { value: true });
-	Object.defineProperty(doc, "isSynced", { value: synced });
+	Object.defineProperty(doc, "isSynced", { value: synced === true, writable: true });
 	Object.defineProperty(doc, "editLock", { value: true });
 	// A note that is still syncing never finishes within these tests.
 	(doc as unknown as { onceFreshlySynced: () => Promise<void> }).onceFreshlySynced = () =>
-		synced ? Promise.resolve() : new Promise<void>(() => {});
+		synced === true ? Promise.resolve() : synced === false ? new Promise<void>(() => {}) : synced;
 	(doc as unknown as { getSyncBase: () => Promise<string> }).getSyncBase = async () => base;
 	return doc;
 }
 
-function setup(ytext: string, base: string, disk: string, synced = true) {
+function setup(ytext: string, base: string, disk: string, synced: boolean | Promise<void> = true) {
 	const doc = fakeDoc(ytext, base, synced);
 	const tfile: TFile = Object.create(TFile.prototype);
 	(tfile as unknown as { path: string }).path = PATH;
@@ -48,6 +51,7 @@ function setup(ytext: string, base: string, disk: string, synced = true) {
 		shareFor: () => ({ isOnline: true, rootRelative: { entryFor: () => doc } }),
 	};
 	const copies: string[] = [];
+	const notices: string[] = [];
 	let now = 1_000;
 	const writes = new AppWriteLog(() => now);
 	const deps = {
@@ -59,12 +63,16 @@ function setup(ytext: string, base: string, disk: string, synced = true) {
 			return "Shared/note (outside change).md";
 		},
 		log: () => {},
+		notify: (message: string) => {
+			notices.push(message);
+		},
 	};
 	return {
 		doc,
 		vault,
 		registry,
 		copies,
+		notices,
 		writes,
 		deps,
 		advance: (ms: number) => {
@@ -222,5 +230,128 @@ describe("GH #117 outside rewrite of an open shared note", () => {
 		const r = await afterModify(s, "a\nb\n");
 		expect(r.ydoc).toBe("a\nb\n");
 		expect(s.copies).toEqual([]);
+	});
+	test("the user is told when an outside change could not be shared", async () => {
+		const locked = setup("before", "before", "after");
+		locked.deps.read = async () => {
+			throw new Error("EBUSY: resource busy or locked");
+		};
+		await onBoundNoteModified(PATH, locked.doc, "before", locked.deps);
+		expect(locked.notices).toHaveLength(1);
+		expect(locked.notices[0]).toContain(PATH);
+		expect(locked.notices[0]).toContain("not shared");
+
+		const noCopy = setup("live text", "", "rewritten");
+		noCopy.deps.writeConflictCopy = async () => {
+			throw new Error("disk full");
+		};
+		expect((await onBoundNoteModified(PATH, noCopy.doc, undefined, noCopy.deps)).kind).toBe("skipped");
+		expect(noCopy.doc.content).toBe("live text");
+		expect(noCopy.notices).toHaveLength(1);
+		expect(noCopy.notices[0]).toContain("not shared");
+
+		const unsynced = setup("partial", "partial", "rewritten", false);
+		unsynced.deps.writeConflictCopy = async () => {
+			throw new Error("disk full");
+		};
+		expect((await onBoundNoteModified(PATH, unsynced.doc, "partial", unsynced.deps)).kind).toBe("not-shared");
+		expect(unsynced.notices[0]).toContain("not shared");
+	});
+
+	test("the user is told where a copy went, and nothing when the change simply went in", async () => {
+		const copied = setup("v1 plus remote edit", "v1", "v2 from outside");
+		await onBoundNoteModified(PATH, copied.doc, "v1", copied.deps);
+		expect(copied.notices).toHaveLength(1);
+		expect(copied.notices[0]).toContain("Shared/note (outside change).md");
+
+		const plain = setup("garbled", "garbled", "clean");
+		await onBoundNoteModified(PATH, plain.doc, "garbled", plain.deps);
+		expect(plain.notices).toEqual([]);
+	});
+
+	test("a collaborator's edit arriving while the conflict copy is written is kept, not erased", async () => {
+		const s = setup("remote-before", "", "outside");
+		s.deps.writeConflictCopy = async (content: string) => {
+			s.copies.push(content);
+			applyDiffToYText(s.doc.crdtDoc, "remote-before remote-edit-during-copy");
+			return `copy ${s.copies.length}.md`;
+		};
+		const r = await onBoundNoteModified(PATH, s.doc, "base", s.deps);
+		expect(r.kind).toBe("merged-with-copy");
+		expect(s.doc.content).toBe("outside");
+		expect(s.copies).toEqual(["remote-before", "remote-before remote-edit-during-copy"]);
+	});
+
+	test("collaborators who keep editing through every copy leave the Y.Doc alone, and the user is told", async () => {
+		const s = setup("live", "", "outside");
+		s.deps.writeConflictCopy = async (content: string) => {
+			s.copies.push(content);
+			applyDiffToYText(s.doc.crdtDoc, `${content}+`);
+			return `copy ${s.copies.length}.md`;
+		};
+		const r = await onBoundNoteModified(PATH, s.doc, "base", s.deps);
+		expect(r).toEqual({ kind: "skipped", reason: "kept-changing", conflictPath: `copy ${COPY_ATTEMPTS}.md` });
+		expect(s.doc.content).toBe("live" + "+".repeat(COPY_ATTEMPTS));
+		expect(s.notices).toHaveLength(1);
+	});
+
+	test("an older change still waiting for sync does not replace a newer one already taken in", async () => {
+		let finishSync!: () => void;
+		const syncing = new Promise<void>((resolve) => {
+			finishSync = resolve;
+		});
+		const s = setup("base", "base", "v1", syncing);
+		let disk = "v1";
+		s.deps.read = async () => disk;
+		s.deps.sleep = () => new Promise<void>(() => {}); // the sync wait does not time out
+		const first = onBoundNoteModified(PATH, s.doc, "base", s.deps);
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		(s.doc as unknown as { isSynced: boolean }).isSynced = true;
+		disk = "v2";
+		expect((await onBoundNoteModified(PATH, s.doc, "base", s.deps)).kind).toBe("merged");
+		finishSync();
+		expect((await first).kind).toBe("superseded");
+		expect(s.doc.content).toBe("v2");
+		expect(s.copies).toEqual([]);
+	});
+
+	test("changes of one note queued in order end on the newest text", async () => {
+		let finishSync!: () => void;
+		const syncing = new Promise<void>((resolve) => {
+			finishSync = resolve;
+		});
+		const s = setup("base", "base", "v1", syncing);
+		let disk = "v1";
+		s.deps.read = async () => disk;
+		s.deps.sleep = () => new Promise<void>(() => {}); // the sync wait does not time out
+		const queue = new PathQueue();
+		const first = queue.run(PATH, () => onBoundNoteModified(PATH, s.doc, "base", s.deps));
+		for (let i = 0; i < 5; i++) await Promise.resolve(); // the first change is read and waits for sync
+		disk = "v2";
+		const second = queue.run(PATH, () => onBoundNoteModified(PATH, s.doc, "base", s.deps));
+		finishSync();
+		expect((await first).kind).toBe("superseded");
+		expect((await second).kind).toBe("merged");
+		expect(s.doc.content).toBe("v2");
+	});
+
+	test("this app's own disk write while the note syncs does not cancel the outside text", async () => {
+		let finishSync!: () => void;
+		const syncing = new Promise<void>((resolve) => {
+			finishSync = resolve;
+		});
+		const s = setup("relay text", "relay text", "outside", syncing);
+		let disk = "outside";
+		s.deps.read = async () => disk;
+		s.deps.sleep = () => new Promise<void>(() => {}); // the sync wait does not time out
+		const pending = onBoundNoteModified(PATH, s.doc, "relay text", s.deps);
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		// The sync writes the Y.Doc's text to disk through the vault adapter.
+		s.writes.record(PATH, "relay text");
+		disk = "relay text";
+		(s.doc as unknown as { isSynced: boolean }).isSynced = true;
+		finishSync();
+		expect((await pending).kind).toBe("merged");
+		expect(s.doc.content).toBe("outside");
 	});
 });
