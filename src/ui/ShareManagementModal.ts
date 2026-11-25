@@ -585,7 +585,9 @@ export class ShareManagementModal extends Modal {
 				folderPath,
 				this.selectedShare!.id,
 				"relay-onprem",
-				true
+				true,
+				undefined,
+				"manual",
 			);
 			if (vaultShare) {
 				await vaultShare.setOnpremServerId(this.selectedShare!.serverId);

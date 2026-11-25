@@ -17,6 +17,20 @@ import {
 	type RecordSnapshot,
 } from "../src/serverRelocation";
 
+/**
+ * This client synced the notes before the relay moved them: each one is
+ * agreed with the server (acked, sync base), so the attach check
+ * has nothing to ask and the move runs at once.
+ */
+const syncedBefore = () => ({
+	trackedEntries: new Map(),
+	ensureDoc: () => ({
+		getServerAcked: async () => true,
+		getSyncBase: async () => "",
+		dismantle: () => {},
+	}),
+});
+
 const snap = (entries: Record<string, [string, string]>): RecordSnapshot =>
 	new Map(Object.entries(entries).map(([p, [type, id]]) => [p, { type, id }]));
 
@@ -111,6 +125,7 @@ function offlineMoveFixture() {
 		_wantsConnection: true, freshlyCreated: false, isTornDown: false,
 		awaitSynced: async () => {}, onceFreshlySynced: () => synced,
 		followedMoveSkips: new Set<string>(),
+		...syncedBefore(),
 		adoptLocalFiles: jest.fn(async () => { adopted.push([...local]); }),
 		scanFileTree: jest.fn(async () => {}),
 		vaultApi: {
@@ -252,7 +267,7 @@ function noMemoryFixture(disk: Record<string, string>) {
 		for (const path of files.keys()) dirsOf(path).forEach((d) => all.add(d));
 		const nodes = new Map<string, TFile | TFolder>();
 		for (const dir of [...all].sort()) nodes.set(dir, Object.assign(Object.create(TFolder.prototype), { path: dir, children: [] }));
-		for (const path of files.keys()) nodes.set(path, Object.assign(Object.create(TFile.prototype), { path }));
+		for (const [path, text] of files) nodes.set(path, Object.assign(Object.create(TFile.prototype), { path, stat: { size: text.length } }));
 		for (const [path, node] of nodes) {
 			const parent = nodes.get(path.split("/").slice(0, -1).join("/"));
 			if (parent instanceof TFolder) parent.children.push(node);
@@ -266,6 +281,7 @@ function noMemoryFixture(disk: Record<string, string>) {
 		_wantsConnection: true, freshlyCreated: false, isTornDown: false,
 		awaitSynced: async () => {}, onceFreshlySynced: () => Promise.resolve(),
 		followedMoveSkips: new Set<string>(),
+		...syncedBefore(),
 		adoptLocalFiles: jest.fn(async () => {}),
 		scanFileTree: jest.fn(async () => {}),
 		vaultFilesInScope: () =>

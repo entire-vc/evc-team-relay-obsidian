@@ -70,6 +70,22 @@ import {
 	AttachConflictSummary,
 	isDivergenceCopyLabel,
 } from "./attachConflictSummary";
+import {
+	applyAttachChoice,
+	attachBackupFolder,
+	buildAttachReviewModel,
+	compareWithServer,
+	isAttachBackupPath,
+	keepBothCopyLabel,
+	type AttachApplyPorts,
+	type AttachChoice,
+	type AttachEntry,
+	type AttachEntryPoint,
+	type AttachReviewModel,
+} from "./attachReview";
+import { formatAttachChoiceSummary } from "./attachConflictSummary";
+import { sameTextContent } from "./textEquivalence";
+import { deepValueEquals } from "./deepValueEquals";
 import { partitionByKnownGuid } from "./mintGate";
 import { DocActivityChannel } from "./docActivity";
 import {
@@ -112,6 +128,61 @@ export interface VaultShareSettings {
 	 * Indicates which server owns this share
 	 */
 	onpremServerId?: string;
+	/**
+	 * Set while the folder waits for the attach check's decision (GH #114):
+	 * a restart before the user chose holds the folder again instead of
+	 * letting the local notes replace the shared ones.
+	 */
+	attachReview?: "pending";
+}
+
+/**
+ * The UI of the attach check (attachReview.ts). main.ts registers it; with
+ * none registered a held folder simply stays held.
+ */
+export interface AttachReviewUi {
+	/** "Checking done/total", with a Cancel that ends the attach. */
+	progress(share: VaultShare, done: number, total: number, cancel: () => void): void;
+	/** The relay could not be reached; the folder stays held until it can. */
+	offline(share: VaultShare): void;
+	/** Asks for the choice: the dialog (manual), or a persistent notice with Review (auto). */
+	decide(share: VaultShare, model: AttachReviewModel, entry: AttachEntryPoint): Promise<AttachChoice | "cancel">;
+	/** The check is over; shows `summary` when there is one. */
+	finished(share: VaultShare, summary: string | null): void;
+	/** The user cancelled: the folder is not connected (and, for auto, not offered again). */
+	cancelled(share: VaultShare, entry: AttachEntryPoint): void;
+}
+
+let attachReviewUi: AttachReviewUi | null = null;
+
+export function setAttachReviewUi(ui: AttachReviewUi | null): void {
+	attachReviewUi = ui;
+}
+
+/** Pause before the check retries a relay that could not be read. */
+const ATTACH_RETRY_MS = 30_000;
+
+/**
+ * Pause before a check started by holdForAttachCheck() compares: adoption
+ * reconciles a folder's notes together, so the ones that trip with the
+ * first land in the same dialog.
+ */
+export const ATTACH_TRIP_SETTLE_MS = 300;
+
+/** A note the attach check compares, and the wrapper it built for it. */
+interface AttachCandidate {
+	item: Document | CanvasDocument;
+	/** Built by the check: not tracked by the folder before it. */
+	fresh: boolean;
+	entry: AttachEntry;
+	/** Compared at the path a pending server move brings it to; applied only after the move. */
+	projected?: boolean;
+}
+
+/** A choice the user made for a note before the server move that brings it to its path. */
+interface CarriedChoice {
+	choice: AttachChoice;
+	backupFolder: string;
 }
 
 // Discriminated "sync op" shapes, all sharing the same {kind,filePath,completion}
@@ -234,6 +305,37 @@ export class VaultShare extends ProviderBacked {
 	private cancelInitialFolderSync: (() => void) | null = null;
 	/** Set while this device syncs the folder for the first time (#114). */
 	private attachConflictSummary?: AttachConflictSummary;
+	/**
+	 * How this attach started, while the attach check (GH #114) holds the
+	 * folder: nothing is written to disk or to the server until the user
+	 * has decided. Null once released, and for folders that are not being
+	 * attached (created here, or restored after a completed attach).
+	 */
+	private attachEntry: AttachEntryPoint | null = null;
+	/** The running attach check: one at a time, whoever starts it. */
+	private attachCheck?: Promise<boolean>;
+	/**
+	 * Opened by the attach check once the choice is applied (true) or the
+	 * attach ended (false). Server moves rename files on disk, so they wait
+	 * for it while the folder is held.
+	 */
+	private attachMovesGate?: { promise: Promise<boolean>; open(allowed: boolean): void };
+	/** Set once the attach check has let server moves change the disk. */
+	private attachMovesReleased = false;
+	/**
+	 * Notes that met holdForAttachCheck() on a folder that was not being
+	 * attached: the check started that way compares exactly these.
+	 */
+	private attachTripped?: Map<string, Document | CanvasDocument>;
+	private attachFromBarrier = false;
+	/**
+	 * Guids minted locally by claimPaths() in this session (GH #114).
+	 * FolderIndex.put() removes the path from uploadClaims when ensureFileMetadata()
+	 * publishes the record, so scanFileTree() -> _reconcileNewDoc() can run right
+	 * after without seeing uploadClaims; tracking the minted guid keeps our own
+	 * new local-only notes from tripping holdForAttachCheck().
+	 */
+	private locallyMintedGuids?: Set<string>;
 
 	// -- Readiness / persistence promises (memoized -- see awaitReady/awaitSynced) --
 	private readyValue: LazyValue<VaultShare> | null = null;
@@ -275,6 +377,9 @@ export class VaultShare extends ProviderBacked {
 		// createLocalVaultShare, QuickShareModal) -- see the field's own
 		// comment above for why this must stay separate from isAuthority.
 		freshlyCreated: boolean = false,
+		// Set by ShareRegistry.new() when a local folder is attached to a
+		// shared folder that already exists on the server (GH #114).
+		attachEntry?: AttachEntryPoint,
 	) {
 		const s3rn = workspaceId
 			? new RemoteFolderAddress(workspaceId, guid)
@@ -282,6 +387,10 @@ export class VaultShare extends ProviderBacked {
 
 		super(guid, s3rn, tokenStore, loginManager, _config.readValue().onpremServerId);
 		this.freshlyCreated = freshlyCreated;
+		if (!freshlyCreated && workspaceId) {
+			const pending = _config.readValue().attachReview === "pending";
+			this.attachEntry = attachEntry ?? (isRestore && pending ? "auto" : null);
+		}
 		this.path = path;
 		this.setLoggers(`[VaultShare](${this.path})`);
 		this.fileOps = fileOps;
@@ -546,7 +655,7 @@ export class VaultShare extends ProviderBacked {
 	 * claim is still pending, with backoff, until none remain.
 	 */
 	public _scheduleUploadRetry(): void {
-		if (this.isTornDown || this.dormant || this.uploadRetryTimer !== undefined) return;
+		if (this.isTornDown || this.dormant || this.attachHeld || this.uploadRetryTimer !== undefined) return;
 		if (this.pendingUploadCount() === 0) {
 			this.uploadRetryAttempt = 0;
 			return;
@@ -675,6 +784,10 @@ export class VaultShare extends ProviderBacked {
 			// client under a guid this device hasn't learned yet. Bypassing
 			// the mint gate for that path would reopen exactly the
 			// race this gate exists to prevent.
+			if (this.attachEntry) {
+				if (!(await this.runAttachReview(freshlySynced))) return;
+				freshlySynced = true;
+			}
 			const allowMint = freshlySynced || this.freshlyCreated;
 			console.debug(
 				`[VaultShare] isPrepared to syncNow: path=${this.path}, synced=${this.isSynced}, isAuthority=${this.isAuthority}, freshlyCreated=${this.freshlyCreated}, allowMint=${allowMint}`,
@@ -742,6 +855,12 @@ export class VaultShare extends ProviderBacked {
 					if (!this.freshlyCreated && !this.isTornDown) {
 						const persisted = await this.recordsBeforeSync();
 						await this.onceFreshlySynced();
+						// A move that brings a note never agreed with the server onto a
+						// tracked path holds the folder before anything is renamed.
+						if (!this.attachHeld) await this.holdForProjectedMoves(persisted);
+						// Held for the attach check: moves rename files on disk, so they
+						// wait for the user's choice and never run on a cancelled attach.
+						if (!(await this.attachMovesAllowed())) return false;
 						await this.applyServerMoves(persisted);
 						this.refreshServerMoveRemnants();
 					}
@@ -754,14 +873,11 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	/**
-	 * Renames local folders/files the server moved while this client was
-	 * offline (relocate-artifacts), so adoptLocalFiles() finds them at their
-	 * new, already-tracked path instead of publishing the old one again.
-	 * Never overwrites: if the destination already exists locally, the old
-	 * path is left alone.
+	 * The server moves applyServerMoves() follows: paths the persisted index
+	 * knew under another path, plus top-level folders on disk the relocation
+	 * tool moved. The attach check reads the same list before anything moves.
 	 */
-	private async applyServerMoves(persisted: RecordSnapshot): Promise<void> {
-		if (this.isTornDown) return;
+	private planServerMoves(persisted: RecordSnapshot): ServerMove[] {
 		const synced = takeRecordSnapshot(this.folderIndex);
 		const moves: ServerMove[] = findServerMoves(persisted, synced);
 		// IndexedDB may be empty or already hold the post-move state (a client
@@ -779,7 +895,21 @@ export class VaultShare extends ProviderBacked {
 		for (const move of findStructuralMoves(localRoots, synced)) {
 			if (!moves.some((known) => known.from === move.from)) moves.push(move);
 		}
-		for (const { from, to } of moves) {
+		return moves;
+	}
+
+	/**
+	 * Renames local folders/files the server moved while this client was
+	 * offline (relocate-artifacts), so adoptLocalFiles() finds them at their
+	 * new, already-tracked path instead of publishing the old one again.
+	 * Never overwrites: if the destination already exists locally, the old
+	 * path is left alone.
+	 */
+	private async applyServerMoves(persisted: RecordSnapshot): Promise<void> {
+		if (this.isTornDown) return;
+		// Held for the attach check and not let through yet: the disk stays as it is.
+		if (this.attachHeld && !this.attachMovesReleased) return;
+		for (const { from, to } of this.planServerMoves(persisted)) {
 			try {
 				const source = this.vaultApi.getAbstractFileByPath(this.absolutePath(from));
 				if (!source) continue;
@@ -992,6 +1122,496 @@ export class VaultShare extends ProviderBacked {
 		const folderName = this.path.split(sep).pop() ?? this.path;
 		this.attachConflictSummary = new AttachConflictSummary(folderName, (message) => {
 			new Notice(message, ATTACH_SUMMARY_NOTICE_MS);
+		});
+	}
+
+	/** Held for the attach check: nothing is written to disk or to the server (GH #114). */
+	get attachHeld(): boolean {
+		return this.attachEntry != null;
+	}
+
+	/** Write access to the shared folder: a viewer's folder token is read-only. */
+	hasWriteAccess(): boolean {
+		const token = this.credentialCache?.peekToken(ResourceAddress.serialize(this.resourceAddress));
+		// Fail closed: without a token known to grant writes, keep local is not offered.
+		return token?.authorization === "full";
+	}
+
+	/** The folder's name as the user sees it; the vault's name for a vault-root share. */
+	private attachFolderName(): string {
+		return this.path.split(sep).pop() || this.vaultApi.getName?.() || "Vault";
+	}
+
+	/**
+	 * The attach check (attachReview.ts, GH #114). Runs in place of the first
+	 * adoption while the folder is held: compares every note that exists on
+	 * both sides, asks the user when any differ, applies the choice, then
+	 * releases the hold. Returns false when the attach ended instead
+	 * (cancelled, or the folder was torn down).
+	 */
+	private runAttachReview(freshlySynced: boolean): Promise<boolean> {
+		return (this.attachCheck ??= this.attachReviewPasses(freshlySynced).finally(() => {
+			this.attachCheck = undefined;
+		}));
+	}
+
+	private async attachReviewPasses(freshlySynced: boolean): Promise<boolean> {
+		const entryPoint = this.attachEntry;
+		if (!entryPoint) return true;
+		let cancelled = false;
+		const cancel = () => {
+			cancelled = true;
+		};
+		type SummaryBucket = {
+			choice: AttachChoice;
+			differed: number;
+			copies: string[];
+			backupFolder: string;
+			unresolved: string[];
+		};
+		const summaryBuckets = new Map<string, SummaryBucket>();
+		const recordSummary = (
+			choice: AttachChoice,
+			differed: number,
+			copies: readonly string[],
+			backupFolder: string,
+			unresolved: readonly string[],
+		) => {
+			const key = choice === "keep-both" ? choice : `${choice}\0${backupFolder}`;
+			let bucket = summaryBuckets.get(key);
+			if (!bucket) {
+				bucket = { choice, differed: 0, copies: [], backupFolder, unresolved: [] };
+				summaryBuckets.set(key, bucket);
+			}
+			bucket.differed += differed;
+			bucket.copies.push(...copies);
+			bucket.unresolved.push(...unresolved);
+		};
+		const flushSummary = (): string | null => {
+			if (summaryBuckets.size === 0) return null;
+			const folderName = this.attachFolderName();
+			const lines = [...summaryBuckets.values()].map((bucket) =>
+				formatAttachChoiceSummary(folderName, bucket),
+			);
+			summaryBuckets.clear();
+			return lines.join("\n");
+		};
+		let movesDone = false;
+		const settled: AttachCandidate[] = [];
+		// Notes a pending server move brings onto a tracked path: the user
+		// decides before the move, the choice is applied once they are there.
+		const carried = new Map<string, CarriedChoice>();
+		while (!this.isTornDown) {
+			if (!freshlySynced && !this._liveProvider?.synced) {
+				attachReviewUi?.offline(this);
+				await this.onceFreshlySynced();
+			}
+			freshlySynced = true;
+			// The index only: awaitFolderTreeReady() itself waits for this check.
+			const persisted = await this.recordsBeforeSync();
+			if (this.isTornDown) return false;
+			const candidates = await this.attachCandidates();
+			const byPath = new Map(candidates.map((c) => [c.entry.vpath, c]));
+			const add = (c: AttachCandidate | null) => {
+				if (!c) return;
+				if (byPath.has(c.entry.vpath)) {
+					if (c.fresh) c.item.dismantle();
+					return;
+				}
+				byPath.set(c.entry.vpath, c);
+				candidates.push(c);
+			};
+			for (const vpath of carried.keys()) add(await this.attachCandidateAt(vpath));
+			let unreadableMoves = false;
+			if (!movesDone && !this.attachMovesReleased) {
+				try {
+					for (const c of await this.projectedMoveCandidates(persisted)) add(c);
+				} catch (e: unknown) {
+					this.warn("attach check: could not read the notes server moves bring", e);
+					unreadableMoves = true;
+				}
+			}
+			const itemOf = (entry: AttachEntry) => byPath.get(entry.vpath)!.item;
+			const compared = await compareWithServer(
+				candidates.map((c) => c.entry),
+				{
+					onProgress: (done, total) => attachReviewUi?.progress(this, done, total, cancel),
+					isCancelled: () => cancelled || this.isTornDown,
+					onAgreed: (entry, text) => this.markAttachAgreed(itemOf(entry), text),
+				},
+			);
+			if (this.isTornDown) return false;
+			if (compared.cancelled) return this.cancelAttach(entryPoint, [...settled, ...candidates]);
+			if (compared.unreadable.length > 0 || unreadableMoves) {
+				this.warn(`attach check: ${compared.unreadable.length} note(s) could not be read (disk or relay), holding`);
+				this.dropAttachCandidates(candidates);
+				attachReviewUi?.offline(this);
+				await new Promise<void>((resolve) => window.setTimeout(resolve, ATTACH_RETRY_MS));
+				freshlySynced = false;
+				continue;
+			}
+
+			const chosen = compared.differing.filter(
+				(d) => carried.has(d.entry.vpath) && !byPath.get(d.entry.vpath)?.projected,
+			);
+			const toAsk = compared.differing.filter((d) => !carried.has(d.entry.vpath));
+			const batches: { choice: AttachChoice; backupFolder: string; differing: typeof toAsk }[] = [];
+			for (const d of chosen) {
+				const { choice, backupFolder } = carried.get(d.entry.vpath)!;
+				// One attempt: a note left unresolved is asked about again.
+				carried.delete(d.entry.vpath);
+				let batch = batches.find((b) => b.choice === choice && b.backupFolder === backupFolder);
+				if (!batch) batches.push((batch = { choice, backupFolder, differing: [] }));
+				batch.differing.push(d);
+			}
+			if (toAsk.length > 0) {
+				const folderName = this.attachFolderName();
+				const backupFolder = await this.freeAttachBackupFolder(folderName);
+				const model = buildAttachReviewModel(folderName, toAsk, this.hasWriteAccess(), backupFolder);
+				const ui = attachReviewUi;
+				if (!ui) return false;
+				const choice = await ui.decide(this, model, entryPoint);
+				if (this.isTornDown) return false;
+				if (choice === "cancel" || (choice === "keep-local" && !model.canKeepLocal)) {
+					return this.cancelAttach(entryPoint, [...settled, ...candidates]);
+				}
+				const now: typeof toAsk = [];
+				for (const d of toAsk) {
+					if (byPath.get(d.entry.vpath)?.projected) carried.set(d.entry.vpath, { choice, backupFolder });
+					else now.push(d);
+				}
+				batches.push({ choice, backupFolder, differing: now });
+			}
+
+			let unresolved = false;
+			for (const { choice, backupFolder, differing } of batches) {
+				if (differing.length === 0) continue;
+				const applied = await applyAttachChoice(
+					choice,
+					differing,
+					this.attachApplyPorts(itemOf, backupFolder),
+				);
+				recordSummary(choice, differing.length, applied.copies, backupFolder, applied.unresolved);
+				this.log(
+					`attach check: ${choice}, resolved ${applied.resolved.length}, unresolved ${applied.unresolved.length}`,
+				);
+				if (applied.unresolved.length > 0) unresolved = true;
+			}
+			// Compared at a path they are not on yet: nothing to track before the move.
+			const projected = candidates.filter((c) => c.projected);
+			this.dropAttachCandidates(projected);
+			const current = candidates.filter((c) => !c.projected);
+			if (unresolved) {
+				// Fail closed: a note whose copy could not be saved stays as it is on
+				// both sides and the folder stays held; the next pass offers only
+				// those notes again (settled ones carry a sync base now).
+				attachReviewUi?.finished(this, flushSummary());
+				this.dropAttachCandidates(current);
+				continue;
+			}
+			settled.push(...current);
+			if (!movesDone) {
+				// Server moves rename files on disk: they run only now, after the
+				// choice for every note they carry; the next pass applies it there.
+				movesDone = true;
+				this.openAttachMovesGate(true);
+				if (!(await this.awaitFolderTreeReady()) || this.isTornDown) return false;
+				continue;
+			}
+			await this.releaseAttachHold(settled);
+			attachReviewUi?.finished(this, flushSummary());
+			return true;
+		}
+		return false;
+	}
+
+	/** Resolves once server moves may change the disk: at once unless held. */
+	private attachMovesAllowed(): Promise<boolean> {
+		if (!this.attachHeld || this.attachMovesReleased) return Promise.resolve(true);
+		if (!this.attachMovesGate) {
+			let open: (allowed: boolean) => void = () => {};
+			const promise = new Promise<boolean>((resolve) => {
+				open = resolve;
+			});
+			this.attachMovesGate = { promise, open };
+		}
+		return this.attachMovesGate.promise;
+	}
+
+	private openAttachMovesGate(allowed: boolean): void {
+		if (allowed) this.attachMovesReleased = true;
+		const gate = this.attachMovesGate;
+		this.attachMovesGate = undefined;
+		gate?.open(allowed);
+	}
+
+	/**
+	 * GH #114, any entry point: a note the server tracks, never agreed with it
+	 * on this device and not minted here would replace the shared text when
+	 * uploaded. Holds the folder and runs the attach check instead. False
+	 * when the ordinary upload goes ahead (a folder created here, no local text).
+	 */
+	private holdForAttachCheck(item: Document | CanvasDocument): boolean {
+		if (this.freshlyCreated || this.isTornDown) return false;
+		// No local text (or no file): nothing to upload over the shared note.
+		if (!item.obsidianFile?.stat.size) return false;
+		(this.attachTripped ??= new Map()).set(item.entityGuid, item);
+		if (this.attachEntry) return true;
+		this.startBarrierHold(`${item.entryPath} was never agreed with the server`);
+		return true;
+	}
+
+	/**
+	 * Before server moves run unheld (a restart without a pending check): a
+	 * move that would bring a note never agreed with the server onto a
+	 * tracked path holds the folder, so the rename waits for the choice.
+	 */
+	private async holdForProjectedMoves(persisted: RecordSnapshot): Promise<void> {
+		if (this.freshlyCreated || this.isTornDown || this.attachEntry) return;
+		let count: number;
+		try {
+			const projected = await this.projectedMoveCandidates(persisted);
+			this.dropAttachCandidates(projected);
+			count = projected.length;
+		} catch (e: unknown) {
+			// Fail closed: the moves wait for a check that can read them.
+			this.warn("attach check: could not read the notes server moves bring", e);
+			count = -1;
+		}
+		if (count === 0 || this.attachEntry || this.isTornDown) return;
+		this.attachTripped ??= new Map();
+		this.startBarrierHold("server moves bring notes never agreed with the server onto shared paths");
+	}
+
+	private startBarrierHold(reason: string): void {
+		this.attachEntry = "auto";
+		this.attachFromBarrier = true;
+		this.log(`attach check: ${reason}, holding the folder`);
+		void this._config.mutateValue((current) => ({ ...current, attachReview: "pending" as const }));
+		void this.runDeferredAttachCheck();
+	}
+
+	/** The check started by holdForAttachCheck(), then what the hold skipped. */
+	private async runDeferredAttachCheck(): Promise<void> {
+		await new Promise<void>((resolve) => window.setTimeout(resolve, ATTACH_TRIP_SETTLE_MS));
+		if (this.isTornDown) return;
+		const released = await this.runAttachReview(false);
+		if (!released || this.isTornDown) return;
+		// Notes that met the hold were tracked but not reconciled: do it now.
+		for (const item of [...this.trackedEntries.values()]) {
+			if (isDocument(item)) void this._reconcileNewDoc(item);
+			else if (isCanvasDocument(item)) void this._reconcileNewCanvas(item);
+		}
+		void this.scanFileTree(this.folderIndex);
+		this._scheduleUploadRetry();
+	}
+
+	/**
+	 * Notes the attach check compares: tracked by the server, not empty on
+	 * disk, and never agreed with the relay on this device. A note settled by
+	 * an earlier check (sync base recorded) is not offered again.
+	 */
+	private async attachCandidates(): Promise<AttachCandidate[]> {
+		if (this.attachFromBarrier) return this.trippedAttachCandidates();
+		const candidates: AttachCandidate[] = [];
+		for (const tfile of this.adoptableFiles()) {
+			if (!(tfile instanceof TFile) || tfile.stat.size === 0) continue;
+			const candidate = await this.attachCandidateFor(this.toVirtualPath(tfile.path));
+			if (candidate) candidates.push(candidate);
+		}
+		return candidates;
+	}
+
+	/** The note on disk at `vpath`, when the check must compare it. */
+	private async attachCandidateAt(vpath: string): Promise<AttachCandidate | null> {
+		const tfile = this.vaultApi.getAbstractFileByPath(normalizePath(this.absolutePath(vpath)));
+		if (!(tfile instanceof TFile) || tfile.stat.size === 0) return null;
+		return this.attachCandidateFor(vpath);
+	}
+
+	/**
+	 * Notes a pending server move brings onto a path the server tracks,
+	 * compared before the move: the local text is read at its current path.
+	 * Moves applyServerMoves() would skip (destination on disk) bring nothing.
+	 */
+	private async projectedMoveCandidates(persisted: RecordSnapshot): Promise<AttachCandidate[]> {
+		const candidates: AttachCandidate[] = [];
+		for (const { from, to } of this.planServerMoves(persisted)) {
+			const source = this.vaultApi.getAbstractFileByPath(normalizePath(this.absolutePath(from)));
+			if (!source) continue;
+			if (this.vaultApi.getAbstractFileByPath(normalizePath(this.absolutePath(to)))) continue;
+			const files: TFile[] = [];
+			const collect = (file: TAbstractFile) => {
+				if (file instanceof TFile && file.stat.size > 0) files.push(file);
+			};
+			if (source instanceof TFolder) Vault.recurseChildren(source, collect);
+			else collect(source);
+			for (const file of files) {
+				const vpath = this.toVirtualPath(file.path);
+				if (vpath !== from && !vpath.startsWith(`${from}/`)) continue;
+				const candidate = await this.attachCandidateFor(to + vpath.slice(from.length), file.path);
+				if (candidate) candidates.push(candidate);
+			}
+		}
+		return candidates;
+	}
+
+	/**
+	 * The candidate for the tracked note at `vpath`, or null when the check
+	 * leaves it alone (not tracked, not a note, agreed on this device before).
+	 * `localPath`: where its local text is now, when not at `vpath` yet.
+	 */
+	private async attachCandidateFor(vpath: string, localPath?: string): Promise<AttachCandidate | null> {
+		const guid = this.folderIndex.guidFor(vpath);
+		const type = this.folderIndex.recordFor(vpath)?.type;
+		if (!guid || type === undefined || this.locallyMintedGuids?.has(guid)) return null;
+		const tracked = this.trackedEntries.has(guid);
+		let item: Document | CanvasDocument;
+		if (type === ItemKind.Document && Document.matchesTrackedExtension(vpath)) {
+			item = this.ensureDoc(guid, vpath);
+		} else if (
+			type === ItemKind.Canvas &&
+			CanvasDocument.matchesTrackedExtension(vpath) &&
+			currentToggles().enableCanvasSync
+		) {
+			item = this.ensureCanvas(guid, vpath);
+		} else {
+			return null;
+		}
+		const [acked, base] = await Promise.all([item.getServerAcked(), item.getSyncBase()]);
+		if (acked && base !== undefined) {
+			if (!tracked) item.dismantle();
+			return null;
+		}
+		const entry = this.attachEntryFor(item, localPath);
+		return localPath === undefined
+			? { item, fresh: !tracked, entry }
+			: { item, fresh: !tracked, entry, projected: true };
+	}
+
+	/** The notes that started a barrier hold, until each is agreed (ack and sync base). */
+	private async trippedAttachCandidates(): Promise<AttachCandidate[]> {
+		const candidates: AttachCandidate[] = [];
+		for (const item of [...(this.attachTripped?.values() ?? [])]) {
+			const [acked, base] = await Promise.all([item.getServerAcked(), item.getSyncBase()]);
+			if (acked && base !== undefined) {
+				this.attachTripped?.delete(item.entityGuid);
+				continue;
+			}
+			// Already tracked (docAt / adoption created it): never dismantled here.
+			candidates.push({ item, fresh: false, entry: this.attachEntryFor(item) });
+		}
+		return candidates;
+	}
+
+	private attachEntryFor(item: Document | CanvasDocument, localPath?: string): AttachEntry {
+		const read = localPath
+			? () => this.vaultApi.adapter.read(normalizePath(localPath))
+			: () => this.readContents(item);
+		return {
+			vpath: item.entryPath,
+			// A read failure is not an empty note: null keeps the folder held.
+			readLocal: () => read().catch((): null => null),
+			readServer: () => this.transfers.readRelayText(item),
+			same: (local, server) => {
+				if (isDocument(item)) return sameTextContent(local, server);
+				try {
+					// The relay reports a canvas with no nodes or edges as "".
+					const relay: unknown = server === "" ? { nodes: [], edges: [] } : JSON.parse(server);
+					return deepValueEquals(JSON.parse(local), relay);
+				} catch {
+					return false;
+				}
+			},
+		};
+	}
+
+	private attachApplyPorts(
+		itemOf: (entry: AttachEntry) => Document | CanvasDocument,
+		backupFolder: string,
+	): AttachApplyPorts {
+		const writeNew = async (vaultPath: string, text: string) => {
+			const target = normalizePath(vaultPath);
+			if (await this.vaultApi.adapter.exists(target)) {
+				throw new Error(`refusing to overwrite ${target}`);
+			}
+			await this.ensureVaultFolder(dirname(target));
+			await this.vaultApi.adapter.write(target, text);
+		};
+		return {
+			writeDisk: (entry, text) => this.writeContents(itemOf(entry), text),
+			writeLocalCopy: async (entry, text) => {
+				const copy = buildConflictCopyPath(entry.vpath, keepBothCopyLabel(new Date()));
+				await writeNew(this.absolutePath(copy), text);
+				return copy;
+			},
+			writeBackup: async (entry, text) => {
+				const target = `${backupFolder}/${entry.vpath}`;
+				await writeNew(target, text);
+				return target;
+			},
+			replaceServer: (entry, local, preserve) =>
+				this.transfers.replaceRelayText(itemOf(entry), local, preserve),
+			markAgreed: (entry, text) => this.markAttachAgreed(itemOf(entry), text),
+		};
+	}
+
+	private async markAttachAgreed(item: Document | CanvasDocument, text: string): Promise<void> {
+		await item.setSyncBase(text);
+		await item.markServerAcked();
+	}
+
+	/** Creates `folder` and its parents in the vault when missing. */
+	private async ensureVaultFolder(folder: string): Promise<void> {
+		if (!folder || folder === ".") return;
+		const parts = normalizePath(folder).split("/");
+		for (let i = 1; i <= parts.length; i++) {
+			const path = parts.slice(0, i).join("/");
+			if (!(await this.vaultApi.adapter.exists(path))) await this.vaultApi.adapter.mkdir(path);
+		}
+	}
+
+	/** A backup folder name nothing uses yet: "<name> <stamp>", then " (2)", " (3)"... */
+	private async freeAttachBackupFolder(folderName: string): Promise<string> {
+		const base = attachBackupFolder(folderName, new Date());
+		let candidate = base;
+		for (let n = 2; await this.vaultApi.adapter.exists(candidate); n++) {
+			candidate = `${base} (${n})`;
+		}
+		return candidate;
+	}
+
+	/** Frees the wrappers the check built for notes the folder does not track yet. */
+	private dropAttachCandidates(candidates: AttachCandidate[]): void {
+		for (const c of candidates) if (c.fresh) c.item.dismantle();
+	}
+
+	private cancelAttach(entryPoint: AttachEntryPoint, candidates: AttachCandidate[]): false {
+		this.openAttachMovesGate(false);
+		this.dropAttachCandidates(candidates);
+		this.log(`attach check cancelled (${entryPoint}): the folder is not connected`);
+		attachReviewUi?.finished(this, null);
+		attachReviewUi?.cancelled(this, entryPoint);
+		return false;
+	}
+
+	/**
+	 * Ends the hold: the compared notes are tracked as they are (disk and
+	 * relay now agree on each one) and adoption runs for everything else.
+	 */
+	private async releaseAttachHold(settled: AttachCandidate[]): Promise<void> {
+		for (const { item } of settled) {
+			this.trackedEntries.set(item.entityGuid, item);
+			this.pathSet.include(item, false);
+		}
+		if (settled.length > 0) this.pathSet.update();
+		this.attachEntry = null;
+		this.attachFromBarrier = false;
+		this.attachTripped?.clear();
+		await this._config.mutateValue((current) => {
+			const rest = { ...current };
+			delete rest.attachReview;
+			return rest;
 		});
 	}
 
@@ -1231,6 +1851,8 @@ export class VaultShare extends ProviderBacked {
 		diverged: (local: string, winner: S) => boolean,
 		winnerEmpty: (winner: S) => boolean,
 	): Promise<T> {
+		const lostGuid = this.uploadClaims.get(vpath);
+		if (lostGuid) this.locallyMintedGuids?.delete(lostGuid);
 		this.folderIndex.clearPendingUpload(vpath);
 		await this.awaitVpathResolved(vpath);
 
@@ -1487,6 +2109,10 @@ export class VaultShare extends ProviderBacked {
 		if (!inFolder || !isSupportedFileType) {
 			return false;
 		}
+		// The attach check's backups stay local, folders included (GH #114).
+		if (isAttachBackupPath(tfile.path)) {
+			return false;
+		}
 		// Extension preferences don't apply to folders -- only the sync
 		// store's own support check above matters for them.
 		if (tfile instanceof TFolder) {
@@ -1540,7 +2166,7 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	async refreshFromServer() {
-		if (this.dormant) return;
+		if (this.dormant || this.attachHeld) return;
 		await this.awaitReady();
 		// Wait for a FRESH provider sync (not onceProviderSynced()'s sticky
 		// "ever synced" featureKey, see its own doc comment) before reconciling.
@@ -1589,6 +2215,7 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	async syncNow() {
+		if (this.attachHeld) return;
 		await this.scanFileTree(this.folderIndex);
 	}
 
@@ -1874,7 +2501,7 @@ export class VaultShare extends ProviderBacked {
 		// Recovery copies are local-only: copies already registered in the
 		// shared index by an earlier version must not be pulled onto other
 		// clients (that is how they nested).
-		if (isConflictCopyPath(path)) {
+		if (isConflictCopyPath(path) || isAttachBackupPath(this.absolutePath(path))) {
 			return this._noop(path);
 		}
 
@@ -2341,6 +2968,8 @@ export class VaultShare extends ProviderBacked {
 		// Do not start SingleFlight's stall timer while waiting for the first
 		// connection; offline startup may legitimately wait indefinitely.
 		if (!(await this.awaitFolderTreeReady()) || this.isTornDown) return;
+		// Held for the attach check: the server-only files are not pulled yet.
+		if (this.attachHeld) return;
 		// A sync is already in flight -- queue a follow-up pass instead of overlapping.
 		if (this.treeScanInFlight) {
 			this.resyncRequested = true;
@@ -2628,6 +3257,7 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	async noteUploaded(file: SyncableEntry): Promise<void> {
+		if (this.attachHeld) return;
 		const meta = await this._metaForUpload(file);
 		if (meta) {
 			this._commitMeta(file, meta);
@@ -2748,7 +3378,8 @@ export class VaultShare extends ProviderBacked {
 					continue;
 				}
 				this.log("claiming a fresh guid for:", vpath);
-				this.folderIndex.new(vpath);
+				const guid = this.folderIndex.new(vpath);
+				(this.locallyMintedGuids ??= new Set()).add(guid);
 				claimed.push(vpath);
 			}
 		}, this);
@@ -2813,13 +3444,31 @@ export class VaultShare extends ProviderBacked {
 		return canvas;
 	}
 
+	private isLocallyMinted(item: Document | CanvasDocument): boolean {
+		return (
+			Boolean(this.uploadClaims.get(item.entryPath)) ||
+			this.locallyMintedGuids?.has(item.entityGuid) === true
+		);
+	}
+
 	private async _reconcileNewCanvas(canvas: CanvasDocument): Promise<void> {
+		if (this.attachHeld && !this.attachFromBarrier) return;
 		const synced = await canvas.getServerAcked();
+		if (synced) this.locallyMintedGuids?.delete(canvas.entityGuid);
+		if (this.attachHeld) {
+			if (!synced && this.workspaceId && !this.isLocallyMinted(canvas)) {
+				this.holdForAttachCheck(canvas);
+			}
+			return;
+		}
 		if (canvas.crdtStat.size === 0 && !synced) {
 			void this.transfers.enqueueCanvasFetch(canvas);
-		} else if (this.uploadClaims.get(canvas.entryPath)) {
+		} else if (this.isLocallyMinted(canvas)) {
 			void this.transfers.enqueueUpload(canvas);
 		} else if (!synced && this.workspaceId) {
+			// GH #114: same rule as notes. The fetch's WS fallback (the relay-onprem
+			// path) writes the relay canvas over the local file.
+			if (this.holdForAttachCheck(canvas)) return;
 			// For relay-onprem: CanvasDocument hasn't been synced to server yet
 			void this.transfers.enqueueCanvasFetch(canvas);
 		}
@@ -3014,12 +3663,24 @@ export class VaultShare extends ProviderBacked {
 	}
 
 	private async _reconcileNewDoc(doc: Document): Promise<void> {
+		if (this.attachHeld && !this.attachFromBarrier) return;
 		const synced = await doc.getServerAcked();
+		if (synced) this.locallyMintedGuids?.delete(doc.entityGuid);
+		if (this.attachHeld) {
+			// A hold the barrier started: only note what the check must compare.
+			if (!synced && this.workspaceId && !this.isLocallyMinted(doc)) {
+				this.holdForAttachCheck(doc);
+			}
+			return;
+		}
 		if (doc.obsidianFile?.stat.size === 0 && !synced) {
 			void this.transfers.enqueueFetch(doc);
-		} else if (this.uploadClaims.get(doc.entryPath)) {
+		} else if (this.isLocallyMinted(doc)) {
 			void this.transfers.enqueueUpload(doc);
 		} else if (!synced && this.workspaceId) {
+			// GH #114: the server tracks this note, this device never agreed with
+			// it and did not mint it: an upload would replace the shared text.
+			if (this.holdForAttachCheck(doc)) return;
 			// For relay-onprem: Document hasn't been synced to server yet.
 			// Use enqueueUpload (WebSocket path) which properly reconciles:
 			// if the relay is empty and local file has content, it uploads;
@@ -3282,7 +3943,10 @@ export class VaultShare extends ProviderBacked {
 		if (this.dormant) return;
 		// Local recovery copies stay local (GH #4) -- this handler also sees
 		// the ones this client writes itself.
-		if (isConflictCopyPath(tfile.path)) return;
+		if (isConflictCopyPath(tfile.path) || isAttachBackupPath(tfile.path)) return;
+		// Held for the attach check: a file created meanwhile is adopted with
+		// the rest once the user has decided.
+		if (this.attachHeld) return;
 		const vpath = this.toVirtualPath(tfile.path);
 		// Startup "create" events can arrive before the tree scan has looked at
 		// the persisted records; take them first so the check below sees them.
@@ -3357,6 +4021,7 @@ export class VaultShare extends ProviderBacked {
 				void doc.dispose();
 				this.pathSet.delete(doc);
 				this.trackedEntries.delete(doc.entityGuid);
+				this.locallyMintedGuids?.delete(doc.entityGuid);
 			}
 		}, this);
 		// Fully tear down the Document/CanvasDocument after removing from folderIndex:
@@ -3484,8 +4149,10 @@ export class VaultShare extends ProviderBacked {
 
 	dismantle() {
 		this.isTornDown = true;
+		this.locallyMintedGuids?.clear();
 		this.attachConflictSummary?.close();
 		this.lostClaimSettler.cancelAll();
+		if (this.attachEntry) attachReviewUi?.finished(this, null);
 		this.cancelInitialFolderSync?.();
 		this.cancelInitialFolderSync = null;
 		this.teardowns.forEach((unsub) => {
@@ -3544,6 +4211,7 @@ type FolderBuilder = (
 	hasPendingUpdates?: boolean,
 	isRestore?: boolean,
 	freshlyCreated?: boolean,
+	attach?: AttachEntryPoint,
 ) => VaultShare;
 
 export class ShareRegistry extends NotifierSet<VaultShare> {
@@ -3626,7 +4294,10 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 
 	shareFor(path: string): VaultShare | null {
 		// Purely a path-namespace match -- doesn't care whether `path` exists on disk.
-		return this.locate((vaultShare) => vaultShare.containsPath(path)) ?? null;
+		// A folder held for the attach check (GH #114) syncs no path yet:
+		// vault events, editors and the sync-artifact mirrors leave it alone
+		// until the user has decided.
+		return this.locate((vaultShare) => !vaultShare.attachHeld && vaultShare.containsPath(path)) ?? null;
 	}
 
 	/**
@@ -3785,6 +4456,7 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 		hasPendingUpdates?: boolean,
 		isRestore?: boolean,
 		freshlyCreated?: boolean,
+		attach?: AttachEntryPoint,
 	): VaultShare {
 		// Every caller hands over a server-issued share id; refuse a missing
 		// one before the factory persists it as `guid: "undefined"` (GH #116).
@@ -3801,7 +4473,10 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 		this._assertPathFree(path);
 		this._assertNoNestingConflict(path);
 
-		const folder = this.shareFactory(path, guid, workspaceId, hasPendingUpdates, isRestore, freshlyCreated);
+		// The attach argument only when set: every other caller keeps its call shape.
+		const folder = attach
+			? this.shareFactory(path, guid, workspaceId, hasPendingUpdates, isRestore, freshlyCreated, attach)
+			: this.shareFactory(path, guid, workspaceId, hasPendingUpdates, isRestore, freshlyCreated);
 		this.backing.add(folder);
 		return folder;
 	}
@@ -3840,11 +4515,15 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 		// elsewhere under a different guid (, see freshlyCreated's
 		// own doc comment on the VaultShare field).
 		freshlyCreated?: boolean,
+		// How a local folder is being attached to a shared folder that already
+		// exists on the server: the folder is held for the attach check
+		// (GH #114) until the user has decided.
+		attach?: AttachEntryPoint,
 	) {
 		// isRestore left undefined (falsy): every caller of this public method
 		// writes onpremServerId immediately after it returns -- the
 		// constructor must not race that write with its own auto-connect.
-		const folder = this._create(path, guid, workspaceId, hasPendingUpdates, undefined, freshlyCreated);
+		const folder = this._create(path, guid, workspaceId, hasPendingUpdates, undefined, freshlyCreated, attach);
 		this.notifySubscribers();
 		return folder;
 	}

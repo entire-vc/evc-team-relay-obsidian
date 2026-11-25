@@ -25,6 +25,7 @@ import { waitForBufferFlush } from "./websocketFlush";
 import { ResourceAddress } from "./ResourceAddress";
 import type { LiveText } from "./InboundFileDownloader";
 import type { ShareRegistry, VaultShare } from "./VaultShare";
+import { isAttachBackupPath } from "./attachReview";
 
 const log = namedLogger("[OutboundSyncWiring]");
 
@@ -35,6 +36,9 @@ export function resolveOutboundTarget(
 	shareRegistry: ShareRegistry,
 	vaultPath: string,
 ): OutboundTarget | null {
+	// The attach check's backups stay on this device (GH #114), also when the
+	// shared folder is the vault root.
+	if (isAttachBackupPath(vaultPath)) return null;
 	const folder = shareRegistry.shareFor(vaultPath);
 	if (!folder) return null;
 	const shareId = folder.entityGuid;
@@ -303,7 +307,9 @@ export function watchShareReconnects(opts: {
 
 	const check = (): void => {
 		shareRegistry.each((folder) => {
-			const isOnline = folder.isOnline;
+			// Held by the attach check (GH #114): counts as offline, so the
+			// reconnect reconcile runs once the user has decided.
+			const isOnline = folder.isOnline && !folder.attachHeld;
 			const wasOnline = online.get(folder) ?? false;
 			online.set(folder, isOnline);
 			if (isOnline && !wasOnline) reconcileFolder(folder);

@@ -145,3 +145,56 @@ export class AttachConflictSummary {
 		this.report();
 	}
 }
+
+/** What the attach check (attachReview.ts) did, for its one summary notice. */
+export interface AttachChoiceSummaryInput {
+	choice: "keep-both" | "keep-server" | "keep-local";
+	/** Notes that differed between local and server. */
+	differed: number;
+	/** Local copies written next to the notes (keep both). */
+	copies: readonly string[];
+	/** Where keep server / keep local saved the overwritten side. */
+	backupFolder: string;
+	/** Notes left unchanged because their copy could not be saved. */
+	unresolved: readonly string[];
+}
+
+function listNames(names: readonly string[], maxNames: number): string {
+	const shown = names.slice(0, maxNames);
+	const more = names.length - shown.length;
+	return (more > 0 ? [...shown, `+${more} more`] : shown).join(", ");
+}
+
+/**
+ * The one notice after the user chose how to attach a folder whose notes
+ * differed from the server: how many differed, what was kept, where the
+ * other side went, and which notes were left as they were.
+ */
+export function formatAttachChoiceSummary(
+	folderName: string,
+	input: AttachChoiceSummaryInput,
+	maxNames: number = ATTACH_SUMMARY_MAX_NAMES,
+): string {
+	const files = input.differed === 1 ? "1 file" : `${input.differed} files`;
+	const where = folderName ? ` (${folderName})` : "";
+	if (input.unresolved.length >= input.differed) {
+		// Nothing was applied: do not claim a version was kept or saved.
+		return `Team Relay${where}: ${files} differed between local and server; not changed, the copy could not be saved: ${listNames(input.unresolved, maxNames)}`;
+	}
+	let kept: string;
+	if (input.choice === "keep-both") {
+		kept =
+			input.copies.length > 0
+				? `kept the server version; local copies created: ${listNames(input.copies, maxNames)}`
+				: "kept the server version";
+	} else if (input.choice === "keep-server") {
+		kept = `kept the server version; local versions saved to ${input.backupFolder}`;
+	} else {
+		kept = `kept the local version; server versions saved to ${input.backupFolder}`;
+	}
+	const left =
+		input.unresolved.length > 0
+			? `. Not changed, the copy could not be saved: ${listNames(input.unresolved, maxNames)}`
+			: "";
+	return `Team Relay${where}: ${files} differed between local and server; ${kept}${left}`;
+}
