@@ -101,7 +101,7 @@ import {
 	VIEW_TYPE_FILE_DIFF,
 } from "./fileDiff/fileDiffView";
 
-import { AttachmentSyncSettings } from "./AttachmentSyncSettings";
+import { bindVaultShareSettings, isValidShareGuid } from "./vaultShareSettings";
 import { FileHashCache, isAttachmentFile } from "./AttachmentFile";
 import { isDocument } from "./Document";
 import { TenantRegistry, type TenantSettings } from "./TenantRegistry";
@@ -1248,25 +1248,13 @@ export default class TeamRelayPlugin extends Plugin {
 		freshlyCreated?: boolean,
 	): VaultShare {
 		// Address this folder's settings slice by its guid, not array index.
-		const folderSettings = new SettingsScope<VaultShareSettings>(
+		// Validates the guid before anything is written (GH #116).
+		const folderSettings = bindVaultShareSettings(
 			this.pluginSettings as unknown as Settings<unknown>,
-			`sharedFolders/[guid=${guid}]`,
+			path,
+			guid,
+			workspaceId,
 		);
-		const settings: VaultShareSettings = { guid: guid, path: path };
-		if (workspaceId) {
-			settings["relay"] = workspaceId;
-		}
-		void folderSettings.mutateValue((current) => {
-			return {
-				...current,
-				path,
-				guid,
-				...(workspaceId ? { relay: workspaceId } : {}),
-				...{
-					sync: current.sync ? current.sync : AttachmentSyncSettings.defaultCategoryFlags,
-				},
-			};
-		}, true);
 
 		const folder = new VaultShare(
 			this.instanceAppId,
@@ -1389,6 +1377,13 @@ export default class TeamRelayPlugin extends Plugin {
 				log(`Found ${rawShares.length} shares across all servers (${allShares.length} after folder-path dedup)`);
 
 				for (const share of allShares) {
+					if (share.kind === "folder" && !isValidShareGuid(share.id)) {
+						// Checked before the path match below: an id-less share
+						// would read as a guid mismatch and the migrate branch
+						// would delete the valid local share first (GH #116).
+						err(`Skipping folder share ${share.path}: server returned no valid share id`);
+						continue;
+					}
 					if (share.kind === "folder") {
 						// Find existing by guid OR by path (settings may have old client-side guid)
 						const byGuid = this.shareRegistry.locate(
@@ -1489,6 +1484,11 @@ export default class TeamRelayPlugin extends Plugin {
 					(relayOnPremSettings.servers.length > 0 ? relayOnPremSettings.servers[0].id : "default");
 
 				for (const share of shares) {
+					if (share.kind === "folder" && !isValidShareGuid(share.id)) {
+						// Same guard as the multi-server branch above (GH #116).
+						err(`Skipping folder share ${share.path}: server returned no valid share id`);
+						continue;
+					}
 					if (share.kind === "folder") {
 						// Find existing by guid OR by path (settings may have old client-side guid)
 						const byGuid = this.shareRegistry.locate(

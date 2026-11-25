@@ -59,6 +59,7 @@ import { VaultScopedMap } from "./VaultScopedMap";
 import { withRootRelativePaths } from "./rootRelativeProxy";
 import { BlobClient } from "./BlobClient";
 import { AttachmentSyncSettings, type AttachmentToggles } from "./AttachmentSyncSettings";
+import { isValidShareGuid, withoutUndefinedGuidShares } from "./vaultShareSettings";
 import { currentToggles } from "./featureToggleState";
 import { findNestingConflictPath } from "./vaultShareNesting";
 import { isRootSharePath, resolveShareFolder } from "./vaultRootPath";
@@ -3633,7 +3634,16 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 	}
 
 	restore() {
-		this._restoreFrom(this.persistedShares.readValue());
+		const persisted = this.persistedShares.readValue();
+		const kept = withoutUndefinedGuidShares(persisted);
+		if (kept.length !== persisted.length) {
+			// Leftover `guid: "undefined"` records (GH #116) can never be
+			// restored; drop them from data.json instead of skipping them on
+			// every load.
+			this.warn(`removing ${persisted.length - kept.length} shared folder record(s) with guid "undefined"`);
+			void this.persistedShares.mutateValue(withoutUndefinedGuidShares);
+		}
+		this._restoreFrom(kept);
 	}
 
 	/**
@@ -3649,7 +3659,7 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 	 * recurring under a different name.
 	 */
 	private _hasValidGuid(folder: VaultShareSettings): boolean {
-		return typeof folder.guid === "string" && ResourceAddress.isValidUUID(folder.guid);
+		return isValidShareGuid(folder.guid);
 	}
 
 	private _restoreFrom(folders: VaultShareSettings[]) {
@@ -3749,6 +3759,11 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 		isRestore?: boolean,
 		freshlyCreated?: boolean,
 	): VaultShare {
+		// Every caller hands over a server-issued share id; refuse a missing
+		// one before the factory persists it as `guid: "undefined"` (GH #116).
+		if (!isValidShareGuid(guid)) {
+			throw new Error(`Cannot add shared folder ${path}: it has no valid share id`);
+		}
 		const existing = this.locate(
 			(folder) => folder.path == path && folder.entityGuid == guid,
 		);
