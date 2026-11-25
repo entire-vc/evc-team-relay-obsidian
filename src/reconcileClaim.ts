@@ -52,10 +52,10 @@ function isReconcileClaim(value: unknown): value is ReconcileClaim {
  * then `wonReconcileClaim()`. The WINNER may proceed with the safe fast-path
  * apply. The LOSER must NOT apply via the fast path -- its edit is still
  * real and unsynced, so the caller re-reads the (now possibly different,
- * post-settle) syncedText and falls through to `reconcileWithConflictCopy()`
- * instead, which correctly diffs against whatever the winner just committed
- * and preserves the loser's own content as a conflict-copy rather than
- * silently concatenating it in.
+ * post-settle) syncedText and falls through to `keepLocalTextAndDeliverRelay()`
+ * in TransferQueue instead, which keeps the loser's own text whole as a
+ * conflict copy and writes the winner's text to the file, leaving the CRDT
+ * untouched, rather than silently concatenating it in.
  */
 export function claimReconcile(ydoc: Y.Doc, now: () => number = Date.now): void {
 	const meta = ydoc.getMap(META_MAP);

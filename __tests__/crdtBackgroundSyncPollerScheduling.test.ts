@@ -526,6 +526,33 @@ describe("CrdtBackgroundSyncPoller scheduling", () => {
 		poller.destroy();
 	});
 
+	test("a second edit announced while its note is being pulled is what the pull waits for", async () => {
+		const held: Held[] = [];
+		const pull = holdingPull(held);
+		const folder = makeFolder("s", 1, pull, 1);
+		const poller = new CrdtBackgroundSyncPoller(clock as never, makeRegistry([folder]) as never, 3_600_000);
+		poller.start();
+		held.shift()?.resolve({ outcome: "unchanged", remoteText: "old" });
+		await flushPromises();
+
+		folder.announce("s-0", textFingerprint("v1"));
+		await flushPromises();
+		const running = held[0];
+		expect(running.control.expected?.()).toBe(textFingerprint("v1"));
+		// The pull itself connects the note, the way the real one does.
+		(running.file as { isOnline: boolean }).isOnline = true;
+		clock.setTime(t0 + 2_000);
+		folder.announce("s-0", textFingerprint("v2"));
+		await flushPromises();
+		expect(running.control.expected?.()).toBe(textFingerprint("v2"));
+
+		(running.file as { isOnline: boolean }).isOnline = false;
+		held.shift()?.resolve({ outcome: "flushed", remoteText: "v2" });
+		await flushPromises();
+		expect(poller.stats().delivery.count).toBe(1);
+		poller.destroy();
+	});
+
 	test("destroy() cancels pending re-checks", async () => {
 		const held: Held[] = [];
 		const pull = holdingPull(held);

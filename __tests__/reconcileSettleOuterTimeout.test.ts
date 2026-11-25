@@ -55,6 +55,12 @@ function makeFakeDoc(opts: FakeDocOptions) {
 	const writeConflictCopy = jest
 		.fn<(doc: unknown, content: string, label: string) => Promise<string>>()
 		.mockResolvedValue("note (relay conflict TIMESTAMP).md");
+	let disk = opts.vaultContents;
+	const writeContents = jest
+		.fn<(doc: unknown, content: string) => Promise<void>>()
+		.mockImplementation(async (_doc, content) => {
+			disk = content;
+		});
 
 	const fakeDoc = Object.create(Document.prototype) as Document;
 	Object.defineProperty(fakeDoc, "path", { value: "note.md" });
@@ -69,8 +75,10 @@ function makeFakeDoc(opts: FakeDocOptions) {
 	Object.defineProperty(fakeDoc, "vaultShare", {
 		value: {
 			workspaceId: "test-relay-id",
-			readContents: async () => opts.vaultContents,
+			readContents: async () => disk,
 			writeConflictCopy,
+			writeContents,
+			isDeletePending: () => false,
 			credentialCache: { dropFromQueue: () => {} },
 		},
 	});
@@ -90,7 +98,7 @@ function makeFakeDoc(opts: FakeDocOptions) {
 		},
 	});
 
-	return { fakeDoc, ydoc, writeConflictCopy, getBase: () => base };
+	return { fakeDoc, ydoc, writeConflictCopy, getBase: () => base, getDisk: () => disk };
 }
 
 describe("reconcileRelayContent's claim+settle fast path has its own outer bound", () => {
@@ -101,7 +109,7 @@ describe("reconcileRelayContent's claim+settle fast path has its own outer bound
 	});
 
 	test("REGRESSION: awaitReconcileSettled never resolves -- outer timeout fires, edit preserved as conflict copy, never silently discarded", async () => {
-		const { fakeDoc, writeConflictCopy, getBase } = makeFakeDoc({
+		const { fakeDoc, writeConflictCopy, getBase, getDisk } = makeFakeDoc({
 			syncedText: "TWO-CLIENT-RESTART-PROBE initial",
 			vaultContents: "A-EDIT-DURING-RESTART",
 			initialBase: "TWO-CLIENT-RESTART-PROBE initial",
@@ -128,13 +136,16 @@ describe("reconcileRelayContent's claim+settle fast path has its own outer bound
 		// who won, since the claim state never confirmed settled.
 		expect(wonReconcileClaimMock).not.toHaveBeenCalled();
 		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		// The claim state is unknown, so there is no base to diff from: the
+		// edit is kept whole as the copy and the CRDT is not rewritten (GH #113).
 		expect(writeConflictCopy).toHaveBeenCalledWith(
 			fakeDoc,
-			"TWO-CLIENT-RESTART-PROBE initial",
+			"A-EDIT-DURING-RESTART",
 			expect.stringMatching(/^relay conflict /),
 		);
-		expect(fakeDoc.content).toBe("A-EDIT-DURING-RESTART");
-		expect(getBase()).toBe("A-EDIT-DURING-RESTART");
+		expect(fakeDoc.content).toBe("TWO-CLIENT-RESTART-PROBE initial");
+		expect(getDisk()).toBe("TWO-CLIENT-RESTART-PROBE initial");
+		expect(getBase()).toBe("TWO-CLIENT-RESTART-PROBE initial");
 	});
 
 	test("settle resolves promptly and this client wins: applies directly, no conflict copy, outer timeout never fires", async () => {
@@ -172,5 +183,7 @@ describe("reconcileRelayContent's claim+settle fast path has its own outer bound
 
 		expect(result).toBe(true);
 		expect(writeConflictCopy).toHaveBeenCalledTimes(1);
+		expect(writeConflictCopy.mock.calls[0][1]).toBe("verify EDITED content");
+		expect(fakeDoc.content).toBe("verify initial content");
 	});
 });

@@ -7,6 +7,7 @@ import {
 	TAbstractFile,
 	TFile,
 	TFolder,
+	Notice,
 	Vault,
 	debounce,
 	normalizePath,
@@ -59,10 +60,16 @@ import { VaultScopedMap } from "./VaultScopedMap";
 import { withRootRelativePaths } from "./rootRelativeProxy";
 import { BlobClient } from "./BlobClient";
 import { AttachmentSyncSettings, type AttachmentToggles } from "./AttachmentSyncSettings";
+import { isValidShareGuid, withoutUndefinedGuidShares } from "./vaultShareSettings";
 import { currentToggles } from "./featureToggleState";
 import { findNestingConflictPath } from "./vaultShareNesting";
 import { isRootSharePath, resolveShareFolder } from "./vaultRootPath";
 import { buildConflictCopyPath, isConflictCopyPath } from "./conflictCopyPath";
+import {
+	ATTACH_SUMMARY_NOTICE_MS,
+	AttachConflictSummary,
+	isDivergenceCopyLabel,
+} from "./attachConflictSummary";
 import { partitionByKnownGuid } from "./mintGate";
 import { DocActivityChannel } from "./docActivity";
 import {
@@ -225,6 +232,8 @@ export class VaultShare extends ProviderBacked {
 	private treeScanInFlight: SingleFlight<void> | null = null;
 	private initialFolderSync: Promise<boolean> | null = null;
 	private cancelInitialFolderSync: (() => void) | null = null;
+	/** Set while this device syncs the folder for the first time (#114). */
+	private attachConflictSummary?: AttachConflictSummary;
 
 	// -- Readiness / persistence promises (memoized -- see awaitReady/awaitSynced) --
 	private readyValue: LazyValue<VaultShare> | null = null;
@@ -966,9 +975,24 @@ export class VaultShare extends ProviderBacked {
 	private async _ensureServerSyncMarked(): Promise<void> {
 		const serverSynced = await this.readServerSynced();
 		if (!serverSynced) {
+			this.beginAttachConflictSummary();
 			await this.onceEverSynced();
 			await this.noteSynced();
 		}
+	}
+
+	/**
+	 * This device has never synced the folder: it was just attached (or its
+	 * local store is new). Every local/server difference of this first sync
+	 * becomes a conflict copy; report them in one summary notice instead of
+	 * leaving the user with unexplained files (see attachConflictSummary.ts).
+	 */
+	private beginAttachConflictSummary(): void {
+		if (this.isTornDown || this.attachConflictSummary?.isOpen) return;
+		const folderName = this.path.split(sep).pop() ?? this.path;
+		this.attachConflictSummary = new AttachConflictSummary(folderName, (message) => {
+			new Notice(message, ATTACH_SUMMARY_NOTICE_MS);
+		});
 	}
 
 	/**
@@ -2151,7 +2175,7 @@ export class VaultShare extends ProviderBacked {
 		// the file outright instead of overwriting it. Preserve any
 		// unsynced edit as a conflict-copy first;
 		// folders have no content of their own to preserve. Fail
-		// CLOSED like 's reconcileWithConflictCopy: if we can't
+		// CLOSED like copy-first reconcile: if we can't
 		// positively confirm it's safe (nothing to preserve, or the
 		// preserve step actually succeeded), skip the trash this
 		// cycle rather than risk destroying an edit we couldn't check.
@@ -2194,7 +2218,7 @@ export class VaultShare extends ProviderBacked {
 	 * in response to a remote delete, so for an entry whose session hasn't
 	 * restarted since it was last synced, its in-memory content still
 	 * reflects that state. Comparing the on-disk file against it is the
-	 * same technique 's reconcileWithConflictCopy uses, applied to the
+	 * same technique copy-first reconcile uses, applied to the
 	 * delete path.
 	 *
 	 * `find` resolves the live Document/CanvasDocument for `vpath` (or undefined if
@@ -2205,7 +2229,7 @@ export class VaultShare extends ProviderBacked {
 	 * pretty-printed while the exported Y.Doc state isn't).
 	 *
 	 * Returns whether it's safe to proceed with the trash. Fails CLOSED,
-	 * matching 's reconcileWithConflictCopy: any step we can't
+	 * matching copy-first reconcile: any step we can't
 	 * positively confirm (couldn't read the file, couldn't write the
 	 * conflict-copy) returns false rather than falling through to trash —
 	 * an orphaned local file left behind for the next cleanup pass to
@@ -2492,6 +2516,9 @@ export class VaultShare extends ProviderBacked {
 			normalizePath(this.absolutePath(conflictDocPath)),
 			content,
 		);
+		if (isDivergenceCopyLabel(label)) {
+			this.attachConflictSummary?.record(doc.entryPath, conflictDocPath);
+		}
 		return conflictDocPath;
 	}
 
@@ -3457,6 +3484,7 @@ export class VaultShare extends ProviderBacked {
 
 	dismantle() {
 		this.isTornDown = true;
+		this.attachConflictSummary?.close();
 		this.lostClaimSettler.cancelAll();
 		this.cancelInitialFolderSync?.();
 		this.cancelInitialFolderSync = null;
@@ -3633,7 +3661,16 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 	}
 
 	restore() {
-		this._restoreFrom(this.persistedShares.readValue());
+		const persisted = this.persistedShares.readValue();
+		const kept = withoutUndefinedGuidShares(persisted);
+		if (kept.length !== persisted.length) {
+			// Leftover `guid: "undefined"` records (GH #116) can never be
+			// restored; drop them from data.json instead of skipping them on
+			// every load.
+			this.warn(`removing ${persisted.length - kept.length} shared folder record(s) with guid "undefined"`);
+			void this.persistedShares.mutateValue(withoutUndefinedGuidShares);
+		}
+		this._restoreFrom(kept);
 	}
 
 	/**
@@ -3649,7 +3686,7 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 	 * recurring under a different name.
 	 */
 	private _hasValidGuid(folder: VaultShareSettings): boolean {
-		return typeof folder.guid === "string" && ResourceAddress.isValidUUID(folder.guid);
+		return isValidShareGuid(folder.guid);
 	}
 
 	private _restoreFrom(folders: VaultShareSettings[]) {
@@ -3749,6 +3786,11 @@ export class ShareRegistry extends NotifierSet<VaultShare> {
 		isRestore?: boolean,
 		freshlyCreated?: boolean,
 	): VaultShare {
+		// Every caller hands over a server-issued share id; refuse a missing
+		// one before the factory persists it as `guid: "undefined"` (GH #116).
+		if (!isValidShareGuid(guid)) {
+			throw new Error(`Cannot add shared folder ${path}: it has no valid share id`);
+		}
 		const existing = this.locate(
 			(folder) => folder.path == path && folder.entityGuid == guid,
 		);

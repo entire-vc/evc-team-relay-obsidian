@@ -71,6 +71,8 @@ describe("ShareRegistry.restore() -- dedupe prefers a valid guid", () => {
 				{ path: "already-triplicated-folder", guid: "undefined", relay: "fmt-test" },
 				{ path: "already-triplicated-folder", guid: VALID_GUID, relay: "relay-onprem" },
 			],
+			// restore() drops literal "undefined" records from storage (GH #116).
+			mutateValue: jest.fn(async () => {}),
 		};
 
 		const registry = new ShareRegistry(
@@ -141,6 +143,7 @@ describe("ShareRegistry.restore() -- dedupe prefers a valid guid", () => {
 				{ path: "folder", guid: "undefined", relay: "a" },
 				{ path: "folder", guid: "" as unknown as string, relay: "b" },
 			],
+			mutateValue: jest.fn(async () => {}),
 		};
 
 		const registry = new ShareRegistry(

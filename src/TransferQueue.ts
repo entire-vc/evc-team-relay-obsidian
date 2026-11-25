@@ -16,7 +16,7 @@ import { CanvasDocument } from "./CanvasDocument";
 import { deepValueEquals } from "./deepValueEquals";
 import type { CanvasData } from "./HostCanvasView";
 import { AttachmentFile, isAttachmentFile } from "./AttachmentFile";
-import { applyDiffToYText, reconcileWithConflictCopy } from "./ytextDiff";
+import { applyDiffToYText } from "./ytextDiff";
 import { hasPreservableContent, sameTextContent } from "./textEquivalence";
 import { waitForBufferFlush } from "./websocketFlush";
 import { textFingerprint } from "./docActivity";
@@ -1182,8 +1182,8 @@ export class TransferQueue extends Loggable {
 		// syncing with the relay, reconcile content. The vault file is treated as
 		// the source of truth for edits that weren't committed to Y.Doc (e.g. the
 		// file was modified without an active editor binding) — but see
-		// reconcileRelayContent()/reconcileWithConflictCopy: it never discards
-		// divergent Y.Doc content without preserving it first.
+		// deliverPreservingLocalEdit()/reconcileRelayContent(): without a common
+		// base the file text is kept as a copy and the CRDT is not rewritten.
 		// A doc with a history gap shows empty or partial text: reconciling
 		// would seed the file into it (duplicated once the gap closes) and
 		// record that text as the agreed base.
@@ -1206,7 +1206,7 @@ export class TransferQueue extends Loggable {
 					if (await this.deliverPreservingLocalEdit(doc, localText)) {
 						baseSettled = true;
 					} else {
-						await this.reconcileRelayContent(doc, localText);
+						baseSettled = await this.reconcileRelayContent(doc, localText);
 					}
 				}
 			}
@@ -1298,28 +1298,51 @@ export class TransferQueue extends Loggable {
 	 * version, not the local one (live on 0.1.33: copy without the full local
 	 * text, note without the remote deletion).
 	 *
+	 * No base yet is handled the same way: nothing tells which side moved,
+	 * and there is no common text to merge from. Rewriting the CRDT with a
+	 * diff from the relay's current text to the file merged with a
+	 * collaborator's concurrent typing inside words: the note got text no
+	 * side ever wrote, and every participant received it (GH #113).
+	 *
 	 * Returns false when this does not apply and the caller reconciles as
-	 * before: no base yet (nothing tells which side moved), the relay did not
-	 * move, or its text is empty (also what an unloaded room reads as).
-	 * Returns true when the base is settled here: the relay text was
-	 * delivered and recorded, or nothing was written and the base stays
-	 * where it was, so the next sync sees the same divergence and preserves
-	 * the edit again. That covers a failed copy: moving the base to the
-	 * relay text would read the stale file as an own edit next time and push
-	 * it over the relay without a copy.
+	 * before: the relay did not move since the base, or its text is empty
+	 * (also what an unloaded room reads as). Returns true when the base is
+	 * settled here; see keepLocalTextAndDeliverRelay().
 	 */
 	private async deliverPreservingLocalEdit(doc: Document, localText: string): Promise<boolean> {
 		const base = await doc.getSyncBase();
 		const remoteText = doc.content;
-		if (base === undefined) return false;
-		if (sameTextContent(remoteText, base)) return false;
+		if (base !== undefined && sameTextContent(remoteText, base)) return false;
 		if (!hasPreservableContent(remoteText)) return false;
+		return this.keepLocalTextAndDeliverRelay(doc, localText, base);
+	}
+
+	/**
+	 * Keep the file's text in full as a conflict copy, then write the relay's
+	 * text to disk and record it as the base. The CRDT is not touched, so a
+	 * collaborator's concurrent edit merges into the relay text as any CRDT
+	 * edit does, and the note always holds one whole version.
+	 *
+	 * Always returns true: the base is settled here. Either the relay text was
+	 * delivered and recorded, or nothing was written and the base stays where
+	 * it was, so the next sync sees the same divergence and preserves the edit
+	 * again. That covers a failed copy: moving the base to the relay text
+	 * would read the stale file as an own edit next time and push it over the
+	 * relay without a copy.
+	 */
+	private async keepLocalTextAndDeliverRelay(
+		doc: Document,
+		localText: string,
+		base: string | undefined,
+	): Promise<boolean> {
+		const remoteText = doc.content;
 		if (doc.vaultShare.isDeletePending(doc.entryPath)) return true;
 		const current = await this.readVaultContents(doc);
 		// "" is also a failed read: nothing safe to copy, write or record.
 		if (current === "") return true;
 		if (!sameTextContent(current, localText)) return true;
-		if (!sameTextContent(current, base) && hasPreservableContent(current)) {
+		const isLocalEdit = base === undefined || !sameTextContent(current, base);
+		if (isLocalEdit && !sameTextContent(current, remoteText) && hasPreservableContent(current)) {
 			const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 			try {
 				await doc.vaultShare.writeConflictCopy(doc, current, `relay conflict ${timestamp}`);
@@ -1339,7 +1362,8 @@ export class TransferQueue extends Loggable {
 		await doc.vaultShare.writeContents(doc, remoteText);
 		await doc.setSyncBase(remoteText);
 		this.log(
-			`[uploadDocumentViaSocket] relay moved and ${doc.entryPath} held a local edit; ` +
+			`[uploadDocumentViaSocket] ${base === undefined ? "no sync base" : "relay moved"} and ` +
+				`${doc.entryPath} held a local edit; ` +
 				`local text kept as a conflict copy, relay text written ` +
 				`(relay=${remoteText.length}, local=${current.length})`,
 		);
@@ -1661,8 +1685,7 @@ export class TransferQueue extends Loggable {
 				// edit (e.g. app.vault.modify() with no live editor binding),
 				// not staleness from our own in-flight push. Preserve it
 				// before overwriting -- never silently discard, same
-				// invariant as reconcileRelayContent()/
-				// reconcileWithConflictCopy.
+				// invariant as deliverPreservingLocalEdit().
 				const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 				await doc.vaultShare.writeConflictCopy(
 					doc,
@@ -1982,10 +2005,11 @@ export class TransferQueue extends Loggable {
 	 * The relay-linked reconcile branch of `uploadDocumentViaSocket`: either
 	 * seeds a genuinely-empty relay document from the vault file (guarded by
 	 * initContentClaim.ts against a second client racing the same insert —
-	 * see that module's doc comment, ), or reconciles a
-	 * relay document whose synced text differs from the vault file by
-	 * preserving the relay's prior content as a conflict copy before
-	 * overwriting. Always waits for the resulting update
+	 * see that module's doc comment, ), or applies this client's own edit
+	 * when the relay text is still the base (guarded by reconcileClaim.ts).
+	 * A lost claim keeps the edit as a conflict copy and delivers the relay
+	 * text instead; the CRDT is only rewritten from a common base. Returns
+	 * true when the sync base was settled here. Always waits for the resulting update
 	 * to actually leave the local send buffer before the caller may
 	 * disconnect — a fixed timer isn't long enough for a
 	 * large diff on a slow link.
@@ -1993,7 +2017,10 @@ export class TransferQueue extends Loggable {
 	private async reconcileRelayContent(
 		doc: Document,
 		vaultContents: string,
-	): Promise<void> {
+	): Promise<boolean> {
+		// True when the base was settled here and the caller must not record
+		// the current text over it.
+		let baseSettled = false;
 		const syncedText = doc.content;
 		if (!syncedText) {
 			// Two clients opening the same brand-new shared folder at once
@@ -2040,7 +2067,7 @@ export class TransferQueue extends Loggable {
 			// preserving as before -- noisy-but-safe over silently discarding
 			// someone else's edit.
 			const base = await doc.getSyncBase();
-			if (base !== undefined && base === syncedText) {
+			if (base !== undefined && sameTextContent(base, syncedText)) {
 				// This snapshot alone can't tell "only I moved" apart from "a
 				// GENUINELY CONCURRENT client is about to reach the exact same
 				// conclusion against the exact same stale base" --
@@ -2083,11 +2110,12 @@ export class TransferQueue extends Loggable {
 					this.warn(
 						`[uploadDocumentViaSocket] reconcile claim settle exceeded its own ` +
 							`${RECONCILE_SETTLE_OUTER_TIMEOUT_MS}ms outer bound for ${doc.entryPath} -- ` +
-							`treating as lost, preserving vault content rather than risk applying ` +
-							`against a claim state that never confirmed settled`,
+							`treating as lost: the local text is kept as a conflict copy`,
 					);
-					await this.reconcileWithVaultFileSafely(doc, vaultContents, syncedText);
-				} else if (wonReconcileClaim(doc.crdtDoc) && doc.content === base) {
+					baseSettled = hasPreservableContent(doc.content)
+						? await this.keepLocalTextAndDeliverRelay(doc, vaultContents, base)
+						: true;
+				} else if (wonReconcileClaim(doc.crdtDoc) && sameTextContent(doc.content, base)) {
 					// Won the claim AND the settled text still matches what we
 					// started with -- re-checked, not assumed, in case some
 					// THIRD update landed during the settle window itself.
@@ -2101,14 +2129,22 @@ export class TransferQueue extends Loggable {
 					// Lost the claim to a concurrently-reconciling client (its
 					// own fast-path apply, if any, may already be sitting in
 					// the Y.Doc), or a third update landed mid-settle. Either
-					// way this client's edit is still real and unsynced --
-					// fall back to the safe, conflict-preserving path below
-					// rather than risk the concatenation this claim exists to
-					// prevent.
-					await this.reconcileWithVaultFileSafely(doc, vaultContents, syncedText);
+					// way this client's edit is still real and unsynced, and the
+					// relay text is no longer the base to diff from: keep the
+					// edit as a copy and deliver the relay text, the CRDT
+					// untouched. A diff from the current relay text would merge
+					// with a collaborator's concurrent typing inside words
+					// (GH #113), and would risk the concatenation this claim
+					// exists to prevent.
+					baseSettled = hasPreservableContent(doc.content)
+						? await this.keepLocalTextAndDeliverRelay(doc, vaultContents, base)
+						: true;
 				}
 			} else {
-				await this.reconcileWithVaultFileSafely(doc, vaultContents, syncedText);
+				// No base, or the relay moved off it: normally settled by
+				// deliverPreservingLocalEdit() already, unless the relay text
+				// changed since. Same outcome; never a diff without a base.
+				baseSettled = await this.keepLocalTextAndDeliverRelay(doc, vaultContents, base);
 			}
 		}
 
@@ -2118,46 +2154,7 @@ export class TransferQueue extends Loggable {
 		// be sitting in bufferedAmount well past a fixed timer, and
 		// disconnecting at that point drops it silently.
 		await waitForBufferFlush(doc._liveProvider.ws);
-	}
-
-	/**
-	 * The conflict-preserving reconcile path: whatever the Y.Doc CURRENTLY
-	 * holds (read fresh inside reconcileWithConflictCopy() itself, not from
-	 * `priorSyncedText` — that parameter is only for the log line) may
-	 * include edits from OTHER clients that just merged in, or from the
-	 * winner of a reconcileClaim race; a plain text diff can't
-	 * tell those apart from this device's own unsynced edits, so before
-	 * rewriting the Y.Doc to match the vault file we preserve whatever it
-	 * currently holds as a conflict-copy file — nothing is silently
-	 * discarded, and if the preserve step itself fails we skip reconciling
-	 * rather than risk it.
-	 */
-	private async reconcileWithVaultFileSafely(
-		doc: Document,
-		vaultContents: string,
-		priorSyncedText: string,
-	): Promise<void> {
-		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const result = await reconcileWithConflictCopy(
-			doc.crdtDoc,
-			vaultContents,
-			(relayContent) =>
-				doc.vaultShare.writeConflictCopy(doc, relayContent, `relay conflict ${timestamp}`),
-			undefined,
-			(...args) => this.log("[uploadDocumentViaSocket]", ...args),
-		);
-		if (result.reconciled) {
-			this.log(
-				`[uploadDocumentViaSocket] Reconciled ${doc.entryPath} with vault file ` +
-					`(relay=${priorSyncedText.length}, vault=${vaultContents.length}); ` +
-					`prior relay content preserved at ${result.conflictPath}`,
-			);
-		} else {
-			this.warn(
-				`[uploadDocumentViaSocket] Skipped reconciliation for ${doc.entryPath} — ` +
-					`could not safely preserve relay content before overwriting`,
-			);
-		}
+		return baseSettled;
 	}
 
 	/**
