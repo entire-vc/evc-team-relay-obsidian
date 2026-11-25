@@ -616,3 +616,19 @@
 	font-size: var(--font-ui-smaller);
 	word-break: break-all;
 }
+
+/* Attach check (GH #114): the list of differing notes and the buttons inside its notices. */
+.evc-attach-review-list {
+	max-height: 14em;
+	overflow-y: auto;
+	margin: 0 0 var(--size-4-3);
+	padding-left: var(--size-4-6);
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-small);
+	overflow-wrap: anywhere;
+}
+
+.evc-attach-review-notice-button {
+	display: block;
+	margin-top: var(--size-4-2);
+}

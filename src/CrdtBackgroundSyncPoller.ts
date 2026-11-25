@@ -354,7 +354,8 @@ export class CrdtBackgroundSyncPoller {
 		const live = new Set<VaultShare>();
 		const registered = new Set<VaultShare>();
 		this.shareRegistry.each((folder: VaultShare) => {
-			if (!folder.workspaceId) return;
+			// A folder held by the attach check (GH #114) is not pulled until the user decides.
+			if (!folder.workspaceId || folder.attachHeld) return;
 			// Listen while offline too: on reconnect the folder sync replays the
 			// markers peers wrote in the meantime, usually before the next tick,
 			// and a missed marker leaves its note to the next sweep pass.
@@ -622,7 +623,7 @@ export class CrdtBackgroundSyncPoller {
 			if (!next) return;
 			// Re-validated at start: the editor may have opened it, or another
 			// path may have started pulling it, while it sat in the queue.
-			if (!next.pull.folder.isOnline || !this.canQueue(next.pull.file)) continue;
+			if (!next.pull.folder.isOnline || next.pull.folder.attachHeld || !this.canQueue(next.pull.file)) continue;
 			if (next.pull.file.entityGuid === this.probing) {
 				// Picked up again once the probe disconnects (sweep pulls just wait for the next pass).
 				if (next.lane !== "sweep") this.heldByProbe.set(next.pull.file.entityGuid, next);

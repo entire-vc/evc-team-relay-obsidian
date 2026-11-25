@@ -32,6 +32,9 @@ export function bindVaultShareSettings(
 	path: string,
 	guid: string,
 	workspaceId?: string,
+	// The attach check (GH #114) is pending: written in this same mutate so
+	// a restart before the user decides restores the folder held again.
+	attachPending = false,
 ): SettingsScope<VaultShareSettings> {
 	if (!isValidShareGuid(guid)) {
 		throw new Error(`Refusing to save shared folder ${path}: it has no valid share id`);
@@ -49,6 +52,7 @@ export function bindVaultShareSettings(
 			...{
 				sync: current.sync ? current.sync : AttachmentSyncSettings.defaultCategoryFlags,
 			},
+			...(attachPending ? { attachReview: "pending" as const } : {}),
 		};
 	}, true);
 	return folderSettings;
