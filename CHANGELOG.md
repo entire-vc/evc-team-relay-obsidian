@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.38
+- Added: when attaching a local folder to a shared folder that already exists on the server, the plugin now compares notes on both sides before syncing and holds the folder until you choose how to resolve any differences (Keep both, Keep server version, Keep local version with confirmation, or Cancel), keeping local backups out of sync and reporting created copies in a single summary notice.
+- Fixed: when a note diverged without a common sync base (for example, after an offline edit while a collaborator edited the same lines), reconciling could mix both versions inside words. The plugin now keeps the full local text as a conflict copy and delivers the server version whole without rewriting the shared document.
+- Fixed: when another program or script rewrote a shared note that was open in Obsidian (in Source or Reading view), the change could fail to reach other participants. External rewrites of open notes are now detected and synced into the shared text, or saved as a conflict copy with a notice if the file cannot be read.
+- Fixed: invalid shared-folder entries with `guid: "undefined"` are no longer persisted in `data.json`, and leftover entries are removed automatically on startup.
+- Fixed: when a peer saved a note twice within a couple of seconds, a device with that note closed could deliver the second edit about a minute late. A newer update announced while a pull is already in progress now reaches that pull right away.
+
 ## 0.1.37
 - Fixed: after the Settings window or a pop-out window was closed, other members stopped seeing your cursor and selection for the rest of the session, while text kept syncing. Your presence now stays visible until Obsidian itself is closed.
 - Updated development dependencies (ESLint 10, typescript-eslint 8.73) and several libraries to newer patch and minor versions.
